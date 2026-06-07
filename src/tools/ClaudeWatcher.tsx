@@ -60,17 +60,19 @@ export default function ClaudeWatcher() {
     }
   }, [addLog]);
 
+  // 日志轮询固定 1s，与「检测间隔」解耦：检测频率由后端扫描循环控制，
+  // 这里只负责把已点击的结果及时显示到运行日志。
   useEffect(() => {
     if (!running) return;
     const loop = async () => {
       await tick();
-      timerRef.current = setTimeout(loop, interval * 1000);
+      timerRef.current = setTimeout(loop, 1000);
     };
     timerRef.current = setTimeout(loop, 500);
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [running, interval, tick]);
+  }, [running, tick]);
 
   const handleStart = async () => {
     const ok = await checkAccess();
@@ -80,12 +82,12 @@ export default function ClaudeWatcher() {
       return;
     }
     try {
-      await invoke("start_watcher");
+      await invoke("start_watcher", { interval });
     } catch (e) {
       addLog(`启动监听进程失败: ${e}`, "err");
       return;
     }
-    addLog("开始监听（常驻热循环，每秒扫描自动点击）…", "warn");
+    addLog(`开始监听（常驻热循环，每 ${interval} 秒扫描自动点击）…`, "warn");
     setRunning(true);
   };
 
@@ -184,6 +186,7 @@ export default function ClaudeWatcher() {
                 value={interval}
                 onChange={(e) => setIntervalMs(Math.max(1, parseInt(e.target.value) || 2))}
                 disabled={running}
+                title="每隔几秒扫描一次 Claude 窗口，数值越小检测越快（启动后不可改，需先停止）"
                 style={{
                   width: 52,
                   background: "var(--bg3)",
@@ -247,8 +250,8 @@ export default function ClaudeWatcher() {
               <span style={{ color: "var(--green)", fontWeight: 600 }}>✓ 辅助功能已授权</span>
               <br />
               启动后会拉起一个常驻后台进程，持续监听 Claude Desktop / Claude Code
-              所有窗口（每秒扫描），检测到 Allow / Allow Once / 允许 等按钮时自动点击
-              （优先「Allow once」）。
+              所有窗口（按上方「检测间隔」设定的频率扫描，间隔越小检测越快），
+              检测到 Allow / Allow Once / 允许 等按钮时自动点击（优先「Allow once」）。
               <br />
               若未生效，点「诊断」查看实际按钮名称，或点「试点一次」手动触发。
             </div>

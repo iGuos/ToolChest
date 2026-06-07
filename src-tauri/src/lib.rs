@@ -15,6 +15,9 @@ pub fn run() {
             tools::claude_watcher::start_watcher,
             tools::claude_watcher::stop_watcher,
             tools::claude_watcher::read_watcher_clicks,
+            tools::hosts::read_hosts,
+            tools::hosts::write_hosts,
+            tools::http::http_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

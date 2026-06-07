@@ -16,7 +16,14 @@ pub struct PortInfo {
 }
 
 #[tauri::command]
-pub fn list_ports() -> Result<Vec<PortInfo>, String> {
+pub async fn list_ports() -> Result<Vec<PortInfo>, String> {
+    // lsof 可能跑几百 ms，放到阻塞线程池，避免冻结主线程（UI）。
+    tauri::async_runtime::spawn_blocking(collect_ports)
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+
+fn collect_ports() -> Result<Vec<PortInfo>, String> {
     let output = Command::new("lsof")
         .args(["-i", "-P", "-n"])
         .output()
@@ -131,28 +138,45 @@ fn split_host_port(addr: &str) -> (String, String) {
 }
 
 #[tauri::command]
-pub fn kill_process(pid: u32) -> Result<(), String> {
+pub async fn kill_process(pid: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || terminate(pid))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+
+fn terminate(pid: u32) -> Result<(), String> {
+    let pid_s = pid.to_string();
+
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
-            .args(["-9", &pid.to_string()])
+        // 先发 SIGTERM 让进程优雅退出（有机会清理资源），
+        // 等一会儿仍存活才 SIGKILL 强杀。
+        let _ = Command::new("kill").args(["-TERM", &pid_s]).status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // `kill -0` 仅探测进程是否还在
+        let alive = Command::new("kill")
+            .args(["-0", &pid_s])
             .status()
-            .map_err(|e| format!("执行 kill 失败: {e}"))?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("终止进程 {pid} 失败"))
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if alive {
+            let status = Command::new("kill")
+                .args(["-9", &pid_s])
+                .status()
+                .map_err(|e| format!("执行 kill 失败: {e}"))?;
+            if !status.success() {
+                return Err(format!("终止进程 {pid} 失败"));
+            }
         }
+        Ok(())
     }
 
     #[cfg(windows)]
     {
         let status = Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
+            .args(["/F", "/PID", &pid_s])
             .status()
             .map_err(|e| format!("执行 taskkill 失败: {e}"))?;
-
         if status.success() {
             Ok(())
         } else {

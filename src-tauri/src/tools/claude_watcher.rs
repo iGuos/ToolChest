@@ -26,6 +26,7 @@ repeat 1000000 times
                             set value of attribute "AXManualAccessibility" to true
                         end try
                         try
+                          with timeout of 20 seconds
                             repeat with w in every window
                                 set theElems to entire contents of w
                                 set clicked to false
@@ -54,13 +55,14 @@ repeat 1000000 times
                                 end repeat
                                 if clicked then exit repeat
                             end repeat
+                          end timeout
                         end try
                     end tell
                 end if
             end repeat
         end tell
     end try
-    delay 1
+    delay __DELAY__
 end repeat
 "#;
 
@@ -261,12 +263,15 @@ fn run_script(script: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn check_accessibility() -> bool {
-    let script = r#"tell application "System Events" to return (UI elements enabled) as string"#;
-    match run_script(script) {
-        Ok(s) => s.trim() == "true",
-        Err(_) => false,
-    }
+pub async fn check_accessibility() -> bool {
+    // osascript 启动有 ~100-300ms 开销，放到阻塞线程池避免冻结主线程。
+    tauri::async_runtime::spawn_blocking(|| {
+        let script =
+            r#"tell application "System Events" to return (UI elements enabled) as string"#;
+        matches!(run_script(script), Ok(s) if s.trim() == "true")
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -298,8 +303,10 @@ pub fn open_accessibility_settings() -> Result<(), String> {
 }
 
 /// Start the persistent warm-loop watcher (idempotent).
+/// `interval` is the scan cadence in seconds (smaller = faster detection);
+/// it is injected into the loop's `delay` and clamped to a sane range.
 #[tauri::command]
-pub fn start_watcher(state: tauri::State<WatcherProc>) -> Result<(), String> {
+pub fn start_watcher(interval: f64, state: tauri::State<WatcherProc>) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|e| e.to_string())?;
     if guard.is_some() {
         return Ok(());
@@ -309,9 +316,16 @@ pub fn start_watcher(state: tauri::State<WatcherProc>) -> Result<(), String> {
         .args(["-f", "baibaoWatchLoopMarker"])
         .status();
     let _ = std::fs::write(WATCH_LOG, b"");
+    // Clamp: below ~0.2s the warm loop just pegs CPU; above 60s is pointless.
+    let delay = if interval.is_finite() {
+        interval.clamp(0.2, 60.0)
+    } else {
+        1.0
+    };
+    let script = WATCH_SCRIPT.replace("__DELAY__", &format!("{delay}"));
     let child = Command::new("osascript")
         .arg("-e")
-        .arg(WATCH_SCRIPT)
+        .arg(&script)
         .spawn()
         .map_err(|e| format!("启动监听进程失败: {e}"))?;
     *guard = Some(child);
@@ -335,16 +349,17 @@ pub fn stop_watcher(state: tauri::State<WatcherProc>) -> Result<(), String> {
 /// Drain new "Clicked …" lines the watcher loop has written since last poll.
 #[tauri::command]
 pub fn read_watcher_clicks() -> Vec<String> {
-    match std::fs::read_to_string(WATCH_LOG) {
-        Ok(s) if !s.trim().is_empty() => {
-            let lines: Vec<String> = s
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
-            let _ = std::fs::write(WATCH_LOG, b"");
-            lines
-        }
-        _ => vec![],
+    // 原子地把日志改名取走再读，避免「读出 → 清空」之间后端 append 的记录被丢掉：
+    // 改名后，监听脚本下一次 `>>` append 会重建原文件，下个 tick 再取，零丢失。
+    let drained = format!("{WATCH_LOG}.drain");
+    if std::fs::rename(WATCH_LOG, &drained).is_err() {
+        return vec![]; // 日志文件还不存在
     }
+    let content = std::fs::read_to_string(&drained).unwrap_or_default();
+    let _ = std::fs::remove_file(&drained);
+    content
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }

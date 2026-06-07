@@ -35,6 +35,13 @@ body {
   display: flex;
 }
 
+/* .app 是 #root（flex 容器）的子项，必须撑满视口宽度，
+   否则按内容收缩、窗口拉宽后右侧会留白 */
+.app {
+  flex: 1;
+  min-width: 0;
+}
+
 /* ── Sidebar ── */
 .sidebar {
   width: var(--sidebar-w);
@@ -92,6 +99,7 @@ body {
 /* ── Content ── */
 .content {
   flex: 1;
+  min-width: 0; /* 允许收缩到窗口宽度，避免内部宽表格把整个 app 撑出窗口 */
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -135,7 +143,26 @@ body {
 }
 
 .tab:hover { background: var(--bg-hover); color: var(--text); }
-.tab.dragging { opacity: 0.45; }
+.tab.draggable { cursor: grab; }
+.tab.dragging { opacity: 0.35; cursor: grabbing; }
+
+/* 拖拽时跟随鼠标的卡片 */
+.tab-ghost {
+  position: fixed;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-hi);
+  white-space: nowrap;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
 
 .tab.active {
   background: var(--bg);
@@ -161,6 +188,22 @@ body {
 .tab-dot.on {
   background: var(--green);
   box-shadow: 0 0 5px var(--green);
+}
+/* 未保存改动：黄色指示灯（优先级高于激活态） */
+.tab-dot.dirty {
+  background: var(--yellow);
+  box-shadow: 0 0 5px var(--yellow);
+}
+
+.dirty-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 8px;
+  border-radius: 50%;
+  background: var(--yellow);
+  box-shadow: 0 0 5px var(--yellow);
+  vertical-align: middle;
 }
 
 .tab-close {
@@ -356,7 +399,6 @@ body {
 
 table {
   width: 100%;
-  min-width: 760px;
   border-collapse: collapse;
 }
 
@@ -522,7 +564,230 @@ tr:hover td { background: #28282c; }
 .log-entry.dim  { color: var(--text-dim); }
 
 /* ── Scrollbar ── */
-::-webkit-scrollbar { width: 7px; }
+::-webkit-scrollbar { width: 7px; height: 7px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #555; }
+
+/* ── Shared: inline check / banners / code area ── */
+.inline-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.notice-banner {
+  background: rgba(78, 201, 176, 0.1);
+  border: 1px solid rgba(78, 201, 176, 0.3);
+  color: var(--green);
+  padding: 10px 20px;
+  margin: 8px 16px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.code-area {
+  width: 100%;
+  min-height: 200px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: "Menlo", "Monaco", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 12px;
+  outline: none;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+}
+.table-wrap > textarea.code-area { height: 100%; min-height: 300px; }
+
+/* ── Hosts editor ── */
+.cell-input {
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  outline: none;
+}
+.cell-input:hover { border-color: var(--border); }
+.cell-input:focus { border-color: var(--accent); background: var(--bg3); }
+.cell-input.cell-warn { border-color: rgba(244, 71, 71, 0.55); }
+
+/* 分段开关（结构 / 原文） */
+.seg-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.seg {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.seg:hover { color: var(--text); }
+.seg.active {
+  background: var(--accent);
+  color: #fff;
+}
+.row-off { opacity: 0.45; }
+.tag-sys {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+  border-radius: 3px;
+  background: rgba(0, 122, 204, 0.15);
+  color: var(--blue);
+}
+
+/* ── HTTP client ── */
+.req-bar {
+  display: flex;
+  gap: 8px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.method-select {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text-hi);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-weight: 600;
+  font-size: 13px;
+  outline: none;
+}
+.url-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 13px;
+  outline: none;
+}
+.url-input:focus,
+.method-select:focus { border-color: var(--accent); }
+
+.sub-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.sub-tab {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 8px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.sub-tab:hover { color: var(--text); }
+.sub-tab.active { color: var(--text-hi); border-bottom-color: var(--accent); }
+
+.req-panel {
+  padding: 14px 20px;
+  flex-shrink: 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.kv-editor { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.kv-row { display: flex; align-items: center; gap: 8px; width: 100%; }
+.kv-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 12px;
+  outline: none;
+}
+.kv-input:focus { border-color: var(--accent); }
+.kv-del {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 16px;
+  width: 22px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.kv-del:hover { background: rgba(244, 71, 71, 0.15); color: var(--red); }
+
+.body-kind { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+.mini-select {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+.opts-panel { display: flex; flex-direction: column; gap: 12px; }
+.opt-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); }
+.opt-row > span:first-child { min-width: 90px; }
+
+.resp-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+.resp-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.resp-tabs { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.resp-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 20px; }
+.resp-body .code-area {
+  min-height: 0;
+  border: none;
+  padding: 0;
+  background: none;
+}
+.warn-text { color: var(--yellow); font-size: 12px; }
+
+.status-pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.st-2xx { background: rgba(78, 201, 176, 0.18); color: var(--green); }
+.st-3xx { background: rgba(0, 122, 204, 0.18); color: var(--blue); }
+.st-4xx { background: rgba(220, 220, 170, 0.18); color: var(--yellow); }
+.st-5xx { background: rgba(244, 71, 71, 0.18); color: var(--red); }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface PortInfo {
@@ -20,6 +20,7 @@ export default function PortScanner() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [onlyListen, setOnlyListen] = useState(false);
+  const [auto, setAuto] = useState(false);
   const [killing, setKilling] = useState<Set<number>>(new Set());
 
   const refresh = useCallback(async () => {
@@ -38,6 +39,13 @@ export default function PortScanner() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // 自动刷新：开启后每 3 秒拉一次端口列表
+  useEffect(() => {
+    if (!auto) return;
+    const id = setInterval(refresh, 3000);
+    return () => clearInterval(id);
+  }, [auto, refresh]);
 
   const killProcess = async (pid: number, command: string) => {
     if (!confirm(`确认终止进程「${command}」(PID: ${pid})？\n\n此操作不可撤销。`)) return;
@@ -59,24 +67,28 @@ export default function PortScanner() {
   const stateKey = (s: string | null) =>
     s ? s.toLowerCase().replace(/[_\s]/g, "-") : "";
 
-  const filtered = ports.filter((p) => {
-    if (onlyListen && p.state !== "LISTEN") return false;
-    if (!filter) return true;
+  // 过滤 + 排序合并进 useMemo，避免每次渲染（含每次搜索按键）都重算 O(n log n)
+  const sorted = useMemo(() => {
     const q = filter.toLowerCase();
-    return (
-      p.command.toLowerCase().includes(q) ||
-      p.local_port.includes(q) ||
-      p.local_addr.toLowerCase().includes(q) ||
-      String(p.pid).includes(q) ||
-      (p.protocol.toLowerCase().includes(q))
-    );
-  });
-
-  const sorted = [...filtered].sort((a, b) => {
-    const pa = parseInt(a.local_port) || 0;
-    const pb = parseInt(b.local_port) || 0;
-    return pa - pb;
-  });
+    const filtered = ports.filter((p) => {
+      if (onlyListen && p.state !== "LISTEN") return false;
+      if (!filter) return true;
+      return (
+        p.command.toLowerCase().includes(q) ||
+        p.local_port.includes(q) ||
+        p.local_addr.toLowerCase().includes(q) ||
+        String(p.pid).includes(q) ||
+        p.protocol.toLowerCase().includes(q) ||
+        (p.remote_addr?.toLowerCase().includes(q) ?? false) ||
+        (p.state?.toLowerCase().includes(q) ?? false)
+      );
+    });
+    return filtered.sort((a, b) => {
+      const pa = parseInt(a.local_port) || 0;
+      const pb = parseInt(b.local_port) || 0;
+      return pa - pb;
+    });
+  }, [ports, filter, onlyListen]);
 
   return (
     <div className="tool-container">
@@ -95,6 +107,13 @@ export default function PortScanner() {
             title="仅显示 LISTEN 状态"
           >
             仅监听
+          </button>
+          <button
+            className={`btn btn-ghost${auto ? " active" : ""}`}
+            onClick={() => setAuto((v) => !v)}
+            title="每 3 秒自动刷新"
+          >
+            自动
           </button>
           <button className="btn btn-primary" onClick={refresh} disabled={loading}>
             {loading ? "加载中…" : "刷新"}
