@@ -28,7 +28,26 @@ body {
   height: 100vh;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
+  /* 桌面客户端：默认禁止选中界面文字（否则 Cmd+A 会选中整个 UI），
+     下面再对可编辑/数据展示区恢复可选中 */
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
 }
+
+/* 真正该让用户选中/复制的地方：输入框、表格数据、代码/响应/日志区 */
+input,
+textarea,
+td,
+pre,
+.code-area,
+.log-box,
+.mono {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: auto;
+}
+select { cursor: pointer; }
 
 #root, .app {
   height: 100vh;
@@ -791,3 +810,36 @@ tr:hover td { background: #28282c; }
 .st-3xx { background: rgba(0, 122, 204, 0.18); color: var(--blue); }
 .st-4xx { background: rgba(220, 220, 170, 0.18); color: var(--yellow); }
 .st-5xx { background: rgba(244, 71, 71, 0.18); color: var(--red); }
+
+/* ── Modal（导入请求等） ── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+.modal {
+  width: min(640px, 90%);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.modal h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-hi);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

@@ -150,22 +150,22 @@ export default function HostsEditor({
     ]);
 
   const save = async () => {
+    // 结构模式下要求每条记录的 IP 与域名都不为空，否则不允许保存
+    if (!raw && lines.some((l) => l.kind === "entry" && !isEntryComplete(l))) {
+      setError("有记录缺少 IP 或域名，请补全或删除后再保存");
+      return;
+    }
     const content = raw ? rawText : serialize(lines);
     // 不再用 window.confirm —— 它在 Tauri WebView 里不可靠（会静默返回导致保存无效）。
     // 写入 /etc/hosts 时系统会弹出管理员密码框，那本身就是确认与授权。
     setSaving(true);
     setError(null);
     setNotice(null);
-    const skipped = raw
-      ? 0
-      : lines.filter((l) => l.kind === "entry" && !isEntryComplete(l)).length;
     try {
       const msg = await invoke<string>("write_hosts", { content, flushDns });
       setOriginal(content);
       if (raw) setLines(parse(content));
-      setNotice(
-        msg + (skipped ? `（已忽略 ${skipped} 条不完整记录：缺 IP 或域名）` : "")
-      );
+      setNotice(msg);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -230,7 +230,16 @@ export default function HostsEditor({
           <button className="btn btn-ghost" onClick={load} disabled={loading || saving}>
             重载
           </button>
-          <button className="btn btn-primary" onClick={save} disabled={saving || !dirty}>
+          <button
+            className="btn btn-primary"
+            onClick={save}
+            disabled={saving || !dirty || (!raw && incomplete > 0)}
+            title={
+              !raw && incomplete > 0
+                ? "有记录缺 IP 或域名，补全或删除后才能保存"
+                : ""
+            }
+          >
             {saving ? "保存中…" : "保存"}
           </button>
         </div>
@@ -332,7 +341,7 @@ export default function HostsEditor({
           {incomplete > 0 && (
             <span className="warn-text">
               {" "}
-              · {incomplete} 条不完整不会被保存
+              · {incomplete} 条缺 IP 或域名，补全或删除后才能保存
             </span>
           )}
         </span>

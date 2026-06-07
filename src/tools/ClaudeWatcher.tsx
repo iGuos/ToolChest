@@ -15,7 +15,7 @@ export default function ClaudeWatcher() {
   const [running, setRunning] = useState(false);
   const [diagnosing, setDiagnosing] = useState(false);
   const [clicking, setClicking] = useState(false);
-  const [interval, setIntervalMs] = useState(2);
+  const [interval, setIntervalMs] = useState(5);
   const [accessible, setAccessible] = useState<boolean | null>(null);
   const [binaryPath, setBinaryPath] = useState("");
   const [logs, setLogs] = useState<LogEntry[]>([
@@ -184,7 +184,7 @@ export default function ClaudeWatcher() {
                 min={1}
                 max={30}
                 value={interval}
-                onChange={(e) => setIntervalMs(Math.max(1, parseInt(e.target.value) || 2))}
+                onChange={(e) => setIntervalMs(Math.max(1, parseInt(e.target.value) || 5))}
                 disabled={running}
                 title="每隔几秒扫描一次 Claude 窗口，数值越小检测越快（启动后不可改，需先停止）"
                 style={{

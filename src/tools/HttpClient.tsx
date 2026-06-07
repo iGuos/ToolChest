@@ -1,5 +1,6 @@
 import { useState, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { parseRequest } from "./importRequest";
 
 interface KV {
   key: string;
@@ -24,6 +25,14 @@ interface HistoryItem {
   url: string;
   status: number;
   ms: number;
+}
+
+// 实际发出的请求（解析 query、注入 auth/content-type 之后的样子）
+interface SentReq {
+  method: string;
+  url: string;
+  headers: { key: string; value: string }[];
+  body: string;
 }
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -102,12 +111,49 @@ export default function HttpClient() {
   const [verifyTls, setVerifyTls] = useState(true);
 
   const [tab, setTab] = useState<Tab>("Params");
-  const [respTab, setRespTab] = useState<"body" | "headers">("body");
+  const [respTab, setRespTab] = useState<"request" | "body" | "headers">("body");
+  const [sentReq, setSentReq] = useState<SentReq | null>(null);
   const [pretty, setPretty] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resp, setResp] = useState<HttpResponse | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importErr, setImportErr] = useState<string | null>(null);
+
+  const applyImport = () => {
+    let p;
+    try {
+      p = parseRequest(importText);
+    } catch (e) {
+      setImportErr(String(e instanceof Error ? e.message : e));
+      return;
+    }
+    setMethod(p.method || "GET");
+    setUrl(p.url);
+    setParams([emptyRow()]); // query 已含在 URL 里
+    setHeaders(
+      p.headers.length ? p.headers.map((h) => ({ ...h, enabled: true })) : [emptyRow()]
+    );
+    if (p.body) {
+      setBodyKind("raw");
+      setBodyRaw(p.body);
+      const ct = (
+        p.contentType ||
+        p.headers.find((h) => h.key.toLowerCase() === "content-type")?.value ||
+        ""
+      ).toLowerCase();
+      setRawType(ct.includes("json") ? "json" : ct.includes("xml") ? "xml" : "text");
+    } else {
+      setBodyKind("none");
+      setBodyRaw("");
+    }
+    setImportOpen(false);
+    setImportText("");
+    setImportErr(null);
+    setError(null);
+  };
 
   const finalUrl = useMemo(() => {
     const qs = params
@@ -154,6 +200,24 @@ export default function HttpClient() {
       verifyTls,
     };
 
+    // 记录"真实请求"：把会被实际发送的 Content-Type、form 编码后的 body 也算进去
+    const effKind = hasBody ? bodyKind : "none";
+    const dispHeaders = hdrs.map((h) => ({ key: h.key, value: h.value }));
+    const hasCT = () => dispHeaders.some((h) => h.key.toLowerCase() === "content-type");
+    let sentBody = "";
+    if (effKind === "raw") {
+      sentBody = bodyRaw;
+      if (sentBody && !hasCT()) dispHeaders.push({ key: "Content-Type", value: RAW_TYPES[rawType] });
+    } else if (effKind === "form") {
+      sentBody = form
+        .filter((f) => f.enabled && f.key)
+        .map((f) => `${encodeURIComponent(f.key)}=${encodeURIComponent(f.value)}`)
+        .join("&");
+      if (!hasCT())
+        dispHeaders.push({ key: "Content-Type", value: "application/x-www-form-urlencoded" });
+    }
+    setSentReq({ method, url: finalUrl, headers: dispHeaders, body: sentBody });
+
     try {
       const r = await invoke<HttpResponse>("http_send", { req });
       setResp(r);
@@ -183,11 +247,27 @@ export default function HttpClient() {
     }
   }, [resp, pretty]);
 
+  const requestText = sentReq
+    ? `${sentReq.method} ${sentReq.url}\n` +
+      sentReq.headers.map((h) => `${h.key}: ${h.value}`).join("\n") +
+      (sentReq.body ? `\n\n${sentReq.body}` : "")
+    : "";
+
   return (
     <div className="tool-container">
       <div className="tool-header">
         <h2>HTTP 请求测试</h2>
         <div className="tool-actions">
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
+              setImportErr(null);
+              setImportOpen(true);
+            }}
+            title="从 cURL / fetch / PowerShell 导入"
+          >
+            导入
+          </button>
           {history.length > 0 && (
             <select
               className="search-input"
@@ -377,53 +457,107 @@ export default function HttpClient() {
 
       {error && <div className="error-banner">⚠ {error}</div>}
 
-      {/* 响应 */}
-      {resp && (
+      {/* 导入 cURL / fetch / PowerShell */}
+      {importOpen && (
+        <div className="modal-overlay" onClick={() => setImportOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>导入请求</h3>
+            <div className="dim" style={{ fontSize: 12 }}>
+              粘贴浏览器「Copy as cURL / fetch / fetch (Node.js) / PowerShell」的内容，自动识别解析
+            </div>
+            <textarea
+              className="code-area"
+              style={{ minHeight: 180 }}
+              placeholder={`curl 'https://api.example.com' -H 'accept: application/json' ...`}
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              spellCheck={false}
+              autoFocus
+            />
+            {importErr && <div className="error-banner" style={{ margin: 0 }}>⚠ {importErr}</div>}
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={() => setImportOpen(false)}>
+                取消
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={applyImport}
+                disabled={!importText.trim()}
+              >
+                解析导入
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 请求 / 响应 */}
+      {sentReq && (
         <div className="resp-panel">
           <div className="resp-meta">
-            <span className={`status-pill ${statusClass(resp.status)}`}>
-              {resp.status} {resp.statusText}
-            </span>
-            <span className="dim">{resp.durationMs} ms</span>
-            <span className="dim">{(resp.sizeBytes / 1024).toFixed(1)} KB</span>
-            {resp.truncated && <span className="warn-text">（响应过大，已截断）</span>}
+            {resp ? (
+              <>
+                <span className={`status-pill ${statusClass(resp.status)}`}>
+                  {resp.status} {resp.statusText}
+                </span>
+                <span className="dim">{resp.durationMs} ms</span>
+                <span className="dim">{(resp.sizeBytes / 1024).toFixed(1)} KB</span>
+                {resp.truncated && <span className="warn-text">（响应过大，已截断）</span>}
+              </>
+            ) : (
+              <span className="dim">
+                {loading ? "请求中…" : "请求已发送（响应见上方错误 / 见「请求」标签）"}
+              </span>
+            )}
+            {respTab === "body" && resp && !resp.bodyIsBinary && (
+              <>
+                <label className="inline-check" style={{ marginLeft: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={pretty}
+                    onChange={(e) => setPretty(e.target.checked)}
+                  />
+                  美化
+                </label>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => navigator.clipboard.writeText(resp.body)}
+                >
+                  复制
+                </button>
+              </>
+            )}
             <div className="resp-tabs">
+              <button
+                className={`sub-tab${respTab === "request" ? " active" : ""}`}
+                onClick={() => setRespTab("request")}
+              >
+                请求
+              </button>
               <button
                 className={`sub-tab${respTab === "body" ? " active" : ""}`}
                 onClick={() => setRespTab("body")}
               >
-                Body
+                响应 Body
               </button>
               <button
                 className={`sub-tab${respTab === "headers" ? " active" : ""}`}
                 onClick={() => setRespTab("headers")}
               >
-                Headers ({resp.headers.length})
+                响应 Headers ({resp ? resp.headers.length : 0})
               </button>
-              {respTab === "body" && !resp.bodyIsBinary && (
-                <>
-                  <label className="inline-check" style={{ marginLeft: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={pretty}
-                      onChange={(e) => setPretty(e.target.checked)}
-                    />
-                    美化
-                  </label>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => navigator.clipboard.writeText(resp.body)}
-                  >
-                    复制
-                  </button>
-                </>
-              )}
             </div>
           </div>
           <div className="resp-body">
-            {respTab === "body" ? (
-              <pre className="code-area mono">{displayBody}</pre>
-            ) : (
+            {respTab === "request" ? (
+              <pre className="code-area mono">{requestText}</pre>
+            ) : respTab === "body" ? (
+              resp ? (
+                <pre className="code-area mono">{displayBody}</pre>
+              ) : (
+                <div className="dim">无响应（请求可能失败，见顶部错误）</div>
+              )
+            ) : resp ? (
               <table>
                 <tbody>
                   {resp.headers.map(([k, v], i) => (
@@ -438,6 +572,8 @@ export default function HttpClient() {
                   ))}
                 </tbody>
               </table>
+            ) : (
+              <div className="dim">无响应</div>
             )}
           </div>
         </div>
