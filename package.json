@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "tauri dev",
     "dev:web": "vite",
-    "build": "tauri build",
+    "build": "tauri build --bundles dmg",
+    "dist": "tauri build --bundles dmg",
     "build:web": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

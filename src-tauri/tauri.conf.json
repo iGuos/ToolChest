@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1860",
     "beforeDevCommand": "pnpm dev:web",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "pnpm build:web"
   },
   "app": {
     "windows": [
@@ -34,6 +34,9 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.png"
-    ]
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
   }
 }
