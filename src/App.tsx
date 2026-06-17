@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import PortScanner from "./tools/PortScanner";
-import ClaudeWatcher from "./tools/ClaudeWatcher";
 import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
+import TrustApp from "./tools/TrustApp";
 
 interface ToolMeta {
   id: string;
@@ -17,7 +17,7 @@ const TOOLS: ToolMeta[] = [
   { id: "port-scanner", name: "端口查询", icon: "⚡" },
   { id: "http-client", name: "HTTP 请求测试", icon: "🌐" },
   { id: "hosts-editor", name: "Hosts 编辑器", icon: "📝" },
-  { id: "claude-watcher", name: "Claude 自动授权", icon: "🤖" },
+  { id: "trust-app", name: "Mac 应用授权", icon: "🔓" },
 ];
 
 const tabName = (id: string) =>
@@ -56,8 +56,8 @@ function renderTool(
       return <HttpClient />;
     case "hosts-editor":
       return <HostsEditor onDirty={(d) => onDirty("hosts-editor", d)} />;
-    case "claude-watcher":
-      return <ClaudeWatcher />;
+    case "trust-app":
+      return <TrustApp />;
     default:
       return null;
   }
