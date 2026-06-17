@@ -3,6 +3,7 @@ import PortScanner from "./tools/PortScanner";
 import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
 import TrustApp from "./tools/TrustApp";
+import TodoList from "./tools/TodoList";
 
 interface ToolMeta {
   id: string;
@@ -18,6 +19,7 @@ const TOOLS: ToolMeta[] = [
   { id: "http-client", name: "HTTP 请求测试", icon: "🌐" },
   { id: "hosts-editor", name: "Hosts 编辑器", icon: "📝" },
   { id: "trust-app", name: "Mac 应用授权", icon: "🔓" },
+  { id: "todo", name: "待办事项", icon: "📋" },
 ];
 
 const tabName = (id: string) =>
@@ -58,6 +60,8 @@ function renderTool(
       return <HostsEditor onDirty={(d) => onDirty("hosts-editor", d)} />;
     case "trust-app":
       return <TrustApp />;
+    case "todo":
+      return <TodoList />;
     default:
       return null;
   }
