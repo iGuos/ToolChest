@@ -339,6 +339,34 @@ select { cursor: pointer; }
   overflow: hidden;
 }
 
+/* ── DeepSeek 网页端（原生子 webview 覆盖在 .ds-host 上）── */
+.ds-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+.ds-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.ds-host {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  /* 占位文案在 webview 摆好之前可见，之后被原生 webview 盖住 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ds-placeholder {
+  color: var(--text-dim, #888);
+  font-size: 13px;
+}
+
 .tool-header {
   display: flex;
   align-items: center;

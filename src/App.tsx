@@ -4,6 +4,7 @@ import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
 import TrustApp from "./tools/TrustApp";
 import TodoList from "./tools/TodoList";
+import DeepSeek from "./tools/DeepSeek";
 
 interface ToolMeta {
   id: string;
@@ -20,6 +21,7 @@ const TOOLS: ToolMeta[] = [
   { id: "hosts-editor", name: "Hosts 编辑器", icon: "📝" },
   { id: "trust-app", name: "Mac 应用授权", icon: "🔓" },
   { id: "todo", name: "待办事项", icon: "📋" },
+  { id: "deepseek", name: "DeepSeek", icon: "🤖" },
 ];
 
 const tabName = (id: string) =>
@@ -47,7 +49,8 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
 function renderTool(
   id: string,
   onOpen: (id: string) => void,
-  onDirty: (id: string, dirty: boolean) => void
+  onDirty: (id: string, dirty: boolean) => void,
+  active: boolean
 ) {
   switch (id) {
     case HOME_ID:
@@ -62,6 +65,8 @@ function renderTool(
       return <TrustApp />;
     case "todo":
       return <TodoList />;
+    case "deepseek":
+      return <DeepSeek active={active} />;
     default:
       return null;
   }
@@ -343,7 +348,7 @@ export default function App() {
               key={id}
               className={`tool-pane${id === activeTab ? "" : " hidden"}`}
             >
-              {renderTool(id, openTool, markDirty)}
+              {renderTool(id, openTool, markDirty, id === activeTab)}
             </div>
           ))}
         </div>

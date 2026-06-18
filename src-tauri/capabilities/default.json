@@ -3,6 +3,10 @@
   "description": "Default capability for main window",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:webview:allow-create-webview",
+    "core:webview:allow-set-webview-position",
+    "core:webview:allow-set-webview-size",
+    "core:webview:allow-webview-close"
   ]
 }
