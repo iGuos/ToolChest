@@ -4,7 +4,7 @@ import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
 import TrustApp from "./tools/TrustApp";
 import TodoList from "./tools/TodoList";
-import DeepSeek from "./tools/DeepSeek";
+import { openDeepSeek } from "./tools/deepseek";
 
 interface ToolMeta {
   id: string;
@@ -64,8 +64,6 @@ function renderTool(
       return <TrustApp />;
     case "todo":
       return <TodoList />;
-    case "deepseek":
-      return <DeepSeek />;
     default:
       return null;
   }
@@ -102,8 +100,13 @@ export default function App() {
     });
   }, []);
 
-  // 打开一个工具：已开则只切换，未开则追加到末尾
+  // 打开一个工具：已开则只切换，未开则追加到末尾。
+  // DeepSeek 例外——它走独立窗口，点一下只开/前置窗口，不占用 tab。
   const openTool = (id: string) => {
+    if (id === "deepseek") {
+      openDeepSeek();
+      return;
+    }
     setOpenTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
     setActiveTab(id);
   };
