@@ -49,8 +49,7 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
 function renderTool(
   id: string,
   onOpen: (id: string) => void,
-  onDirty: (id: string, dirty: boolean) => void,
-  active: boolean
+  onDirty: (id: string, dirty: boolean) => void
 ) {
   switch (id) {
     case HOME_ID:
@@ -66,7 +65,7 @@ function renderTool(
     case "todo":
       return <TodoList />;
     case "deepseek":
-      return <DeepSeek active={active} />;
+      return <DeepSeek />;
     default:
       return null;
   }
@@ -348,7 +347,7 @@ export default function App() {
               key={id}
               className={`tool-pane${id === activeTab ? "" : " hidden"}`}
             >
-              {renderTool(id, openTool, markDirty, id === activeTab)}
+              {renderTool(id, openTool, markDirty)}
             </div>
           ))}
         </div>
