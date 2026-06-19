@@ -180,26 +180,28 @@ export default function LanShare() {
     }
   };
 
-  // 渲染对话项，按时间间隔插入时间分隔
+  // 渲染对话项：每条都带发送时间；间隔较大时再额外插一条居中时间分隔
   let lastTs = 0;
   const renderItem = (m: ChatItem) => {
-    const showTime = m.ts - lastTs > TIME_GAP;
+    const incoming = m.kind === "msg" ? m.incoming : m.direction === "in";
+    const showSep = m.ts - lastTs > TIME_GAP;
     lastTs = m.ts;
     return (
       <div key={m.id}>
-        {showTime && <div className="lan-time-sep">{fmtTime(m.ts)}</div>}
-        {m.kind === "msg" ? (
-          <div className={`lan-msg${m.incoming ? " in" : " out"}`}>
-            <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
-              {m.text}
-              {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
-            </div>
+        {showSep && <div className="lan-time-sep">{fmtTime(m.ts)}</div>}
+        <div className={`lan-msg${incoming ? " in" : " out"}`}>
+          <div className="lan-msg-col">
+            {m.kind === "msg" ? (
+              <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
+                {m.text}
+                {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
+              </div>
+            ) : (
+              <FileBubble f={m} onCancel={cancelTransfer} onAccept={requestConfirm} />
+            )}
+            <div className="lan-msg-time">{fmtTime(m.ts)}</div>
           </div>
-        ) : (
-          <div className={`lan-msg${m.direction === "in" ? " in" : " out"}`}>
-            <FileBubble f={m} onCancel={cancelTransfer} onAccept={requestConfirm} />
-          </div>
-        )}
+        </div>
       </div>
     );
   };

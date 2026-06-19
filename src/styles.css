@@ -786,6 +786,25 @@ select { cursor: pointer; }
   margin: 10px 0 6px;
 }
 
+/* 每条消息的气泡+时间纵列 */
+.lan-msg-col {
+  display: flex;
+  flex-direction: column;
+  max-width: 75%;
+}
+.lan-msg.out .lan-msg-col {
+  align-items: flex-end;
+}
+.lan-msg.in .lan-msg-col {
+  align-items: flex-start;
+}
+.lan-msg-time {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 3px;
+  padding: 0 2px;
+}
+
 /* ── DeepSeek 网页端（原生子 webview 覆盖在 .ds-host 上）── */
 .ds-bar {
   display: flex;
