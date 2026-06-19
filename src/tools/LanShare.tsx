@@ -2,13 +2,21 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { useLan, type Peer, type FileMsg } from "./lanContext";
+import { useLan, type Peer, type FileMsg, type ChatItem } from "./lanContext";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function fmtTime(ts: number): string {
+  const d = new Date(ts);
+  const now = new Date();
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (d.toDateString() === now.toDateString()) return hm;
+  return `${d.getMonth() + 1}-${d.getDate()} ${hm}`;
 }
 
 function deviceIcon(p: Peer): string {
@@ -19,31 +27,39 @@ function deviceIcon(p: Peer): string {
   return "💻";
 }
 
-function fileEmoji(name: string): string {
+function fileExtLabel(name: string): string {
   const e = name.split(".").pop()?.toLowerCase() ?? "";
-  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic"].includes(e)) return "🖼️";
-  if (["mp4", "mov", "avi", "mkv"].includes(e)) return "🎬";
-  if (["mp3", "wav", "flac", "aac"].includes(e)) return "🎵";
-  if (["zip", "rar", "7z", "tar", "gz"].includes(e)) return "🗜️";
-  if (["pdf"].includes(e)) return "📕";
-  if (["doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md"].includes(e)) return "📄";
-  return "📎";
+  return e && e.length <= 4 ? e.toUpperCase() : "FILE";
 }
 
-// 对话里的文件气泡
-function FileBubble({ f, onCancel }: { f: FileMsg; onCancel: (sid: string) => void }) {
+// 微信式文件气泡：左侧文件名+状态，右侧文件类型图标
+function FileBubble({
+  f,
+  onCancel,
+  onAccept,
+}: {
+  f: FileMsg;
+  onCancel: (sid: string) => void;
+  onAccept: (sid: string) => void;
+}) {
   const pct = f.size ? Math.min(100, (f.transferred / f.size) * 100) : 0;
-  const statusText =
-    f.status === "cancelled"
-      ? "已取消"
+  const clickable = f.status === "pending";
+  const sub =
+    f.status === "pending"
+      ? "点击接收"
+      : f.status === "cancelled"
+      ? "已取消 / 已过期"
       : f.status === "failed"
-      ? "失败"
+      ? "传输失败"
       : f.status === "done"
       ? fmtBytes(f.size)
       : `${fmtBytes(f.transferred)} / ${fmtBytes(f.size)} · ${fmtBytes(f.speed)}/s`;
+
   return (
-    <div className="lan-filecard">
-      <span className="lan-file-emoji">{fileEmoji(f.fileName)}</span>
+    <div
+      className={`lan-filecard${clickable ? " clickable" : ""}`}
+      onClick={clickable ? () => onAccept(f.sessionId) : undefined}
+    >
       <div className="lan-file-main">
         <div className="lan-file-name" title={f.fileName}>
           {f.fileName}
@@ -55,32 +71,44 @@ function FileBubble({ f, onCancel }: { f: FileMsg; onCancel: (sid: string) => vo
             <span className="lan-file-fill" style={{ width: `${pct}%` }} />
           </div>
         )}
-        <div className="lan-file-meta dim">
-          <span>{statusText}</span>
+        <div className="lan-file-sub dim">
+          <span className={f.status === "pending" ? "lan-file-accept" : ""}>{sub}</span>
           {f.status === "active" && (
-            <button className="lan-file-cancel" onClick={() => onCancel(f.sessionId)}>
+            <button
+              className="lan-file-act"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancel(f.sessionId);
+              }}
+            >
               取消
             </button>
           )}
           {f.status === "done" && f.direction === "in" && f.path && (
             <button
-              className="lan-file-cancel"
-              onClick={() => invoke("lan_reveal", { path: f.path })}
+              className="lan-file-act"
+              onClick={(e) => {
+                e.stopPropagation();
+                invoke("lan_reveal", { path: f.path });
+              }}
             >
               打开位置
             </button>
           )}
         </div>
       </div>
+      <span className="lan-file-ic">{fileExtLabel(f.fileName)}</span>
     </div>
   );
 }
+
+const TIME_GAP = 5 * 60 * 1000; // 超过 5 分钟显示一次时间分隔
 
 export default function LanShare() {
   const {
     me, peers, items, unread, selected, error,
     setSelected, setError, refreshPeers, sendMessage, sendFiles,
-    cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
+    cancelTransfer, requestConfirm, setAlias, setCompat, pickDir, addPeerByIp,
   } = useLan();
 
   const [aliasDraft, setAliasDraft] = useState("");
@@ -105,7 +133,6 @@ export default function LanShare() {
     [items, selected]
   );
 
-  // 新内容时滚到底部
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [thread.length, selected]);
@@ -151,6 +178,30 @@ export default function LanShare() {
     } finally {
       setAdding(false);
     }
+  };
+
+  // 渲染对话项，按时间间隔插入时间分隔
+  let lastTs = 0;
+  const renderItem = (m: ChatItem) => {
+    const showTime = m.ts - lastTs > TIME_GAP;
+    lastTs = m.ts;
+    return (
+      <div key={m.id}>
+        {showTime && <div className="lan-time-sep">{fmtTime(m.ts)}</div>}
+        {m.kind === "msg" ? (
+          <div className={`lan-msg${m.incoming ? " in" : " out"}`}>
+            <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
+              {m.text}
+              {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
+            </div>
+          </div>
+        ) : (
+          <div className={`lan-msg${m.direction === "in" ? " in" : " out"}`}>
+            <FileBubble f={m} onCancel={cancelTransfer} onAccept={requestConfirm} />
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -232,29 +283,24 @@ export default function LanShare() {
               <div className="lan-chat-head">
                 <b>{selectedPeer.alias}</b>
                 <span className="dim">{selectedPeer.ip}</span>
-                <button className="btn btn-primary btn-sm" onClick={() => sendFiles(selectedPeer.fingerprint)}>
-                  📎 发送文件
-                </button>
               </div>
 
               <div className="lan-chat" ref={chatRef}>
                 {thread.length === 0 && (
-                  <div className="dim">还没有消息。可发消息，或把文件拖进来发送。</div>
+                  <div className="dim">还没有消息。可发消息，或用下方 📎 / 拖拽发送文件。</div>
                 )}
-                {thread.map((m) =>
-                  m.kind === "msg" ? (
-                    <div key={m.id} className={`lan-msg${m.incoming ? " in" : " out"}`}>
-                      <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
-                        {m.text}
-                        {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
-                      </div>
-                    </div>
-                  ) : (
-                    <div key={m.id} className={`lan-msg${m.direction === "in" ? " in" : " out"}`}>
-                      <FileBubble f={m} onCancel={cancelTransfer} />
-                    </div>
-                  )
-                )}
+                {thread.map(renderItem)}
+              </div>
+
+              {/* 文本框上方的操作工具条 */}
+              <div className="lan-toolbar">
+                <button
+                  className="lan-tool-btn"
+                  title="发送文件"
+                  onClick={() => sendFiles(selectedPeer.fingerprint)}
+                >
+                  📎
+                </button>
               </div>
 
               <div className="lan-input-row">

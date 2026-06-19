@@ -11,7 +11,7 @@ function fmtBytes(n: number): string {
 // 收到文件请求的确认弹框。渲染在 app 根部，无论当前在哪个 tab 都能看到。
 // 支持勾选只接收部分文件；不操作则后端 70s 超时自动拒绝。
 export default function LanIncomingModal() {
-  const { incoming, respond } = useLan();
+  const { confirm: incoming, respond } = useLan();
   const [picked, setPicked] = useState<Set<string>>(new Set());
 
   useEffect(() => {

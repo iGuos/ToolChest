@@ -682,24 +682,22 @@ select { cursor: pointer; }
   opacity: 0.7;
 }
 
-/* 对话里的文件气泡（微信式） */
+/* 对话里的文件气泡（微信式：左名右图标） */
 .lan-filecard {
   display: flex;
   align-items: center;
-  gap: 10px;
-  width: 270px;
+  gap: 12px;
+  width: 268px;
   max-width: 70vw;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: var(--bg2);
-}
-.lan-msg.out .lan-filecard {
+  padding: 12px;
+  border-radius: 10px;
   background: var(--bg3);
-  border: 1px solid var(--accent);
 }
-.lan-file-emoji {
-  font-size: 26px;
-  flex-shrink: 0;
+.lan-filecard.clickable {
+  cursor: pointer;
+}
+.lan-filecard.clickable:hover {
+  background: var(--bg-hover);
 }
 .lan-file-main {
   flex: 1;
@@ -707,16 +705,18 @@ select { cursor: pointer; }
 }
 .lan-file-name {
   font-size: 13px;
-  white-space: nowrap;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 .lan-file-bar {
   height: 5px;
   background: var(--bg);
   border-radius: 3px;
   overflow: hidden;
-  margin: 6px 0 4px;
+  margin: 7px 0 5px;
 }
 .lan-file-fill {
   display: block;
@@ -724,20 +724,66 @@ select { cursor: pointer; }
   background: var(--accent);
   transition: width 0.15s;
 }
-.lan-file-meta {
+.lan-file-sub {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   font-size: 11px;
+  margin-top: 4px;
 }
-.lan-file-cancel {
+.lan-file-accept {
+  color: var(--accent-h);
+}
+.lan-file-act {
   background: none;
   border: none;
   color: var(--accent-h);
   cursor: pointer;
   font-size: 11px;
   padding: 0;
+}
+.lan-file-ic {
+  width: 42px;
+  height: 50px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+/* 文本框上方的工具条 */
+.lan-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px 0;
+}
+.lan-tool-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.lan-tool-btn:hover {
+  background: var(--bg-hover);
+}
+
+/* 时间分隔 */
+.lan-time-sep {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 11px;
+  margin: 10px 0 6px;
 }
 
 /* ── DeepSeek 网页端（原生子 webview 覆盖在 .ds-host 上）── */

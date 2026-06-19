@@ -493,13 +493,18 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
         }),
     );
 
-    // 等用户确认（超时视为拒绝）
-    let decision = rx.recv_timeout(Duration::from_secs(70));
+    // 等用户确认（会话里点击文件后才确认；超时视为拒绝）
+    let decision = rx.recv_timeout(Duration::from_secs(300));
     state.0.lock().unwrap().decisions.remove(&session_id);
 
     let decision = match decision {
         Ok(d) if d.accept => d,
-        _ => return respond_text(request, 403, "declined"),
+        Ok(_) => return respond_text(request, 403, "declined"),
+        Err(_) => {
+            // 超时：通知前端把这些待接收文件标记为已过期
+            let _ = app.emit("lan://offer-timeout", serde_json::json!({ "sessionId": session_id }));
+            return respond_text(request, 403, "timeout");
+        }
     };
 
     // 建立会话：只为被接受的文件发 token

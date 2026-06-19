@@ -10,9 +10,9 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-// LAN 互传的全局状态：服务在 app 启动即常驻运行，来件提醒、未读计数等
-// 都不依赖「局域网互传」这个 tab 是否打开（修复「切走 tab 收不到」）。
-// 文件传输以「文件气泡」形式归入对应对端的对话流（微信式）。
+// LAN 互传的全局状态：服务在 app 启动即常驻运行。
+// 收文件不立即弹窗——会话里先出现「待接收」文件气泡，点击才弹框确认。
+// 文件传输以文件气泡形式归入对应对端的对话流（微信式）。
 
 export interface MyInfo {
   alias: string;
@@ -55,7 +55,7 @@ export interface TextMsg {
   incoming: boolean;
   failed?: boolean;
 }
-export type FileStatus = "active" | "done" | "cancelled" | "failed";
+export type FileStatus = "pending" | "active" | "done" | "cancelled" | "failed";
 export interface FileMsg {
   kind: "file";
   id: string; // = `${direction}:${sessionId}:${fileId}`
@@ -79,7 +79,7 @@ interface LanCtxValue {
   me: MyInfo | null;
   peers: Peer[];
   items: ChatItem[];
-  incoming: Incoming | null;
+  confirm: Incoming | null; // 当前正在确认接收的请求（点击待接收文件后弹出）
   unread: Record<string, number>;
   totalUnread: number;
   selected: string | null;
@@ -87,6 +87,7 @@ interface LanCtxValue {
   setSelected: (fp: string | null) => void;
   setError: (e: string | null) => void;
   refreshPeers: () => Promise<void>;
+  requestConfirm: (sessionId: string) => void;
   respond: (accept: boolean, fileIds: string[]) => Promise<void>;
   sendMessage: (fp: string, text: string) => Promise<void>;
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
@@ -113,13 +114,14 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<MyInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [items, setItems] = useState<ChatItem[]>([]);
-  const [incoming, setIncoming] = useState<Incoming | null>(null);
+  const [confirm, setConfirm] = useState<Incoming | null>(null);
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [selected, setSelectedRaw] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
+  const offersRef = useRef<Record<string, Incoming>>({}); // sessionId -> 待接收请求
 
   const bumpUnread = useCallback((fp: string) => {
     if (fp && fp !== selectedRef.current) {
@@ -127,7 +129,6 @@ export function LanProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // 新建或更新一个文件气泡（按 key 去重）
   const upsertFile = useCallback((patch: Partial<FileMsg> & { id: string }) => {
     setItems((list) => {
       const idx = list.findIndex((x) => x.kind === "file" && x.id === patch.id);
@@ -187,22 +188,43 @@ export function LanProvider({ children }: { children: ReactNode }) {
       track(await listen<Peer[]>("lan://peers", (e) => setPeers(e.payload)));
       track(
         await listen<Incoming>("lan://incoming", (e) => {
-          setIncoming(e.payload);
-          bumpUnread(e.payload.fingerprint);
+          // 不立即弹窗：登记请求 + 在对话里放「待接收」文件气泡
+          const inc = e.payload;
+          offersRef.current = { ...offersRef.current, [inc.sessionId]: inc };
+          for (const f of inc.files) {
+            upsertFile({
+              id: fileKey("in", inc.sessionId, f.id),
+              sessionId: inc.sessionId,
+              fileId: f.id,
+              fingerprint: inc.fingerprint,
+              fileName: f.fileName,
+              size: f.size,
+              direction: "in",
+              status: "pending",
+            });
+          }
+          bumpUnread(inc.fingerprint);
         })
       );
       track(
-        await listen<{ fingerprint: string; alias: string; text: string; ts: number }>(
-          "lan://message",
-          (e) => {
-            const m = e.payload;
-            setItems((l) => [
-              ...l,
-              { kind: "msg", id: nextId(), fingerprint: m.fingerprint, text: m.text, ts: Date.now(), incoming: true },
-            ]);
-            bumpUnread(m.fingerprint);
+        await listen<{ sessionId: string }>("lan://offer-timeout", (e) => {
+          const inc = offersRef.current[e.payload.sessionId];
+          if (inc) {
+            for (const f of inc.files) {
+              upsertFile({ id: fileKey("in", inc.sessionId, f.id), status: "cancelled" });
+            }
           }
-        )
+        })
+      );
+      track(
+        await listen<{ fingerprint: string; alias: string; text: string }>("lan://message", (e) => {
+          const m = e.payload;
+          setItems((l) => [
+            ...l,
+            { kind: "msg", id: nextId(), fingerprint: m.fingerprint, text: m.text, ts: Date.now(), incoming: true },
+          ]);
+          bumpUnread(m.fingerprint);
+        })
       );
       track(
         await listen<{
@@ -241,13 +263,14 @@ export function LanProvider({ children }: { children: ReactNode }) {
             const idx = list.findIndex((x) => x.kind === "file" && x.id === id);
             const now = Date.now();
             if (idx < 0) {
-              const f: FileMsg = {
-                kind: "file", id, sessionId: p.sessionId, fileId: p.fileId,
-                fingerprint: p.peer, fileName: p.fileName, size: p.size,
-                transferred: p.transferred, direction: p.direction, status: "active",
-                verified: null, speed: 0, ts: now, updatedAt: now,
-              };
-              return [...list, f];
+              return [
+                ...list,
+                {
+                  kind: "file", id, sessionId: p.sessionId, fileId: p.fileId, fingerprint: p.peer,
+                  fileName: p.fileName, size: p.size, transferred: p.transferred, direction: p.direction,
+                  status: "active", verified: null, speed: 0, ts: now, updatedAt: now,
+                } as FileMsg,
+              ];
             }
             const prev = list[idx] as FileMsg;
             const dt = (now - prev.updatedAt) / 1000;
@@ -259,42 +282,21 @@ export function LanProvider({ children }: { children: ReactNode }) {
         })
       );
       track(
-        await listen<{ sessionId: string; fileId: string; fingerprint: string }>(
-          "lan://sent",
-          (e) => {
-            const s = e.payload;
-            upsertFile({
-              id: fileKey("out", s.sessionId, s.fileId),
-              sessionId: s.sessionId,
-              fileId: s.fileId,
-              status: "done",
-            });
-          }
-        )
+        await listen<{ sessionId: string; fileId: string }>("lan://sent", (e) => {
+          upsertFile({ id: fileKey("out", e.payload.sessionId, e.payload.fileId), status: "done" });
+        })
       );
       track(
         await listen<{
-          fileName: string;
-          path: string;
-          size: number;
-          verified: boolean | null;
-          sessionId: string;
-          fileId: string;
-          peer: string;
+          fileName: string; path: string; size: number; verified: boolean | null;
+          sessionId: string; fileId: string; peer: string;
         }>("lan://received", (e) => {
           const r = e.payload;
           upsertFile({
             id: fileKey("in", r.sessionId, r.fileId),
-            sessionId: r.sessionId,
-            fileId: r.fileId,
-            fingerprint: r.peer,
-            fileName: r.fileName,
-            size: r.size,
-            transferred: r.size,
-            direction: "in",
-            status: "done",
-            verified: r.verified,
-            path: r.path,
+            sessionId: r.sessionId, fileId: r.fileId, fingerprint: r.peer,
+            fileName: r.fileName, size: r.size, transferred: r.size,
+            direction: "in", status: "done", verified: r.verified, path: r.path,
           });
           bumpUnread(r.peer);
         })
@@ -316,32 +318,37 @@ export function LanProvider({ children }: { children: ReactNode }) {
     };
   }, [refreshPeers, bumpUnread, upsertFile]);
 
-  const respond = useCallback(async (accept: boolean, fileIds: string[]) => {
-    setIncoming((cur) => {
-      if (cur) {
-        invoke("lan_respond", { sessionId: cur.sessionId, accept, fileIds }).catch((e) =>
-          setError(String(e))
-        );
-        if (accept) {
-          const want = fileIds.length ? new Set(fileIds) : null;
+  // 点击「待接收」文件 → 打开确认框
+  const requestConfirm = useCallback((sessionId: string) => {
+    const inc = offersRef.current[sessionId];
+    if (inc) setConfirm(inc);
+  }, []);
+
+  const respond = useCallback(
+    async (accept: boolean, fileIds: string[]) => {
+      setConfirm((cur) => {
+        if (cur) {
+          invoke("lan_respond", { sessionId: cur.sessionId, accept, fileIds }).catch((e) =>
+            setError(String(e))
+          );
+          const want = new Set(fileIds);
           for (const f of cur.files) {
-            if (want && !want.has(f.id)) continue;
-            upsertFile({
-              id: fileKey("in", cur.sessionId, f.id),
-              sessionId: cur.sessionId,
-              fileId: f.id,
-              fingerprint: cur.fingerprint,
-              fileName: f.fileName,
-              size: f.size,
-              direction: "in",
-              status: "active",
-            });
+            const id = fileKey("in", cur.sessionId, f.id);
+            if (accept && (want.size === 0 || want.has(f.id))) {
+              upsertFile({ id, status: "active" });
+            } else {
+              upsertFile({ id, status: "cancelled" });
+            }
           }
+          const next = { ...offersRef.current };
+          delete next[cur.sessionId];
+          offersRef.current = next;
         }
-      }
-      return null;
-    });
-  }, [upsertFile]);
+        return null;
+      });
+    },
+    [upsertFile]
+  );
 
   const sendMessage = useCallback(async (fp: string, text: string) => {
     const t = text.trim();
@@ -355,9 +362,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
       await invoke("lan_send_message", { fingerprint: fp, text: t });
     } catch (e) {
       setError(String(e));
-      setItems((l) =>
-        l.map((x) => (x.kind === "msg" && x.id === id ? { ...x, failed: true } : x))
-      );
+      setItems((l) => l.map((x) => (x.kind === "msg" && x.id === id ? { ...x, failed: true } : x)));
     }
   }, []);
 
@@ -417,25 +422,9 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
 
   const value: LanCtxValue = {
-    me,
-    peers,
-    items,
-    incoming,
-    unread,
-    totalUnread,
-    selected,
-    error,
-    setSelected,
-    setError,
-    refreshPeers,
-    respond,
-    sendMessage,
-    sendFiles,
-    cancelTransfer,
-    setAlias,
-    setCompat,
-    pickDir,
-    addPeerByIp,
+    me, peers, items, confirm, unread, totalUnread, selected, error,
+    setSelected, setError, refreshPeers, requestConfirm, respond,
+    sendMessage, sendFiles, cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
   };
 
   return <LanCtx.Provider value={value}>{children}</LanCtx.Provider>;
