@@ -294,26 +294,29 @@ export default function LanShare() {
                 {thread.map(renderItem)}
               </div>
 
-              {/* 文本框上方的操作工具条 */}
-              <div className="lan-toolbar">
-                <button
-                  className="lan-tool-btn"
-                  title="发送文件"
-                  onClick={() => sendFiles(selectedPeer.fingerprint)}
-                >
-                  📎
-                </button>
-              </div>
-
-              <div className="lan-input-row">
-                <input
-                  className="url-input"
-                  placeholder={`给 ${selectedPeer.alias} 发消息…`}
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && send()}
-                />
-                <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>发送</button>
+              {/* 输入区：上方工具条 + 文本框 */}
+              <div className="lan-composer">
+                <div className="lan-toolbar">
+                  <button
+                    className="lan-tool-btn"
+                    title="发送文件"
+                    onClick={() => sendFiles(selectedPeer.fingerprint)}
+                  >
+                    📎
+                  </button>
+                </div>
+                <div className="lan-input-row">
+                  <input
+                    className="lan-input"
+                    placeholder={`给 ${selectedPeer.alias} 发消息…`}
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && send()}
+                  />
+                  <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>
+                    发送
+                  </button>
+                </div>
               </div>
             </>
           )}

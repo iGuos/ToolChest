@@ -89,6 +89,7 @@ interface LanCtxValue {
   setError: (e: string | null) => void;
   refreshPeers: () => Promise<void>;
   requestConfirm: (sessionId: string) => void;
+  dismissConfirm: () => void;
   respond: (accept: boolean, fileIds: string[]) => Promise<void>;
   acceptAllPending: () => void;
   sendMessage: (fp: string, text: string) => Promise<void>;
@@ -330,6 +331,9 @@ export function LanProvider({ children }: { children: ReactNode }) {
     if (inc) setConfirm(inc);
   }, []);
 
+  // 仅关闭弹框，不接受也不拒绝（文件保留为待接收，可稍后再点）
+  const dismissConfirm = useCallback(() => setConfirm(null), []);
+
   const respond = useCallback(
     async (accept: boolean, fileIds: string[]) => {
       setConfirm((cur) => {
@@ -450,7 +454,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
 
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
-    setSelected, setError, refreshPeers, requestConfirm, respond, acceptAllPending,
+    setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond, acceptAllPending,
     sendMessage, sendFiles, cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
   };
 

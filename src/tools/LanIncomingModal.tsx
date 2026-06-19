@@ -12,7 +12,8 @@ function fmtBytes(n: number): string {
 //   「当前文件」默认只确认点击的这次请求（可勾选其中文件）；
 //   「全部待接收」列出所有发送方待接收的文件，可一次全部接收。
 export default function LanIncomingModal() {
-  const { confirm: incoming, pendingFiles, peers, respond, acceptAllPending } = useLan();
+  const { confirm: incoming, pendingFiles, peers, respond, acceptAllPending, dismissConfirm } =
+    useLan();
   const [tab, setTab] = useState<"current" | "all">("current");
   const [picked, setPicked] = useState<Set<string>>(new Set());
 
@@ -40,9 +41,14 @@ export default function LanIncomingModal() {
   const allTotal = pendingFiles.reduce((a, f) => a + f.size, 0);
 
   return (
-    <div className="modal-overlay" onClick={() => respond(false, [])}>
+    <div className="modal-overlay" onClick={dismissConfirm}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3>收到文件请求</h3>
+        <div className="modal-head">
+          <h3>收到文件请求</h3>
+          <button className="modal-close" title="关闭（保留待接收）" onClick={dismissConfirm}>
+            ×
+          </button>
+        </div>
 
         <div className="sub-tabs" style={{ marginTop: 4 }}>
           <button
@@ -101,7 +107,7 @@ export default function LanIncomingModal() {
               ))}
             </div>
             <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => respond(false, [])}>关闭</button>
+              <button className="btn btn-ghost" onClick={dismissConfirm}>关闭</button>
               <button
                 className="btn btn-primary"
                 disabled={pendingFiles.length === 0}
