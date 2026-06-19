@@ -18,6 +18,26 @@
   --sidebar-w: 210px;
 }
 
+/* 浅色主题：跟随系统时由 JS 把 data-theme 解析成 light/dark 再设到 <html> 上 */
+[data-theme="light"] {
+  --bg: #ffffff;
+  --bg2: #f5f5f5;
+  --bg3: #eaeaea;
+  --bg-hover: #e3e3e3;
+  --bg-active: #d6e9fb;
+  --accent: #0a72c4;
+  --accent-h: #2b8ad6;
+  --text: #2b2b2b;
+  --text-dim: #767676;
+  --text-hi: #111111;
+  --border: #d0d0d0;
+  --red: #d92b2b;
+  --red-h: #e53935;
+  --green: #198f7e;
+  --yellow: #9a7d00;
+  --blue: #0277bd;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
@@ -134,6 +154,29 @@ select { cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+/* 主题选择：三选一分段按钮 */
+.theme-options {
+  display: flex;
+  gap: 8px;
+}
+.theme-opt {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg3);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.theme-opt:hover {
+  border-color: var(--accent);
+}
+.theme-opt.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 .settings-card {
   display: flex;
@@ -1130,6 +1173,11 @@ select { cursor: pointer; }
   color: var(--text-dim);
   font-size: 11px;
   margin: 10px 0 6px;
+}
+.lan-loadmore {
+  text-align: center;
+  font-size: 11px;
+  padding: 4px 0 8px;
 }
 
 /* 每条消息的气泡+时间纵列 */

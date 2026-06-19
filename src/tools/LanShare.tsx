@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -175,6 +175,7 @@ function FileBubble({
 
 const TIME_GAP = 5 * 60 * 1000; // 超过 5 分钟显示一次时间分隔
 const RECALL_WINDOW = 5 * 60 * 1000; // 文本消息可撤回的时限（5 分钟，参考微信）
+const PAGE_SIZE = 20; // 聊天记录每页条数：默认显示最近 20 条，向上滚动再加载 20 条
 
 export default function LanShare() {
   const {
@@ -290,6 +291,37 @@ export default function LanShare() {
     () => items.filter((x) => x.fingerprint === selected).sort((a, b) => a.ts - b.ts),
     [items, selected]
   );
+
+  // 分页：只渲染最近 visibleCount 条；向上滚到顶再加载 PAGE_SIZE 条
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE); // 切换设备时重置到最近一页
+  }, [selected]);
+  const visibleThread = useMemo(
+    () => thread.slice(Math.max(0, thread.length - visibleCount)),
+    [thread, visibleCount]
+  );
+  const hasMore = thread.length > visibleCount;
+  // 加载更早记录时，保持当前阅读位置不跳动
+  const prependRef = useRef<{ pending: boolean; prevHeight: number }>({
+    pending: false,
+    prevHeight: 0,
+  });
+  const onChatScroll = () => {
+    const el = chatRef.current;
+    if (!el || !hasMore) return;
+    if (el.scrollTop < 40) {
+      prependRef.current = { pending: true, prevHeight: el.scrollHeight };
+      setVisibleCount((c) => Math.min(thread.length, c + PAGE_SIZE));
+    }
+  };
+  useLayoutEffect(() => {
+    const el = chatRef.current;
+    if (el && prependRef.current.pending) {
+      el.scrollTop = el.scrollHeight - prependRef.current.prevHeight;
+      prependRef.current.pending = false;
+    }
+  }, [visibleCount]);
 
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
@@ -557,11 +589,12 @@ export default function LanShare() {
                 <span className="dim">{selectedPeer.ip}</span>
               </div>
 
-              <div className="lan-chat" ref={chatRef}>
+              <div className="lan-chat" ref={chatRef} onScroll={onChatScroll}>
                 {thread.length === 0 && (
                   <div className="dim">还没有消息。可发消息，或点下方回形针按钮 / 拖拽发送文件。</div>
                 )}
-                {thread.map(renderItem)}
+                {hasMore && <div className="lan-loadmore dim">↑ 上滑加载更早的消息</div>}
+                {visibleThread.map(renderItem)}
               </div>
 
               {/* 输入区：上方工具条 + 文本框 */}

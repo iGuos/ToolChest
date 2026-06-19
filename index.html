@@ -4,14 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>百宝箱</title>
-    <!-- 首屏底色：在 styles.css 加载前就铺深色，消除启动时的白屏闪烁 -->
+    <!-- 首屏底色：在 styles.css 加载前就按已存主题铺好背景，消除启动闪烁/错色 -->
     <style>
-      html,
-      body {
-        margin: 0;
-        background: #1e1e1e;
-      }
+      html { background: #1e1e1e; }
+      html, body { margin: 0; }
     </style>
+    <script>
+      try {
+        var s = JSON.parse(localStorage.getItem("baibao.settings.v1") || "{}");
+        var t = s.theme || "dark";
+        if (t === "system") {
+          t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        }
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.background = t === "light" ? "#ffffff" : "#1e1e1e";
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

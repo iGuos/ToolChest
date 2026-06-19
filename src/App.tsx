@@ -33,11 +33,18 @@ const tabName = (id: string) =>
 
 // ── 应用设置（localStorage 持久化，结构预留以便后续扩展）──
 const SETTINGS_KEY = "baibao.settings.v1";
+type ThemeMode = "light" | "dark" | "system";
 interface Settings {
   hiddenTools: string[]; // 在侧栏/首页隐藏的工具 id
   order: string[]; // 工具自定义排序（id 顺序；不在此列的按 TOOLS 默认序追加）
+  theme: ThemeMode; // 主题：浅色 / 深色 / 跟随系统
 }
-const DEFAULT_SETTINGS: Settings = { hiddenTools: [], order: [] };
+const DEFAULT_SETTINGS: Settings = { hiddenTools: [], order: [], theme: "dark" };
+const THEME_OPTIONS: { id: ThemeMode; name: string }[] = [
+  { id: "light", name: "浅色" },
+  { id: "dark", name: "深色" },
+  { id: "system", name: "跟随系统" },
+];
 
 function loadSettings(): Settings {
   try {
@@ -146,6 +153,26 @@ export default function App() {
       /* 忽略写入失败 */
     }
   }, [settings]);
+  // 应用主题：跟随系统时解析 prefers-color-scheme，并监听系统切换
+  useEffect(() => {
+    const root = document.documentElement;
+    const apply = () => {
+      const t =
+        settings.theme === "system"
+          ? window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light"
+          : settings.theme;
+      root.dataset.theme = t;
+      root.style.background = t === "light" ? "#ffffff" : "#1e1e1e";
+    };
+    apply();
+    if (settings.theme === "system") {
+      const mq = window.matchMedia("(prefers-color-scheme: dark)");
+      mq.addEventListener("change", apply);
+      return () => mq.removeEventListener("change", apply);
+    }
+  }, [settings.theme]);
   const hiddenTools = new Set(settings.hiddenTools);
   const orderedTools = orderTools(settings.order);
   const visibleTools = orderedTools.filter((t) => !hiddenTools.has(t.id));
@@ -484,6 +511,20 @@ export default function App() {
                       onClick={(e) => e.stopPropagation()}
                     />
                   </div>
+                ))}
+              </div>
+            </div>
+            <div className="settings-section">
+              <div className="settings-section-title">主题</div>
+              <div className="theme-options">
+                {THEME_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    className={`theme-opt${settings.theme === opt.id ? " active" : ""}`}
+                    onClick={() => setSettings((s) => ({ ...s, theme: opt.id }))}
+                  >
+                    {opt.name}
+                  </button>
                 ))}
               </div>
             </div>
