@@ -332,10 +332,17 @@ export default function LanShare() {
                 onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
               />
             </div>
-            <label className="settings-field">
+            <div className="settings-field">
               <span>兼容 LocalSend（可与手机/电脑上的 LocalSend 互传）</span>
-              <input type="checkbox" checked={!!me?.compat} onChange={(e) => setCompat(e.target.checked)} />
-            </label>
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={!!me?.compat}
+                  onChange={(e) => setCompat(e.target.checked)}
+                />
+                <span className="switch-slider" />
+              </label>
+            </div>
             <div className="settings-field">
               <span>接收目录</span>
               <span className="settings-field-val dim" title={me?.downloadDir}>{me?.downloadDir}</span>
