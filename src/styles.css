@@ -665,13 +665,43 @@ select { cursor: pointer; }
   flex-shrink: 0;
 }
 .lan-dot {
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  background: var(--text-dim);
+  background: var(--red);
+  flex-shrink: 0;
 }
 .lan-dot.on {
-  background: var(--green);
+  background: #2ecc71;
+  box-shadow: 0 0 0 3px rgba(46, 204, 113, 0.25);
+  animation: lan-pulse 2s ease-in-out infinite;
+}
+@keyframes lan-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(46, 204, 113, 0.28); }
+  50% { box-shadow: 0 0 0 5px rgba(46, 204, 113, 0.08); }
+}
+
+/* 标题行右侧：服务状态 + 设置齿轮 */
+.lan-status-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.lan-gear {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  margin-left: 4px;
+  border-radius: 6px;
+  opacity: 0.8;
+}
+.lan-gear:hover {
+  background: var(--bg-hover);
+  opacity: 1;
 }
 .lan-dir {
   max-width: 280px;

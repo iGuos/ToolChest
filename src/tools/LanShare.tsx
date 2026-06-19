@@ -108,7 +108,7 @@ export default function LanShare() {
   const {
     me, peers, items, unread, selected, error,
     setSelected, setError, refreshPeers, sendMessage, sendFiles,
-    cancelTransfer, requestConfirm, addPeerByIp,
+    cancelTransfer, requestConfirm, addPeerByIp, setAlias, setCompat, pickDir,
   } = useLan();
 
   const [draft, setDraft] = useState("");
@@ -116,6 +116,12 @@ export default function LanShare() {
   const [addOpen, setAddOpen] = useState(false);
   const [addIp, setAddIp] = useState("");
   const [adding, setAdding] = useState(false);
+  const [setOpen, setSetOpen] = useState(false);
+  const [aliasDraft, setAliasDraft] = useState("");
+
+  useEffect(() => {
+    if (setOpen && me) setAliasDraft(me.alias);
+  }, [setOpen, me]);
 
   const bodyRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
@@ -209,6 +215,9 @@ export default function LanShare() {
           <span className={`lan-dot${me?.running ? " on" : ""}`} />
           {me?.running ? "服务运行中" : "未运行"}
           {me?.ip && <span className="dim">· 本机 {me.ip}:{me.port}</span>}
+          <button className="lan-gear" title="局域网互传设置" onClick={() => setSetOpen(true)}>
+            ⚙️
+          </button>
         </div>
       </div>
 
@@ -304,6 +313,40 @@ export default function LanShare() {
           )}
         </div>
       </div>
+
+      {setOpen && (
+        <div className="modal-overlay" onClick={() => setSetOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>局域网互传设置</h3>
+              <button className="modal-close" onClick={() => setSetOpen(false)}>×</button>
+            </div>
+            <div className="settings-field">
+              <span>设备名</span>
+              <input
+                className="kv-input"
+                style={{ width: 200 }}
+                value={aliasDraft}
+                onChange={(e) => setAliasDraft(e.target.value)}
+                onBlur={() => aliasDraft.trim() && aliasDraft.trim() !== me?.alias && setAlias(aliasDraft)}
+                onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+              />
+            </div>
+            <label className="settings-field">
+              <span>兼容 LocalSend（可与手机/电脑上的 LocalSend 互传）</span>
+              <input type="checkbox" checked={!!me?.compat} onChange={(e) => setCompat(e.target.checked)} />
+            </label>
+            <div className="settings-field">
+              <span>接收目录</span>
+              <span className="settings-field-val dim" title={me?.downloadDir}>{me?.downloadDir}</span>
+              <button className="btn btn-ghost btn-sm" onClick={pickDir}>更改</button>
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-primary" onClick={() => setSetOpen(false)}>完成</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {addOpen && (
         <div className="modal-overlay" onClick={() => setAddOpen(false)}>

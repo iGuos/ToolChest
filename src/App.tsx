@@ -116,15 +116,7 @@ function renderTool(
 }
 
 export default function App() {
-  // 局域网：未读总数（侧栏红点）+ 设置项（设备名/兼容/接收目录）
-  const {
-    totalUnread,
-    me: lanMe,
-    setAlias: lanSetAlias,
-    setCompat: lanSetCompat,
-    pickDir: lanPickDir,
-  } = useLan();
-  const [lanAlias, setLanAlias] = useState("");
+  const { totalUnread } = useLan(); // 局域网未读消息总数（用于侧栏红点）
   // 已打开的 tab（首页恒常驻，不可关闭）与当前激活的 tab
   const [openTabs, setOpenTabs] = useState<string[]>([HOME_ID]);
   const [activeTab, setActiveTab] = useState<string>(HOME_ID);
@@ -147,10 +139,6 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dragToolId, setDragToolId] = useState<string | null>(null);
-  // 打开设置时把当前设备名填入输入框
-  useEffect(() => {
-    if (settingsOpen && lanMe) setLanAlias(lanMe.alias);
-  }, [settingsOpen, lanMe]);
   useEffect(() => {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -499,39 +487,6 @@ export default function App() {
                 ))}
               </div>
             </div>
-
-            <div className="settings-section">
-              <div className="settings-section-title">局域网互传</div>
-              <div className="settings-field">
-                <span>设备名</span>
-                <input
-                  className="kv-input"
-                  style={{ width: 200 }}
-                  value={lanAlias}
-                  onChange={(e) => setLanAlias(e.target.value)}
-                  onBlur={() =>
-                    lanAlias.trim() && lanAlias.trim() !== lanMe?.alias && lanSetAlias(lanAlias)
-                  }
-                  onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-                />
-              </div>
-              <label className="settings-field">
-                <span>兼容 LocalSend（可与手机/电脑上的 LocalSend 互传）</span>
-                <input
-                  type="checkbox"
-                  checked={!!lanMe?.compat}
-                  onChange={(e) => lanSetCompat(e.target.checked)}
-                />
-              </label>
-              <div className="settings-field">
-                <span>接收目录</span>
-                <span className="settings-field-val dim" title={lanMe?.downloadDir}>
-                  {lanMe?.downloadDir}
-                </span>
-                <button className="btn btn-ghost btn-sm" onClick={lanPickDir}>更改</button>
-              </div>
-            </div>
-
             <div className="modal-actions">
               <button className="btn btn-ghost settings-reset" onClick={resetSettings}>
                 重置
