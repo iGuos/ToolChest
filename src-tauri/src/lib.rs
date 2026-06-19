@@ -18,6 +18,8 @@ pub fn run() {
             tools::lan::lan_set_alias,
             tools::lan::lan_set_compat,
             tools::lan::lan_set_dir,
+            tools::lan::lan_cancel,
+            tools::lan::lan_add_peer,
             tools::lan::lan_respond,
             tools::lan::lan_pick_files,
             tools::lan::lan_pick_dir,

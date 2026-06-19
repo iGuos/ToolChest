@@ -10,8 +10,9 @@
 // 拒绝外部 LocalSend 设备的发送，开启后才与真正的 LocalSend 互通。
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -88,7 +89,7 @@ struct DeviceInfo {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Peer {
+pub struct Peer {
     alias: String,
     fingerprint: String,
     ip: String,
@@ -145,6 +146,7 @@ struct FileSlot {
     token: String,
     file_name: String,
     size: u64,
+    sha256: Option<String>,
 }
 
 struct Inner {
@@ -156,6 +158,7 @@ struct Inner {
     peers: HashMap<String, Peer>,
     decisions: HashMap<String, Sender<Decision>>,
     sessions: HashMap<String, HashMap<String, FileSlot>>, // sessionId -> fileId -> slot
+    cancelled: HashSet<String>,                           // 已取消的 sessionId（收发双向）
     socket: Option<Arc<UdpSocket>>,
 }
 
@@ -171,6 +174,7 @@ impl Default for Inner {
             peers: HashMap::new(),
             decisions: HashMap::new(),
             sessions: HashMap::new(),
+            cancelled: HashSet::new(),
             socket: None,
         }
     }
@@ -211,12 +215,25 @@ impl LanState {
             app: Some("baibao".into()),
         }
     }
+
+    fn is_cancelled(&self, session_id: &str) -> bool {
+        self.0.lock().unwrap().cancelled.contains(session_id)
+    }
+}
+
+/// compat 关闭时只对外可见百宝箱设备，外部 LocalSend 设备隐藏。
+fn visible_peers(g: &Inner) -> Vec<Peer> {
+    g.peers
+        .values()
+        .filter(|p| g.compat || p.is_baibao)
+        .cloned()
+        .collect()
 }
 
 fn emit_peers(app: &AppHandle, state: &LanState) {
-    let peers: Vec<Peer> = {
+    let peers = {
         let g = state.0.lock().unwrap();
-        g.peers.values().cloned().collect()
+        visible_peers(&g)
     };
     let _ = app.emit("lan://peers", peers);
 }
@@ -489,6 +506,7 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
                     token,
                     file_name: meta.file_name.clone(),
                     size: meta.size,
+                    sha256: meta.sha256.clone(),
                 },
             );
         }
@@ -516,8 +534,8 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
         return respond_text(request, 400, "missing params");
     };
 
-    // 校验 token，取出文件名/大小与下载目录
-    let (file_name, size, dir) = {
+    // 校验 token，取出文件名/大小/期望哈希与下载目录
+    let (file_name, size, expect_sha, dir) = {
         let g = state.0.lock().unwrap();
         let slot = match g.sessions.get(session_id).and_then(|s| s.get(file_id)) {
             Some(s) if &s.token == token => s,
@@ -526,7 +544,12 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
                 return respond_text(request, 403, "invalid token");
             }
         };
-        (slot.file_name.clone(), slot.size, g.download_dir.clone())
+        (
+            slot.file_name.clone(),
+            slot.size,
+            slot.sha256.clone(),
+            g.download_dir.clone(),
+        )
     };
 
     let dest = unique_path(&dir, &file_name);
@@ -540,13 +563,25 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
     let mut buf = [0u8; 64 * 1024];
     let mut received: u64 = 0;
     let mut last_emit: u64 = 0;
+    let mut hasher = Sha256::new();
+    let mut cancelled = false;
+    let mut check_at: u64 = 0;
     loop {
+        // 周期性检查是否被取消（约每 1MB 查一次状态锁）
+        if received - check_at > 1024 * 1024 {
+            check_at = received;
+            if state.is_cancelled(session_id) {
+                cancelled = true;
+                break;
+            }
+        }
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 if file.write_all(&buf[..n]).is_err() {
                     break;
                 }
+                hasher.update(&buf[..n]);
                 received += n as u64;
                 if received - last_emit > 256 * 1024 || received == size {
                     last_emit = received;
@@ -573,16 +608,56 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
             }
         }
     }
+
+    if cancelled {
+        drop(file);
+        let _ = std::fs::remove_file(&dest);
+        let _ = app.emit(
+            "lan://cancelled",
+            serde_json::json!({ "direction": "in", "sessionId": session_id, "fileName": file_name }),
+        );
+        return respond_text(request, 400, "cancelled");
+    }
+
+    let actual = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let verified = expect_sha.as_deref().map(|e| e.eq_ignore_ascii_case(&actual));
     let _ = app.emit(
         "lan://received",
         serde_json::json!({
-            "fileName": file_name, "path": dest.to_string_lossy(), "size": received,
+            "fileName": file_name, "path": dest.to_string_lossy(),
+            "size": received, "verified": verified,
         }),
     );
     respond_text(request, 200, "ok");
 }
 
+fn sha256_file(path: &str) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 // ── 命令：信息 / 设置 ─────────────────────────────────────────
+
+fn local_ip() -> String {
+    // 不发实际流量：connect 一个公网地址后读本地地址，得到出网网卡 IP
+    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+        if s.connect("8.8.8.8:80").is_ok() {
+            if let Ok(a) = s.local_addr() {
+                return a.ip().to_string();
+            }
+        }
+    }
+    String::new()
+}
 
 fn my_info_value(state: &LanState) -> serde_json::Value {
     let g = state.0.lock().unwrap();
@@ -590,6 +665,8 @@ fn my_info_value(state: &LanState) -> serde_json::Value {
         "alias": g.alias,
         "fingerprint": g.fingerprint,
         "port": PORT,
+        "ip": local_ip(),
+        "running": g.started,
         "compat": g.compat,
         "downloadDir": g.download_dir.to_string_lossy(),
     })
@@ -601,12 +678,9 @@ pub fn lan_my_info(state: State<'_, LanState>) -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn lan_peers(state: State<'_, LanState>) -> Vec<serde_json::Value> {
+pub fn lan_peers(state: State<'_, LanState>) -> Vec<Peer> {
     let g = state.0.lock().unwrap();
-    g.peers
-        .values()
-        .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
-        .collect()
+    visible_peers(&g)
 }
 
 #[tauri::command]
@@ -618,8 +692,46 @@ pub fn lan_set_alias(state: State<'_, LanState>, alias: String) {
 }
 
 #[tauri::command]
-pub fn lan_set_compat(state: State<'_, LanState>, enabled: bool) {
+pub fn lan_set_compat(app: AppHandle, state: State<'_, LanState>, enabled: bool) {
     state.0.lock().unwrap().compat = enabled;
+    emit_peers(&app, state.inner()); // 切换后立即按新规则刷新设备列表
+}
+
+/// 取消一次传输（收发双向，按 sessionId）。
+#[tauri::command]
+pub fn lan_cancel(state: State<'_, LanState>, session_id: String) {
+    state.0.lock().unwrap().cancelled.insert(session_id);
+}
+
+/// 发现失败时的兜底：手动按 IP 拉取对端信息并加入设备表。
+#[tauri::command]
+pub async fn lan_add_peer(
+    app: AppHandle,
+    state: State<'_, LanState>,
+    ip: String,
+    port: Option<u16>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let port = port.unwrap_or(PORT);
+    let ip2 = ip.clone();
+    let info: DeviceInfo = tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(format!("http://{ip2}:{port}/api/localsend/v2/info"))
+            .send()
+            .map_err(|e| format!("连不上 {ip2}:{port}：{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("对方返回 {}", resp.status()));
+        }
+        resp.json::<DeviceInfo>().map_err(|e| format!("对方不是有效设备：{e}"))
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))??;
+    upsert_peer(&app, &state, &info, ip);
+    Ok(())
 }
 
 #[tauri::command]
@@ -769,19 +881,27 @@ pub async fn lan_send_message(
     .map_err(|e| format!("任务调度失败：{e}"))?
 }
 
-/// 发文件读取时上报进度的包装。
+/// 发文件读取时上报进度的包装，同时支持中途取消。
 struct ProgressReader {
     inner: File,
     app: AppHandle,
+    state: LanState,
     session_id: String,
     file_id: String,
     file_name: String,
     size: u64,
     sent: u64,
     last_emit: u64,
+    check_at: u64,
 }
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.sent - self.check_at > 1024 * 1024 || self.check_at == 0 {
+            self.check_at = self.sent;
+            if self.state.is_cancelled(&self.session_id) {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "cancelled"));
+            }
+        }
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.sent += n as u64;
@@ -815,7 +935,7 @@ pub async fn lan_send_files(
     }
 
     tauri::async_runtime::spawn_blocking(move || {
-        // 组装文件清单
+        // 组装文件清单（含 sha256，便于接收方校验完整性）
         let mut files = serde_json::Map::new();
         let mut metas: Vec<(String, String, u64, String)> = Vec::new(); // id, path, size, name
         for path in &paths {
@@ -828,12 +948,13 @@ pub async fn lan_send_files(
                 .to_string();
             let id = rand_hex(8);
             let size = meta.len();
-            files.insert(
-                id.clone(),
-                serde_json::json!({
-                    "id": id, "fileName": name, "size": size, "fileType": ext_mime(&name),
-                }),
-            );
+            let mut fj = serde_json::json!({
+                "id": id, "fileName": name, "size": size, "fileType": ext_mime(&name),
+            });
+            if let Some(h) = sha256_file(path) {
+                fj["sha256"] = serde_json::Value::String(h);
+            }
+            files.insert(id.clone(), fj);
             metas.push((id, path.clone(), size, name));
         }
 
@@ -869,15 +990,17 @@ pub async fn lan_send_files(
             let reader = ProgressReader {
                 inner: f,
                 app: app.clone(),
+                state: state.clone(),
                 session_id: resp.session_id.clone(),
                 file_id: id.clone(),
                 file_name: name.clone(),
                 size: *size,
                 sent: 0,
                 last_emit: 0,
+                check_at: 0,
             };
             let body = reqwest::blocking::Body::sized(reader, *size);
-            let up = client
+            let up = match client
                 .post(format!("{base}/api/localsend/v2/upload"))
                 .query(&[
                     ("sessionId", resp.session_id.as_str()),
@@ -886,7 +1009,20 @@ pub async fn lan_send_files(
                 ])
                 .body(body)
                 .send()
-                .map_err(|e| format!("上传 {name} 失败：{e}"))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // 被用户取消时不当作错误
+                    if state.is_cancelled(&resp.session_id) {
+                        let _ = app.emit(
+                            "lan://cancelled",
+                            serde_json::json!({ "direction": "out", "sessionId": resp.session_id, "fileName": name }),
+                        );
+                        return Ok(());
+                    }
+                    return Err(format!("上传 {name} 失败：{e}"));
+                }
+            };
             if !up.status().is_success() {
                 return Err(format!("上传 {name} 被拒绝：{}", up.status()));
             }

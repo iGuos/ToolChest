@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tiny_http = "0.12"
 socket2 = { version = "0.5", features = ["all"] }
 getrandom = "0.2"
+sha2 = "0.10"
 
 [profile.release]
 panic = "abort"

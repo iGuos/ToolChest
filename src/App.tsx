@@ -5,6 +5,8 @@ import HttpClient from "./tools/HttpClient";
 import TrustApp from "./tools/TrustApp";
 import TodoList from "./tools/TodoList";
 import LanShare from "./tools/LanShare";
+import LanIncomingModal from "./tools/LanIncomingModal";
+import { useLan } from "./tools/lanContext";
 import { openDeepSeek } from "./tools/deepseek";
 
 interface ToolMeta {
@@ -98,6 +100,7 @@ function renderTool(
 }
 
 export default function App() {
+  const { totalUnread } = useLan(); // 局域网未读消息总数（用于侧栏红点）
   // 已打开的 tab（首页恒常驻，不可关闭）与当前激活的 tab
   const [openTabs, setOpenTabs] = useState<string[]>([HOME_ID]);
   const [activeTab, setActiveTab] = useState<string>(HOME_ID);
@@ -284,6 +287,9 @@ export default function App() {
             >
               <span className="tool-icon">{tool.icon}</span>
               <span className="tool-name">{tool.name}</span>
+              {tool.id === "lan-share" && totalUnread > 0 && (
+                <span className="lan-badge nav">{totalUnread}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -442,6 +448,9 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* 局域网收件确认：全局渲染，任何 tab 下都可见 */}
+      <LanIncomingModal />
     </div>
   );
 }
