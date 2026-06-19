@@ -91,6 +91,7 @@ interface LanCtxValue {
   requestConfirm: (sessionId: string) => void;
   dismissConfirm: () => void;
   respond: (accept: boolean, fileIds: string[]) => Promise<void>;
+  acceptPendingFiles: (files: FileMsg[]) => void;
   acceptAllPending: () => void;
   sendMessage: (fp: string, text: string) => Promise<void>;
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
@@ -325,7 +326,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
     };
   }, [refreshPeers, bumpUnread, upsertFile]);
 
-  // 点击「待接收」文件 → 打开确认框
+  // 点击「待接收」文件 → 打开确认框（每个会话即单文件）
   const requestConfirm = useCallback((sessionId: string) => {
     const inc = offersRef.current[sessionId];
     if (inc) setConfirm(inc);
@@ -356,6 +357,40 @@ export function LanProvider({ children }: { children: ReactNode }) {
         }
         return null;
       });
+    },
+    [upsertFile]
+  );
+
+  // 接受指定的一批待接收文件（「全部待接收」勾选后接受所选）。
+  // 按会话分组逐一应答；同会话内未勾选的文件按协议视为拒绝（无法稍后再单独接收）。
+  const acceptPendingFiles = useCallback(
+    (files: FileMsg[]) => {
+      const bySession = new Map<string, Set<string>>();
+      for (const f of files) {
+        const set = bySession.get(f.sessionId) ?? new Set<string>();
+        set.add(f.fileId);
+        bySession.set(f.sessionId, set);
+      }
+      for (const [sid, fileIds] of bySession) {
+        invoke("lan_respond", {
+          sessionId: sid,
+          accept: true,
+          fileIds: [...fileIds],
+        }).catch((e) => setError(String(e)));
+        const offer = offersRef.current[sid];
+        if (offer) {
+          for (const f of offer.files) {
+            upsertFile({
+              id: fileKey("in", sid, f.id),
+              status: fileIds.has(f.id) ? "active" : "cancelled",
+            });
+          }
+          const next = { ...offersRef.current };
+          delete next[sid];
+          offersRef.current = next;
+        }
+      }
+      setConfirm(null);
     },
     [upsertFile]
   );
@@ -454,7 +489,8 @@ export function LanProvider({ children }: { children: ReactNode }) {
 
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
-    setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond, acceptAllPending,
+    setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
+    acceptPendingFiles, acceptAllPending,
     sendMessage, sendFiles, cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
   };
 

@@ -8,11 +8,11 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-// 收到文件请求的确认弹框。Tab 模式：
-//   「当前文件」默认只确认点击的这次请求（可勾选其中文件）；
-//   「全部待接收」列出所有发送方待接收的文件，可一次全部接收。
+// 收到文件请求的确认弹框。发送方每个文件各自一个会话，所以「当前文件」即单个文件。
+//   「当前文件」：确认你点击的这个文件；
+//   「全部待接收」：列出所有待接收文件，可勾选后接受所选。
 export default function LanIncomingModal() {
-  const { confirm: incoming, pendingFiles, peers, respond, acceptAllPending, dismissConfirm } =
+  const { confirm: incoming, pendingFiles, peers, respond, acceptPendingFiles, dismissConfirm } =
     useLan();
   const [tab, setTab] = useState<"current" | "all">("current");
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -20,8 +20,11 @@ export default function LanIncomingModal() {
   useEffect(() => {
     if (incoming) {
       setTab("current");
-      setPicked(new Set(incoming.files.map((f) => f.id)));
+      // 「全部待接收」默认勾选全部，可手动取消
+      setPicked(new Set(pendingFiles.map((f) => f.id)));
     }
+    // 仅在弹框打开（incoming 变化）时重置选择
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incoming]);
 
   if (!incoming) return null;
@@ -34,11 +37,10 @@ export default function LanIncomingModal() {
       return n;
     });
 
-  const pickedTotal = incoming.files
-    .filter((f) => picked.has(f.id))
-    .reduce((a, f) => a + f.size, 0);
+  const currentTotal = incoming.files.reduce((a, f) => a + f.size, 0);
   const aliasOf = (fp: string) => peers.find((p) => p.fingerprint === fp)?.alias ?? "未知设备";
-  const allTotal = pendingFiles.reduce((a, f) => a + f.size, 0);
+  const pickedFiles = pendingFiles.filter((f) => picked.has(f.id));
+  const pickedTotal = pickedFiles.reduce((a, f) => a + f.size, 0);
 
   return (
     <div className="modal-overlay" onClick={dismissConfirm}>
@@ -68,52 +70,47 @@ export default function LanIncomingModal() {
         {tab === "current" ? (
           <>
             <div className="dim" style={{ fontSize: 13, marginTop: 8 }}>
-              <b>{incoming.alias}</b>（{incoming.isBaibao ? "百宝箱" : "LocalSend"}）想发送{" "}
-              {incoming.files.length} 个文件：
+              <b>{incoming.alias}</b>（{incoming.isBaibao ? "百宝箱" : "LocalSend"}）发来的文件：
             </div>
             <div className="lan-req-files">
               {incoming.files.map((f) => (
-                <label key={f.id} className="lan-req-file">
-                  <input type="checkbox" checked={picked.has(f.id)} onChange={() => toggle(f.id)} />
+                <div key={f.id} className="lan-req-file">
                   <span className="lan-xfer-name" title={f.fileName}>{f.fileName}</span>
                   <span className="dim">{fmtBytes(f.size)}</span>
-                </label>
+                </div>
               ))}
             </div>
             <div className="modal-actions">
               <button className="btn btn-ghost" onClick={() => respond(false, [])}>拒绝</button>
-              <button
-                className="btn btn-primary"
-                disabled={picked.size === 0}
-                onClick={() => respond(true, [...picked])}
-              >
-                接受 {picked.size}/{incoming.files.length} 项（{fmtBytes(pickedTotal)}）
+              <button className="btn btn-primary" onClick={() => respond(true, [])}>
+                接受（{fmtBytes(currentTotal)}）
               </button>
             </div>
           </>
         ) : (
           <>
             <div className="dim" style={{ fontSize: 13, marginTop: 8 }}>
-              共 {pendingFiles.length} 个待接收文件，来自各发送方：
+              共 {pendingFiles.length} 个待接收文件，勾选后接受所选：
             </div>
             <div className="lan-req-files">
               {pendingFiles.length === 0 && <div className="dim">没有待接收的文件</div>}
               {pendingFiles.map((f) => (
-                <div key={f.id} className="lan-req-file">
+                <label key={f.id} className="lan-req-file">
+                  <input type="checkbox" checked={picked.has(f.id)} onChange={() => toggle(f.id)} />
                   <span className="lan-xfer-name" title={f.fileName}>{f.fileName}</span>
                   <span className="dim" style={{ flexShrink: 0 }}>{aliasOf(f.fingerprint)}</span>
                   <span className="dim" style={{ flexShrink: 0 }}>{fmtBytes(f.size)}</span>
-                </div>
+                </label>
               ))}
             </div>
             <div className="modal-actions">
               <button className="btn btn-ghost" onClick={dismissConfirm}>关闭</button>
               <button
                 className="btn btn-primary"
-                disabled={pendingFiles.length === 0}
-                onClick={acceptAllPending}
+                disabled={pickedFiles.length === 0}
+                onClick={() => acceptPendingFiles(pickedFiles)}
               >
-                全部接受（{pendingFiles.length} 项 · {fmtBytes(allTotal)}）
+                接受所选（{pickedFiles.length} 项 · {fmtBytes(pickedTotal)}）
               </button>
             </div>
           </>
