@@ -108,10 +108,9 @@ export default function LanShare() {
   const {
     me, peers, items, unread, selected, error,
     setSelected, setError, refreshPeers, sendMessage, sendFiles,
-    cancelTransfer, requestConfirm, setAlias, setCompat, pickDir, addPeerByIp,
+    cancelTransfer, requestConfirm, addPeerByIp,
   } = useLan();
 
-  const [aliasDraft, setAliasDraft] = useState("");
   const [draft, setDraft] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
@@ -122,10 +121,6 @@ export default function LanShare() {
   const chatRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
-
-  useEffect(() => {
-    if (me) setAliasDraft((d) => (d ? d : me.alias));
-  }, [me]);
 
   const selectedPeer = peers.find((p) => p.fingerprint === selected) ?? null;
   const thread = useMemo(
@@ -210,30 +205,11 @@ export default function LanShare() {
     <div className="tool-container">
       <div className="tool-header">
         <h2>局域网互传</h2>
-        <div className="tool-actions lan-actions">
-          <span className="dim">我是</span>
-          <input
-            className="kv-input"
-            style={{ width: 150 }}
-            value={aliasDraft}
-            onChange={(e) => setAliasDraft(e.target.value)}
-            onBlur={() => aliasDraft.trim() && aliasDraft.trim() !== me?.alias && setAlias(aliasDraft)}
-            onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-          />
-          <label className="inline-check" title="开启后可与手机/电脑上的 LocalSend 互传">
-            <input type="checkbox" checked={!!me?.compat} onChange={(e) => setCompat(e.target.checked)} />
-            兼容 LocalSend
-          </label>
+        <div className="lan-status-inline">
+          <span className={`lan-dot${me?.running ? " on" : ""}`} />
+          {me?.running ? "服务运行中" : "未运行"}
+          {me?.ip && <span className="dim">· 本机 {me.ip}:{me.port}</span>}
         </div>
-      </div>
-
-      <div className="lan-statusbar">
-        <span className={`lan-dot${me?.running ? " on" : ""}`} />
-        {me?.running ? "服务运行中" : "未运行"}
-        {me?.ip && <span className="dim">· 本机 {me.ip}:{me.port}</span>}
-        <span className="dim">· 接收目录</span>
-        <span className="lan-dir" title={me?.downloadDir}>{me?.downloadDir}</span>
-        <button className="btn btn-ghost btn-sm" onClick={pickDir}>更改</button>
       </div>
 
       {error && (

@@ -169,6 +169,33 @@ select { cursor: pointer; }
 .settings-reset {
   margin-right: auto;
 }
+.settings-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.settings-field:last-child {
+  border-bottom: none;
+}
+.settings-field > span:first-child {
+  flex-shrink: 0;
+}
+.settings-field-val {
+  flex: 1;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-field > input[type="checkbox"] {
+  margin-left: auto;
+}
+.settings-field .kv-input {
+  margin-left: auto;
+}
 
 /* ── Content ── */
 .content {
