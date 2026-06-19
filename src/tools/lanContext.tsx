@@ -80,6 +80,7 @@ interface LanCtxValue {
   peers: Peer[];
   items: ChatItem[];
   confirm: Incoming | null; // 当前正在确认接收的请求（点击待接收文件后弹出）
+  pendingFiles: FileMsg[]; // 所有待接收文件（跨会话/发送方）
   unread: Record<string, number>;
   totalUnread: number;
   selected: string | null;
@@ -89,6 +90,7 @@ interface LanCtxValue {
   refreshPeers: () => Promise<void>;
   requestConfirm: (sessionId: string) => void;
   respond: (accept: boolean, fileIds: string[]) => Promise<void>;
+  acceptAllPending: () => void;
   sendMessage: (fp: string, text: string) => Promise<void>;
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
   cancelTransfer: (sessionId: string) => Promise<void>;
@@ -208,11 +210,15 @@ export function LanProvider({ children }: { children: ReactNode }) {
       );
       track(
         await listen<{ sessionId: string }>("lan://offer-timeout", (e) => {
-          const inc = offersRef.current[e.payload.sessionId];
+          const sid = e.payload.sessionId;
+          const inc = offersRef.current[sid];
           if (inc) {
             for (const f of inc.files) {
-              upsertFile({ id: fileKey("in", inc.sessionId, f.id), status: "cancelled" });
+              upsertFile({ id: fileKey("in", sid, f.id), status: "cancelled" });
             }
+            const next = { ...offersRef.current };
+            delete next[sid];
+            offersRef.current = next;
           }
         })
       );
@@ -350,6 +356,24 @@ export function LanProvider({ children }: { children: ReactNode }) {
     [upsertFile]
   );
 
+  // 一次接受所有待接收会话的全部文件
+  const acceptAllPending = useCallback(() => {
+    const offers = offersRef.current;
+    for (const sid of Object.keys(offers)) {
+      const inc = offers[sid];
+      invoke("lan_respond", {
+        sessionId: sid,
+        accept: true,
+        fileIds: inc.files.map((f) => f.id),
+      }).catch((e) => setError(String(e)));
+      for (const f of inc.files) {
+        upsertFile({ id: fileKey("in", sid, f.id), status: "active" });
+      }
+    }
+    offersRef.current = {};
+    setConfirm(null);
+  }, [upsertFile]);
+
   const sendMessage = useCallback(async (fp: string, text: string) => {
     const t = text.trim();
     if (!t) return;
@@ -420,10 +444,13 @@ export function LanProvider({ children }: { children: ReactNode }) {
   );
 
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
+  const pendingFiles = items.filter(
+    (x) => x.kind === "file" && x.status === "pending"
+  ) as FileMsg[];
 
   const value: LanCtxValue = {
-    me, peers, items, confirm, unread, totalUnread, selected, error,
-    setSelected, setError, refreshPeers, requestConfirm, respond,
+    me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
+    setSelected, setError, refreshPeers, requestConfirm, respond, acceptAllPending,
     sendMessage, sendFiles, cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
   };
 
