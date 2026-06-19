@@ -19,6 +19,7 @@ pub fn run() {
             tools::lan::lan_peers,
             tools::lan::lan_set_alias,
             tools::lan::lan_set_compat,
+            tools::lan::lan_set_invisible,
             tools::lan::lan_set_dir,
             tools::lan::lan_cancel,
             tools::lan::lan_cancel_send,
@@ -28,6 +29,7 @@ pub fn run() {
             tools::lan::lan_pick_dir,
             tools::lan::lan_reveal,
             tools::lan::lan_send_message,
+            tools::lan::lan_recall_message,
             tools::lan::lan_send_files,
         ])
         .run(tauri::generate_context!())

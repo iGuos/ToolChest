@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>百宝箱</title>
+    <!-- 首屏底色：在 styles.css 加载前就铺深色，消除启动时的白屏闪烁 -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #1e1e1e;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

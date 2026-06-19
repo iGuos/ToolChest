@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -32,17 +33,70 @@ function fileExtLabel(name: string): string {
   return e && e.length <= 4 ? e.toUpperCase() : "FILE";
 }
 
+// 文字气泡：气泡内文本可鼠标选中，右键弹出菜单（复制 / 撤回 / 删除）。
+// 发送失败时文字左侧显示红色警告三角 + 白色重试按钮：点击重试时三角消失、按钮旋转，
+// 若再次失败则三角重新出现。
+function TextBubble({
+  text,
+  failed,
+  onContextMenu,
+  onRetry,
+}: {
+  text: string;
+  failed?: boolean;
+  onContextMenu?: (e: React.MouseEvent) => void;
+  onRetry?: () => Promise<void> | void;
+}) {
+  const [retrying, setRetrying] = useState(false);
+  const handleRetry = async () => {
+    if (retrying || !onRetry) return;
+    setRetrying(true);
+    try {
+      await onRetry();
+    } finally {
+      setRetrying(false);
+    }
+  };
+  return (
+    <div className="lan-msg-textwrap">
+      {onRetry && (
+        <button
+          className={`lan-msg-retry${retrying ? " spinning" : ""}`}
+          title="重新发送"
+          onClick={handleRetry}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <polyline points="21 3 21 9 15 9" />
+          </svg>
+        </button>
+      )}
+      <div
+        className={`lan-msg-bubble${failed ? " failed" : ""}`}
+        onContextMenu={onContextMenu}
+      >
+        {failed && !retrying && (
+          <span className="lan-msg-fail" title="发送失败">⚠</span>
+        )}
+        {text}
+      </div>
+    </div>
+  );
+}
+
 // 微信式文件气泡：左侧文件名+状态，右侧文件类型图标
 function FileBubble({
   f,
   onCancel,
   onCancelSend,
   onAccept,
+  onContextMenu,
 }: {
   f: FileMsg;
   onCancel: (sid: string) => void;
   onCancelSend: (fileId: string) => void;
   onAccept: (sid: string) => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
   const pct = f.size ? Math.min(100, (f.transferred / f.size) * 100) : 0;
   // 只有「收到的待接收文件」才可点击接收；发出去的「待发送」气泡不可点
@@ -64,6 +118,7 @@ function FileBubble({
     <div
       className={`lan-filecard${clickable ? " clickable" : ""}`}
       onClick={clickable ? () => onAccept(f.sessionId) : undefined}
+      onContextMenu={onContextMenu}
     >
       <div className="lan-file-main">
         <div className="lan-file-name" title={f.fileName}>
@@ -119,12 +174,13 @@ function FileBubble({
 }
 
 const TIME_GAP = 5 * 60 * 1000; // 超过 5 分钟显示一次时间分隔
+const RECALL_WINDOW = 5 * 60 * 1000; // 文本消息可撤回的时限（5 分钟，参考微信）
 
 export default function LanShare() {
   const {
     me, peers, items, unread, selected, error,
-    setSelected, setError, refreshPeers, sendMessage, sendFiles,
-    cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, pickDir,
+    setSelected, setError, refreshPeers, sendMessage, resendMessage, recallMessage, deleteItem, sendFiles,
+    cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
   } = useLan();
 
   const [draft, setDraft] = useState("");
@@ -135,6 +191,69 @@ export default function LanShare() {
   const [setOpen, setSetOpen] = useState(false);
   const [aliasDraft, setAliasDraft] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [statusOpen, setStatusOpen] = useState(false); // 在线/隐身下拉
+  // 点击空白 / Esc 关闭在线状态下拉
+  useEffect(() => {
+    if (!statusOpen) return;
+    const close = () => setStatusOpen(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setStatusOpen(false);
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [statusOpen]);
+  // 每 20s 走一次时钟，用于让「撤回」在超过 5 分钟后从右键菜单消失
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 20000);
+    return () => window.clearInterval(t);
+  }, []);
+  // 错误提示：顶部居中浮动框，5 秒后自动消失
+  useEffect(() => {
+    if (!error) return;
+    const t = window.setTimeout(() => setError(null), 5000);
+    return () => window.clearTimeout(t);
+  }, [error, setError]);
+  // 消息右键菜单：文本消息（复制 / 撤回 / 删除）或文件记录（删除）
+  const [msgMenu, setMsgMenu] = useState<
+    | {
+        x: number;
+        y: number;
+        id: string;
+        isFile: boolean;
+        fingerprint?: string;
+        text?: string;
+        canRecall?: boolean;
+      }
+    | null
+  >(null);
+  // 打开菜单后：点击空白 / 再次右键 / 滚动 / Esc 关闭
+  useEffect(() => {
+    if (!msgMenu) return;
+    const close = () => setMsgMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMsgMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [msgMenu]);
+  const copyMsg = async (text: string) => {
+    const sel = window.getSelection()?.toString();
+    try {
+      await navigator.clipboard.writeText(sel || text);
+    } catch {
+      /* 复制失败静默 */
+    }
+    setMsgMenu(null);
+  };
 
   // 刷新设备列表：点击时图标转起来，至少转 0.6s 让动效可见
   const handleRefresh = async () => {
@@ -155,6 +274,14 @@ export default function LanShare() {
 
   const bodyRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  // 输入框随内容自动增高（封顶 120px，超出滚动）
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+  }, [draft, selected]);
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
 
@@ -217,18 +344,71 @@ export default function LanShare() {
     const incoming = m.kind === "msg" ? m.incoming : m.direction === "in";
     const showSep = m.ts - lastTs > TIME_GAP;
     lastTs = m.ts;
+    // 已撤回：整条改为居中小字提示（自己/对方区分文案）
+    if (m.kind === "msg" && m.recalled) {
+      return (
+        <div key={m.id}>
+          {showSep && <div className="lan-time-sep">{fmtTime(m.ts)}</div>}
+          <div className="lan-recall-tip">
+            {incoming ? "对方撤回了一条消息" : "你撤回了一条消息"}
+          </div>
+        </div>
+      );
+    }
+    // 仅自己发出、未失败、5 分钟内的文本消息可撤回
+    const canRecall =
+      m.kind === "msg" && !m.incoming && !m.failed && now - m.ts <= RECALL_WINDOW;
     return (
       <div key={m.id}>
         {showSep && <div className="lan-time-sep">{fmtTime(m.ts)}</div>}
         <div className={`lan-msg${incoming ? " in" : " out"}`}>
           <div className="lan-msg-col">
             {m.kind === "msg" ? (
-              <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
-                {m.text}
-                {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
-              </div>
+              <TextBubble
+                text={m.text}
+                failed={m.failed}
+                onRetry={
+                  m.failed && !m.incoming
+                    ? () => resendMessage(m.fingerprint, m.id, m.text)
+                    : undefined
+                }
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  // 估算菜单尺寸并夹到视口内，避免贴边时被裁掉
+                  const itemCount = 2 + (canRecall ? 1 : 0);
+                  const MENU_W = 150;
+                  const MENU_H = itemCount * 32 + 8;
+                  setMsgMenu({
+                    x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
+                    y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
+                    id: m.id,
+                    isFile: false,
+                    fingerprint: m.fingerprint,
+                    text: m.text,
+                    canRecall,
+                  });
+                }}
+              />
             ) : (
-              <FileBubble f={m} onCancel={cancelTransfer} onCancelSend={cancelSend} onAccept={requestConfirm} />
+              <FileBubble
+                f={m}
+                onCancel={cancelTransfer}
+                onCancelSend={cancelSend}
+                onAccept={requestConfirm}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const MENU_W = 150;
+                  const MENU_H = 32 + 8; // 仅「删除」一项
+                  setMsgMenu({
+                    x: Math.min(e.clientX, window.innerWidth - MENU_W - 8),
+                    y: Math.min(e.clientY, window.innerHeight - MENU_H - 8),
+                    id: m.id,
+                    isFile: true,
+                  });
+                }}
+              />
             )}
             <div className="lan-msg-time">{fmtTime(m.ts)}</div>
           </div>
@@ -240,7 +420,53 @@ export default function LanShare() {
   return (
     <div className="tool-container">
       <div className="tool-header">
-        <h2>局域网互传</h2>
+        <div className="lan-title-row">
+          <h2>局域网互传</h2>
+          <div className="lan-presence">
+            <button
+              className="lan-presence-btn"
+              title="在线状态"
+              onClick={(e) => {
+                e.stopPropagation();
+                setStatusOpen((v) => !v);
+              }}
+            >
+              <span className={`lan-presence-dot${me?.invisible ? "" : " on"}`} />
+              {me?.invisible ? "隐身" : "在线"}
+              <span className="lan-presence-caret">▾</span>
+            </button>
+            {statusOpen && (
+              <div className="lan-presence-menu" onClick={(e) => e.stopPropagation()}>
+                <button
+                  className={`lan-presence-item${me?.invisible ? "" : " active"}`}
+                  onClick={() => {
+                    setInvisible(false);
+                    setStatusOpen(false);
+                  }}
+                >
+                  <span className="lan-presence-dot on" />
+                  <span className="lan-presence-text">
+                    在线
+                    <span className="dim">其他设备可发现你</span>
+                  </span>
+                </button>
+                <button
+                  className={`lan-presence-item${me?.invisible ? " active" : ""}`}
+                  onClick={() => {
+                    setInvisible(true);
+                    setStatusOpen(false);
+                  }}
+                >
+                  <span className="lan-presence-dot" />
+                  <span className="lan-presence-text">
+                    隐身
+                    <span className="dim">对方信号灯显示离线</span>
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
         <div className="lan-status-inline">
           <span className={`lan-dot${me?.running ? " on" : ""}`} />
           {me?.running ? "服务运行中" : "未运行"}
@@ -251,12 +477,14 @@ export default function LanShare() {
         </div>
       </div>
 
-      {error && (
-        <div className="error-banner">
-          ⚠ {error}
-          <button className="lan-err-x" onClick={() => setError(null)}>×</button>
-        </div>
-      )}
+      {error &&
+        createPortal(
+          <div className="lan-toast">
+            ⚠ {error}
+            <button className="lan-toast-x" onClick={() => setError(null)}>×</button>
+          </div>,
+          document.body
+        )}
 
       <div className="lan-body" ref={bodyRef}>
         <div className="lan-peers">
@@ -311,6 +539,10 @@ export default function LanShare() {
                 </span>
               </span>
               {unread[p.fingerprint] > 0 && <span className="lan-badge">{unread[p.fingerprint]}</span>}
+              <span
+                className={`lan-peer-dot${p.online === false ? "" : " on"}`}
+                title={p.online === false ? "离线" : "在线"}
+              />
             </button>
           ))}
         </div>
@@ -327,7 +559,7 @@ export default function LanShare() {
 
               <div className="lan-chat" ref={chatRef}>
                 {thread.length === 0 && (
-                  <div className="dim">还没有消息。可发消息，或用下方 📎 / 拖拽发送文件。</div>
+                  <div className="dim">还没有消息。可发消息，或点下方回形针按钮 / 拖拽发送文件。</div>
                 )}
                 {thread.map(renderItem)}
               </div>
@@ -338,18 +570,28 @@ export default function LanShare() {
                   <button
                     className="lan-tool-btn"
                     title="发送文件"
+                    aria-label="发送文件"
                     onClick={() => sendFiles(selectedPeer.fingerprint)}
                   >
-                    📎
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                    </svg>
                   </button>
                 </div>
                 <div className="lan-input-row">
-                  <input
+                  <textarea
+                    ref={taRef}
                     className="lan-input"
-                    placeholder={`给 ${selectedPeer.alias} 发消息…`}
+                    rows={1}
+                    placeholder={`给 ${selectedPeer.alias} 发消息…（Enter 发送，Shift+Enter 换行）`}
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && send()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                        e.preventDefault();
+                        send();
+                      }
+                    }}
                   />
                   <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>
                     发送
@@ -366,6 +608,43 @@ export default function LanShare() {
           )}
         </div>
       </div>
+
+      {/* 消息右键菜单（挂到 body，避免被聊天区域裁切） */}
+      {msgMenu &&
+        createPortal(
+          <div
+            className="tab-menu"
+            style={{ left: msgMenu.x, top: msgMenu.y }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {!msgMenu.isFile && (
+              <button className="tab-menu-item" onClick={() => copyMsg(msgMenu.text ?? "")}>
+                复制
+              </button>
+            )}
+            {msgMenu.canRecall && msgMenu.fingerprint && (
+              <button
+                className="tab-menu-item"
+                onClick={() => {
+                  recallMessage(msgMenu.fingerprint!, msgMenu.id);
+                  setMsgMenu(null);
+                }}
+              >
+                撤回
+              </button>
+            )}
+            <button
+              className="tab-menu-item danger"
+              onClick={() => {
+                deleteItem(msgMenu.id);
+                setMsgMenu(null);
+              }}
+            >
+              删除
+            </button>
+          </div>,
+          document.body
+        )}
 
       {setOpen && (
         <div className="modal-overlay" onClick={() => setSetOpen(false)}>

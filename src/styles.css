@@ -388,6 +388,7 @@ select { cursor: pointer; }
 }
 .tab-menu-item:hover:not(:disabled) { background: var(--bg-hover); }
 .tab-menu-item:disabled { opacity: 0.4; cursor: not-allowed; }
+.tab-menu-item.danger { color: var(--red); }
 
 .tab-panes {
   flex: 1;
@@ -579,6 +580,53 @@ select { cursor: pointer; }
   line-height: 1.5;
   overflow-wrap: anywhere; /* 只在超长连续串（如一长串数字）时断行，普通文本按自然换行 */
   white-space: pre-wrap;
+  -webkit-user-select: text; /* 全局禁选了 UI 文字，这里恢复气泡可选中/复制 */
+  user-select: text;
+  cursor: auto;
+}
+/* 气泡 + 前方「重试」按钮（发送失败时显示） */
+.lan-msg-textwrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+.lan-msg-fail {
+  color: var(--red);
+  margin-right: 4px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.lan-msg-retry {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-hi);
+  cursor: pointer;
+}
+.lan-msg-retry svg {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+.lan-msg-retry:hover {
+  opacity: 0.75;
+}
+.lan-msg-retry.spinning svg {
+  animation: lan-spin 0.6s linear infinite;
+}
+/* 已撤回的消息：居中小字提示，参考微信 */
+.lan-recall-tip {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 2px 0;
 }
 .lan-msg.in .lan-msg-bubble {
   background: var(--bg2);
@@ -613,22 +661,40 @@ select { cursor: pointer; }
   background: var(--bg-hover);
   opacity: 1;
 }
+.lan-tool-btn svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+/* 输入区回形针在深色主题下要够明显 */
+.lan-toolbar .lan-tool-btn {
+  opacity: 1;
+  color: var(--text);
+}
+.lan-toolbar .lan-tool-btn:hover {
+  color: var(--text-hi);
+}
 .lan-input-row {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
   padding: 4px 12px 12px;
 }
 .lan-input {
   flex: 1;
-  height: 36px;
-  padding: 0 12px;
+  min-height: 36px;
+  max-height: 120px;
+  padding: 8px 12px;
   background: var(--bg3);
   border: 1px solid transparent;
   border-radius: 8px;
   color: var(--text);
   font-size: 13px;
+  font-family: inherit;
+  line-height: 1.5;
   outline: none;
+  resize: none;
+  overflow-y: auto;
 }
 .lan-input:focus {
   border-color: var(--accent);
@@ -726,6 +792,85 @@ select { cursor: pointer; }
   50% { box-shadow: 0 0 0 5px rgba(46, 204, 113, 0.08); }
 }
 
+/* 标题左侧：标题 + 在线状态切换 */
+.lan-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.lan-presence {
+  position: relative;
+}
+.lan-presence-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.lan-presence-btn:hover {
+  border-color: var(--accent, #1f6feb);
+}
+.lan-presence-caret {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+.lan-presence-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-dim);
+}
+.lan-presence-dot.on {
+  background: #2ecc71;
+}
+.lan-presence-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 100;
+  min-width: 200px;
+  padding: 4px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+.lan-presence-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.lan-presence-item:hover {
+  background: var(--bg-hover);
+}
+.lan-presence-item.active {
+  background: var(--bg-active);
+}
+.lan-presence-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+.lan-presence-text .dim {
+  font-size: 11px;
+}
+
 /* 标题行右侧：服务状态 + 设置齿轮 */
 .lan-status-inline {
   display: flex;
@@ -759,18 +904,61 @@ select { cursor: pointer; }
   margin-left: auto;
 }
 
-.error-banner {
+/* 顶部居中浮动错误提示（5s 自动消失） */
+.lan-toast {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2000;
   display: flex;
   align-items: center;
+  gap: 10px;
+  max-width: min(720px, 90vw);
+  padding: 10px 16px;
+  background: rgba(40, 22, 22, 0.96);
+  border: 1px solid rgba(244, 71, 71, 0.45);
+  color: var(--red-h, #ff6b6b);
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  animation: lan-toast-in 0.18s ease-out;
 }
-.lan-err-x {
-  margin-left: auto;
+@keyframes lan-toast-in {
+  from { opacity: 0; transform: translate(-50%, -8px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+.lan-toast-x {
   background: none;
   border: none;
   color: inherit;
   cursor: pointer;
   font-size: 16px;
   line-height: 1;
+  opacity: 0.8;
+}
+.lan-toast-x:hover { opacity: 1; }
+
+/* 设备在线状态信号灯 */
+.lan-peer-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-left: auto;
+  flex-shrink: 0;
+  background: var(--text-dim);
+}
+.lan-peer-dot.on {
+  background: #2ecc71;
+}
+.lan-badge + .lan-peer-dot {
+  margin-left: 8px;
+}
+.lan-peer.active .lan-peer-dot {
+  background: rgba(255, 255, 255, 0.5);
+}
+.lan-peer.active .lan-peer-dot.on {
+  background: #5be38b;
 }
 
 /* 设备未读红点 */
@@ -811,8 +999,7 @@ select { cursor: pointer; }
 .lan-xfer-fill.cancelled {
   background: var(--text-dim);
 }
-.lan-verify-warn,
-.lan-msg-fail {
+.lan-verify-warn {
   color: var(--red);
 }
 .lan-verify-ok {

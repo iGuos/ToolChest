@@ -22,6 +22,7 @@ export interface MyInfo {
   ip: string;
   running: boolean;
   compat: boolean;
+  invisible: boolean;
   downloadDir: string;
 }
 export interface Peer {
@@ -58,6 +59,7 @@ export interface TextMsg {
   ts: number;
   incoming: boolean;
   failed?: boolean;
+  recalled?: boolean; // 已撤回：界面改为小字「消息已撤回」提示
 }
 export type FileStatus = "pending" | "active" | "done" | "cancelled" | "failed";
 export interface FileMsg {
@@ -100,11 +102,15 @@ interface LanCtxValue {
   acceptAllPending: () => void;
   rejectAllPending: () => void;
   sendMessage: (fp: string, text: string) => Promise<void>;
+  resendMessage: (fp: string, id: string, text: string) => Promise<void>;
+  recallMessage: (fp: string, id: string) => Promise<void>;
+  deleteItem: (id: string) => void;
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
   cancelTransfer: (sessionId: string) => Promise<void>;
   cancelSend: (fileId: string) => void;
   setAlias: (alias: string) => Promise<void>;
   setCompat: (enabled: boolean) => Promise<void>;
+  setInvisible: (enabled: boolean) => Promise<void>;
   pickDir: () => Promise<void>;
   addPeerByIp: (ip: string, port?: number) => Promise<void>;
 }
@@ -324,13 +330,26 @@ export function LanProvider({ children }: { children: ReactNode }) {
         })
       );
       track(
-        await listen<{ fingerprint: string; alias: string; text: string }>("lan://message", (e) => {
+        await listen<{ fingerprint: string; alias: string; text: string; id?: string | null }>("lan://message", (e) => {
           const m = e.payload;
           setItems((l) => [
             ...l,
-            { kind: "msg", id: nextId(), fingerprint: m.fingerprint, text: m.text, ts: Date.now(), incoming: true },
+            { kind: "msg", id: m.id || nextId(), fingerprint: m.fingerprint, text: m.text, ts: Date.now(), incoming: true },
           ]);
           bumpUnread(m.fingerprint);
+        })
+      );
+      // 对方撤回了一条消息：按共享 msgId 把本地那条标记为已撤回
+      track(
+        await listen<{ fingerprint: string; msgId: string }>("lan://recall", (e) => {
+          const { fingerprint, msgId } = e.payload;
+          setItems((l) =>
+            l.map((x) =>
+              x.kind === "msg" && x.id === msgId && x.fingerprint === fingerprint
+                ? { ...x, recalled: true }
+                : x
+            )
+          );
         })
       );
       // 发送方点了发送：先在本地放一个「待发送」气泡（还没拿到会话号，按 fileId 临时归位）
@@ -601,20 +620,52 @@ export function LanProvider({ children }: { children: ReactNode }) {
     setConfirm(null);
   }, [upsertFile]);
 
-  const sendMessage = useCallback(async (fp: string, text: string) => {
-    const t = text.trim();
-    if (!t) return;
-    const id = nextId();
-    setItems((l) => [
-      ...l,
-      { kind: "msg", id, fingerprint: fp, text: t, ts: Date.now(), incoming: false },
-    ]);
+  // 发送一条文本：id 不存在则新建气泡，已存在（重发）则清掉失败标记后重试。
+  // 发送失败不弹错误条，只把该条标记为 failed —— 由气泡前方的「重试」按钮处理。
+  const doSendText = useCallback(async (fp: string, text: string, id: string) => {
+    // 新消息才插入；重发时保留原条目（仍为 failed，三角的显隐交给气泡的「重试中」态控制）
+    setItems((l) =>
+      l.some((x) => x.id === id)
+        ? l
+        : [...l, { kind: "msg", id, fingerprint: fp, text, ts: Date.now(), incoming: false }]
+    );
     try {
-      await invoke("lan_send_message", { fingerprint: fp, text: t });
-    } catch (e) {
-      setError(String(e));
+      await invoke("lan_send_message", { fingerprint: fp, text, msgId: id });
+      setItems((l) => l.map((x) => (x.kind === "msg" && x.id === id ? { ...x, failed: false } : x)));
+    } catch {
       setItems((l) => l.map((x) => (x.kind === "msg" && x.id === id ? { ...x, failed: true } : x)));
     }
+  }, []);
+
+  const sendMessage = useCallback(
+    async (fp: string, text: string) => {
+      const t = text.trim();
+      if (!t) return;
+      await doSendText(fp, t, nextId());
+    },
+    [doSendText]
+  );
+
+  // 重新发送一条失败的消息（沿用原 id/文本）
+  const resendMessage = useCallback(
+    (fp: string, id: string, text: string) => doSendText(fp, text, id),
+    [doSendText]
+  );
+
+  // 撤回自己发出的一条文本消息（仅 5 分钟内允许，时限由 UI 控制）：
+  // 先通知对端，成功后本地也标记为已撤回，保证两端一致。
+  const recallMessage = useCallback(async (fp: string, id: string) => {
+    try {
+      await invoke("lan_recall_message", { fingerprint: fp, msgId: id });
+      setItems((l) => l.map((x) => (x.kind === "msg" && x.id === id ? { ...x, recalled: true } : x)));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // 本地删除一条消息/记录（仅删除本端，不通知对方）
+  const deleteItem = useCallback((id: string) => {
+    setItems((l) => l.filter((x) => x.id !== id));
   }, []);
 
   const sendFiles = useCallback(async (fp: string, paths?: string[]) => {
@@ -663,6 +714,11 @@ export function LanProvider({ children }: { children: ReactNode }) {
     setMe((cur) => (cur ? { ...cur, compat: enabled } : cur));
   }, []);
 
+  const setInvisible = useCallback(async (enabled: boolean) => {
+    await invoke("lan_set_invisible", { enabled });
+    setMe((cur) => (cur ? { ...cur, invisible: enabled } : cur));
+  }, []);
+
   const pickDir = useCallback(async () => {
     const dir = await invoke<string | null>("lan_pick_dir");
     if (dir) {
@@ -694,7 +750,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
-    sendMessage, sendFiles, cancelTransfer, cancelSend, setAlias, setCompat, pickDir, addPeerByIp,
+    sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend, setAlias, setCompat, setInvisible, pickDir, addPeerByIp,
   };
 
   return <LanCtx.Provider value={value}>{children}</LanCtx.Provider>;

@@ -6,6 +6,7 @@
 //   GET  /api/localsend/v2/info             查询设备信息
 // 百宝箱自有扩展：
 //   POST /api/baibao/v1/message             即时文本消息（无需确认）
+//   POST /api/baibao/v1/recall              撤回一条已发送的文本消息
 // announce/info 里带 app:"baibao" 标记区分百宝箱设备；compat 关闭时只认百宝箱、
 // 拒绝外部 LocalSend 设备的发送，开启后才与真正的 LocalSend 互通。
 
@@ -141,6 +142,15 @@ struct MessagePayload {
     alias: String,
     fingerprint: String,
     text: String,
+    #[serde(default)]
+    msg_id: Option<String>, // 双方共享的消息 ID，用于撤回时定位对端的同一条消息
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecallPayload {
+    fingerprint: String,
+    msg_id: String,
 }
 
 // ── 共享状态 ─────────────────────────────────────────────────
@@ -168,6 +178,7 @@ struct Inner {
     fingerprint: String,
     download_dir: PathBuf,
     compat: bool,
+    invisible: bool, // 隐身：不对外广播/应答，其他设备看到本机为离线
     peers: HashMap<String, Peer>,
     decisions: HashMap<String, Sender<Decision>>,
     sessions: HashMap<String, Session>, // sessionId -> 会话
@@ -187,19 +198,21 @@ impl Default for Inner {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| rand_hex(16));
         let compat = cfg.compat.unwrap_or(false);
+        let invisible = cfg.invisible.unwrap_or(false);
         let download_dir = cfg
             .download_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(&home).join("Downloads"));
         // 落盘一次，确保（尤其是随机指纹）下次启动可复用
-        write_config(&alias, &fingerprint, compat, &download_dir);
+        write_config(&alias, &fingerprint, compat, invisible, &download_dir);
         Inner {
             started: false,
             alias,
             fingerprint,
             download_dir,
             compat,
+            invisible,
             peers: HashMap::new(),
             decisions: HashMap::new(),
             sessions: HashMap::new(),
@@ -217,6 +230,7 @@ struct LanConfig {
     alias: Option<String>,
     fingerprint: Option<String>,
     compat: Option<bool>,
+    invisible: Option<bool>,
     download_dir: Option<String>,
 }
 
@@ -235,7 +249,7 @@ fn load_config() -> LanConfig {
         .unwrap_or_default()
 }
 
-fn write_config(alias: &str, fingerprint: &str, compat: bool, dir: &std::path::Path) {
+fn write_config(alias: &str, fingerprint: &str, compat: bool, invisible: bool, dir: &std::path::Path) {
     if let Some(p) = config_path() {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -244,6 +258,7 @@ fn write_config(alias: &str, fingerprint: &str, compat: bool, dir: &std::path::P
             alias: Some(alias.to_string()),
             fingerprint: Some(fingerprint.to_string()),
             compat: Some(compat),
+            invisible: Some(invisible),
             download_dir: Some(dir.to_string_lossy().to_string()),
         };
         if let Ok(s) = serde_json::to_vec_pretty(&cfg) {
@@ -253,7 +268,7 @@ fn write_config(alias: &str, fingerprint: &str, compat: bool, dir: &std::path::P
 }
 
 fn persist(g: &Inner) {
-    write_config(&g.alias, &g.fingerprint, g.compat, &g.download_dir);
+    write_config(&g.alias, &g.fingerprint, g.compat, g.invisible, &g.download_dir);
 }
 
 #[derive(Clone, Default)]
@@ -417,10 +432,12 @@ pub async fn lan_start(app: AppHandle, state: State<'_, LanState>) -> Result<ser
         std::thread::spawn(move || announcer(app, state, sock));
     }
 
-    // 启动即主动 announce 一次
-    let info = state.device_info(Some(true));
-    if let Ok(buf) = serde_json::to_vec(&info) {
-        let _ = udp.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+    // 启动即主动 announce 一次（隐身时不广播）
+    if !state.0.lock().unwrap().invisible {
+        let info = state.device_info(Some(true));
+        if let Ok(buf) = serde_json::to_vec(&info) {
+            let _ = udp.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+        }
     }
 
     Ok(my_info_value(&state))
@@ -460,8 +477,9 @@ fn multicast_listener(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
             continue;
         }
         upsert_peer(&app, &state, &info, ip);
-        // 对方在 announce → 回应自己的信息（announce=false），单播避免风暴
-        if info.announce == Some(true) {
+        // 对方在 announce → 回应自己的信息（announce=false），单播避免风暴。
+        // 隐身时不应答，使对端无法发现本机（其信号灯显示离线）。
+        if info.announce == Some(true) && !state.0.lock().unwrap().invisible {
             let reply = state.device_info(Some(false));
             if let Ok(b) = serde_json::to_vec(&reply) {
                 let _ = sock.send_to(&b, SocketAddr::from((src.ip(), PORT)));
@@ -473,9 +491,12 @@ fn multicast_listener(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
 fn announcer(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
     loop {
         std::thread::sleep(ANNOUNCE_EVERY);
-        let info = state.device_info(Some(true));
-        if let Ok(buf) = serde_json::to_vec(&info) {
-            let _ = sock.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+        // 隐身时不广播，让对端在 TTL 过后把本机判定为离线
+        if !state.0.lock().unwrap().invisible {
+            let info = state.device_info(Some(true));
+            if let Ok(buf) = serde_json::to_vec(&info) {
+                let _ = sock.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+            }
         }
         // 清理过期设备
         let removed = {
@@ -527,8 +548,24 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
                         "fingerprint": msg.fingerprint,
                         "alias": msg.alias,
                         "text": msg.text,
+                        "id": msg.msg_id,
                         "ts": now_ms(),
                         "incoming": true,
+                    }),
+                );
+                respond_text(request, 200, "ok");
+            } else {
+                respond_text(request, 400, "bad request");
+            }
+            Ok(())
+        }
+        ("POST", "/api/baibao/v1/recall") => {
+            if let Ok(r) = read_json::<RecallPayload>(&mut request) {
+                let _ = app.emit(
+                    "lan://recall",
+                    serde_json::json!({
+                        "fingerprint": r.fingerprint,
+                        "msgId": r.msg_id,
                     }),
                 );
                 respond_text(request, 200, "ok");
@@ -837,6 +874,7 @@ fn my_info_value(state: &LanState) -> serde_json::Value {
         "ip": local_ip(),
         "running": g.started,
         "compat": g.compat,
+        "invisible": g.invisible,
         "downloadDir": g.download_dir.to_string_lossy(),
     })
 }
@@ -870,6 +908,25 @@ pub fn lan_set_compat(app: AppHandle, state: State<'_, LanState>, enabled: bool)
         persist(&g);
     }
     emit_peers(&app, state.inner()); // 切换后立即按新规则刷新设备列表
+}
+
+/// 切换隐身模式：隐身时停止广播/应答；取消隐身时立即广播一次让对端尽快重新发现本机。
+#[tauri::command]
+pub fn lan_set_invisible(state: State<'_, LanState>, enabled: bool) {
+    let sock = {
+        let mut g = state.0.lock().unwrap();
+        g.invisible = enabled;
+        persist(&g);
+        g.socket.clone()
+    };
+    if !enabled {
+        if let Some(sock) = sock {
+            let info = state.device_info(Some(true));
+            if let Ok(buf) = serde_json::to_vec(&info) {
+                let _ = sock.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+            }
+        }
+    }
 }
 
 /// 取消一次传输（收发双向，按 sessionId）。
@@ -1009,6 +1066,7 @@ pub async fn lan_send_message(
     state: State<'_, LanState>,
     fingerprint: String,
     text: String,
+    msg_id: Option<String>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
     let (base, my_alias) = peer_base_url(&state, &fingerprint)?;
@@ -1018,12 +1076,43 @@ pub async fn lan_send_message(
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| e.to_string())?;
-        let body = serde_json::json!({ "alias": my_alias, "fingerprint": my_fp, "text": text });
+        let body = serde_json::json!({ "alias": my_alias, "fingerprint": my_fp, "text": text, "msgId": msg_id });
         let resp = client
             .post(format!("{base}/api/baibao/v1/message"))
             .json(&body)
             .send()
             .map_err(|e| format!("发送失败：{e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("对方返回 {}", resp.status()))
+        }
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 撤回一条已发送的文本消息：通知对端把同一条（共享 msgId）标记为「已撤回」。
+#[tauri::command]
+pub async fn lan_recall_message(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    msg_id: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let (base, _my_alias) = peer_base_url(&state, &fingerprint)?;
+    let my_fp = state.0.lock().unwrap().fingerprint.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let body = serde_json::json!({ "fingerprint": my_fp, "msgId": msg_id });
+        let resp = client
+            .post(format!("{base}/api/baibao/v1/recall"))
+            .json(&body)
+            .send()
+            .map_err(|e| format!("撤回失败：{e}"))?;
         if resp.status().is_success() {
             Ok(())
         } else {
