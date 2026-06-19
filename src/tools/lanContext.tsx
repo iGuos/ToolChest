@@ -11,7 +11,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // LAN 互传的全局状态：服务在 app 启动即常驻运行，来件提醒、未读计数等
-// 都不依赖「局域网互传」这个 tab 是否打开，从而修复「切走 tab 收不到」。
+// 都不依赖「局域网互传」这个 tab 是否打开（修复「切走 tab 收不到」）。
+// 文件传输以「文件气泡」形式归入对应对端的对话流（微信式）。
 
 export interface MyInfo {
   alias: string;
@@ -45,42 +46,39 @@ export interface Incoming {
   isBaibao: boolean;
   files: FileMeta[];
 }
-export interface ChatMsg {
+export interface TextMsg {
+  kind: "msg";
   id: string;
   fingerprint: string;
-  alias: string;
   text: string;
   ts: number;
   incoming: boolean;
   failed?: boolean;
 }
-export interface Transfer {
-  key: string;
+export type FileStatus = "active" | "done" | "cancelled" | "failed";
+export interface FileMsg {
+  kind: "file";
+  id: string; // = `${direction}:${sessionId}:${fileId}`
   sessionId: string;
   fileId: string;
+  fingerprint: string;
   fileName: string;
-  transferred: number;
   size: number;
+  transferred: number;
   direction: "in" | "out";
-  done: boolean;
-  cancelled: boolean;
-  speed: number; // 字节/秒
+  status: FileStatus;
+  verified: boolean | null;
+  path?: string;
+  speed: number;
+  ts: number;
   updatedAt: number;
 }
-export interface Received {
-  fileName: string;
-  path: string;
-  size: number;
-  verified: boolean | null;
-  ts: number;
-}
+export type ChatItem = TextMsg | FileMsg;
 
 interface LanCtxValue {
   me: MyInfo | null;
   peers: Peer[];
-  messages: ChatMsg[];
-  transfers: Transfer[];
-  received: Received[];
+  items: ChatItem[];
   incoming: Incoming | null;
   unread: Record<string, number>;
   totalUnread: number;
@@ -93,7 +91,6 @@ interface LanCtxValue {
   sendMessage: (fp: string, text: string) => Promise<void>;
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
   cancelTransfer: (sessionId: string) => Promise<void>;
-  clearFinishedTransfers: () => void;
   setAlias: (alias: string) => Promise<void>;
   setCompat: (enabled: boolean) => Promise<void>;
   pickDir: () => Promise<void>;
@@ -110,13 +107,12 @@ export function useLan(): LanCtxValue {
 
 let idSeq = 0;
 const nextId = () => `${Date.now()}-${idSeq++}`;
+const fileKey = (dir: string, sid: string, fid: string) => `${dir}:${sid}:${fid}`;
 
 export function LanProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<MyInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
-  const [transfers, setTransfers] = useState<Transfer[]>([]);
-  const [received, setReceived] = useState<Received[]>([]);
+  const [items, setItems] = useState<ChatItem[]>([]);
   const [incoming, setIncoming] = useState<Incoming | null>(null);
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [selected, setSelectedRaw] = useState<string | null>(null);
@@ -124,6 +120,42 @@ export function LanProvider({ children }: { children: ReactNode }) {
 
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
+
+  const bumpUnread = useCallback((fp: string) => {
+    if (fp && fp !== selectedRef.current) {
+      setUnread((u) => ({ ...u, [fp]: (u[fp] ?? 0) + 1 }));
+    }
+  }, []);
+
+  // 新建或更新一个文件气泡（按 key 去重）
+  const upsertFile = useCallback((patch: Partial<FileMsg> & { id: string }) => {
+    setItems((list) => {
+      const idx = list.findIndex((x) => x.kind === "file" && x.id === patch.id);
+      if (idx < 0) {
+        const f: FileMsg = {
+          kind: "file",
+          id: patch.id,
+          sessionId: patch.sessionId ?? "",
+          fileId: patch.fileId ?? "",
+          fingerprint: patch.fingerprint ?? "",
+          fileName: patch.fileName ?? "文件",
+          size: patch.size ?? 0,
+          transferred: patch.transferred ?? 0,
+          direction: patch.direction ?? "in",
+          status: patch.status ?? "active",
+          verified: patch.verified ?? null,
+          path: patch.path,
+          speed: patch.speed ?? 0,
+          ts: Date.now(),
+          updatedAt: Date.now(),
+        };
+        return [...list, f];
+      }
+      const copy = [...list];
+      copy[idx] = { ...(copy[idx] as FileMsg), ...patch, updatedAt: Date.now() };
+      return copy;
+    });
+  }, []);
 
   const refreshPeers = useCallback(async () => {
     try {
@@ -138,14 +170,10 @@ export function LanProvider({ children }: { children: ReactNode }) {
     if (fp) setUnread((u) => (u[fp] ? { ...u, [fp]: 0 } : u));
   }, []);
 
-  // 启动服务 + 注册全部事件监听（仅一次）
   useEffect(() => {
     let alive = true;
     const unsubs: UnlistenFn[] = [];
-    const track = (u: UnlistenFn) => {
-      if (alive) unsubs.push(u);
-      else u();
-    };
+    const track = (u: UnlistenFn) => (alive ? unsubs.push(u) : u());
 
     (async () => {
       try {
@@ -157,13 +185,43 @@ export function LanProvider({ children }: { children: ReactNode }) {
       }
 
       track(await listen<Peer[]>("lan://peers", (e) => setPeers(e.payload)));
-      track(await listen<Incoming>("lan://incoming", (e) => setIncoming(e.payload)));
       track(
-        await listen<Omit<ChatMsg, "id">>("lan://message", (e) => {
-          const m = e.payload;
-          setMessages((list) => [...list, { ...m, id: nextId() }]);
-          if (m.incoming && m.fingerprint !== selectedRef.current) {
-            setUnread((u) => ({ ...u, [m.fingerprint]: (u[m.fingerprint] ?? 0) + 1 }));
+        await listen<Incoming>("lan://incoming", (e) => {
+          setIncoming(e.payload);
+          bumpUnread(e.payload.fingerprint);
+        })
+      );
+      track(
+        await listen<{ fingerprint: string; alias: string; text: string; ts: number }>(
+          "lan://message",
+          (e) => {
+            const m = e.payload;
+            setItems((l) => [
+              ...l,
+              { kind: "msg", id: nextId(), fingerprint: m.fingerprint, text: m.text, ts: Date.now(), incoming: true },
+            ]);
+            bumpUnread(m.fingerprint);
+          }
+        )
+      );
+      track(
+        await listen<{
+          sessionId: string;
+          peer: string;
+          files: { fileId: string; fileName: string; size: number }[];
+        }>("lan://outgoing", (e) => {
+          const o = e.payload;
+          for (const f of o.files) {
+            upsertFile({
+              id: fileKey("out", o.sessionId, f.fileId),
+              sessionId: o.sessionId,
+              fileId: f.fileId,
+              fingerprint: o.peer,
+              fileName: f.fileName,
+              size: f.size,
+              direction: "out",
+              status: "active",
+            });
           }
         })
       );
@@ -175,55 +233,80 @@ export function LanProvider({ children }: { children: ReactNode }) {
           fileName: string;
           transferred: number;
           size: number;
+          peer: string;
         }>("lan://progress", (e) => {
           const p = e.payload;
-          const key = `${p.direction}:${p.fileId}`;
-          const now = Date.now();
-          setTransfers((listv) => {
-            const idx = listv.findIndex((t) => t.key === key);
-            const prev = idx >= 0 ? listv[idx] : null;
-            const dt = prev ? (now - prev.updatedAt) / 1000 : 0;
-            const speed =
-              prev && dt > 0 ? (p.transferred - prev.transferred) / dt : prev?.speed ?? 0;
-            const next: Transfer = {
-              key,
-              sessionId: p.sessionId,
-              fileId: p.fileId,
-              fileName: p.fileName,
-              transferred: p.transferred,
-              size: p.size,
-              direction: p.direction,
-              done: p.size > 0 && p.transferred >= p.size,
-              cancelled: false,
-              speed: Math.max(0, speed),
-              updatedAt: now,
-            };
-            if (idx < 0) return [next, ...listv].slice(0, 80);
-            const copy = [...listv];
-            copy[idx] = next;
+          const id = fileKey(p.direction, p.sessionId, p.fileId);
+          setItems((list) => {
+            const idx = list.findIndex((x) => x.kind === "file" && x.id === id);
+            const now = Date.now();
+            if (idx < 0) {
+              const f: FileMsg = {
+                kind: "file", id, sessionId: p.sessionId, fileId: p.fileId,
+                fingerprint: p.peer, fileName: p.fileName, size: p.size,
+                transferred: p.transferred, direction: p.direction, status: "active",
+                verified: null, speed: 0, ts: now, updatedAt: now,
+              };
+              return [...list, f];
+            }
+            const prev = list[idx] as FileMsg;
+            const dt = (now - prev.updatedAt) / 1000;
+            const speed = dt > 0 ? Math.max(0, (p.transferred - prev.transferred) / dt) : prev.speed;
+            const copy = [...list];
+            copy[idx] = { ...prev, transferred: p.transferred, size: p.size, speed, status: "active", updatedAt: now };
             return copy;
           });
         })
       );
       track(
-        await listen<{ direction: "in" | "out"; sessionId: string; fileName: string }>(
-          "lan://cancelled",
+        await listen<{ sessionId: string; fileId: string; fingerprint: string }>(
+          "lan://sent",
           (e) => {
-            const c = e.payload;
-            setTransfers((listv) =>
-              listv.map((t) =>
-                t.sessionId === c.sessionId && t.direction === c.direction
-                  ? { ...t, cancelled: true, done: true }
-                  : t
-              )
-            );
+            const s = e.payload;
+            upsertFile({
+              id: fileKey("out", s.sessionId, s.fileId),
+              sessionId: s.sessionId,
+              fileId: s.fileId,
+              status: "done",
+            });
           }
         )
       );
       track(
-        await listen<Omit<Received, "ts">>("lan://received", (e) => {
-          setReceived((r) => [{ ...e.payload, ts: Date.now() }, ...r].slice(0, 80));
+        await listen<{
+          fileName: string;
+          path: string;
+          size: number;
+          verified: boolean | null;
+          sessionId: string;
+          fileId: string;
+          peer: string;
+        }>("lan://received", (e) => {
+          const r = e.payload;
+          upsertFile({
+            id: fileKey("in", r.sessionId, r.fileId),
+            sessionId: r.sessionId,
+            fileId: r.fileId,
+            fingerprint: r.peer,
+            fileName: r.fileName,
+            size: r.size,
+            transferred: r.size,
+            direction: "in",
+            status: "done",
+            verified: r.verified,
+            path: r.path,
+          });
+          bumpUnread(r.peer);
         })
+      );
+      track(
+        await listen<{ direction: "in" | "out"; sessionId: string; fileId: string }>(
+          "lan://cancelled",
+          (e) => {
+            const c = e.payload;
+            upsertFile({ id: fileKey(c.direction, c.sessionId, c.fileId), status: "cancelled" });
+          }
+        )
       );
     })();
 
@@ -231,35 +314,50 @@ export function LanProvider({ children }: { children: ReactNode }) {
       alive = false;
       unsubs.forEach((u) => u());
     };
-  }, [refreshPeers]);
+  }, [refreshPeers, bumpUnread, upsertFile]);
 
-  const respond = useCallback(
-    async (accept: boolean, fileIds: string[]) => {
-      setIncoming((cur) => {
-        if (cur) {
-          invoke("lan_respond", { sessionId: cur.sessionId, accept, fileIds }).catch((e) =>
-            setError(String(e))
-          );
+  const respond = useCallback(async (accept: boolean, fileIds: string[]) => {
+    setIncoming((cur) => {
+      if (cur) {
+        invoke("lan_respond", { sessionId: cur.sessionId, accept, fileIds }).catch((e) =>
+          setError(String(e))
+        );
+        if (accept) {
+          const want = fileIds.length ? new Set(fileIds) : null;
+          for (const f of cur.files) {
+            if (want && !want.has(f.id)) continue;
+            upsertFile({
+              id: fileKey("in", cur.sessionId, f.id),
+              sessionId: cur.sessionId,
+              fileId: f.id,
+              fingerprint: cur.fingerprint,
+              fileName: f.fileName,
+              size: f.size,
+              direction: "in",
+              status: "active",
+            });
+          }
         }
-        return null;
-      });
-    },
-    []
-  );
+      }
+      return null;
+    });
+  }, [upsertFile]);
 
   const sendMessage = useCallback(async (fp: string, text: string) => {
     const t = text.trim();
     if (!t) return;
     const id = nextId();
-    setMessages((m) => [
-      ...m,
-      { id, fingerprint: fp, alias: "", text: t, ts: Date.now(), incoming: false },
+    setItems((l) => [
+      ...l,
+      { kind: "msg", id, fingerprint: fp, text: t, ts: Date.now(), incoming: false },
     ]);
     try {
       await invoke("lan_send_message", { fingerprint: fp, text: t });
     } catch (e) {
       setError(String(e));
-      setMessages((m) => m.map((x) => (x.id === id ? { ...x, failed: true } : x)));
+      setItems((l) =>
+        l.map((x) => (x.kind === "msg" && x.id === id ? { ...x, failed: true } : x))
+      );
     }
   }, []);
 
@@ -280,10 +378,6 @@ export function LanProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setError(String(e));
     }
-  }, []);
-
-  const clearFinishedTransfers = useCallback(() => {
-    setTransfers((listv) => listv.filter((t) => !t.done));
   }, []);
 
   const setAlias = useCallback(async (alias: string) => {
@@ -325,9 +419,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const value: LanCtxValue = {
     me,
     peers,
-    messages,
-    transfers,
-    received,
+    items,
     incoming,
     unread,
     totalUnread,
@@ -340,7 +432,6 @@ export function LanProvider({ children }: { children: ReactNode }) {
     sendMessage,
     sendFiles,
     cancelTransfer,
-    clearFinishedTransfers,
     setAlias,
     setCompat,
     pickDir,

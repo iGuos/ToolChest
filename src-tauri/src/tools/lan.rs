@@ -149,6 +149,11 @@ struct FileSlot {
     sha256: Option<String>,
 }
 
+struct Session {
+    peer: String, // 对端指纹（发送方）
+    files: HashMap<String, FileSlot>,
+}
+
 struct Inner {
     started: bool,
     alias: String,
@@ -157,8 +162,8 @@ struct Inner {
     compat: bool,
     peers: HashMap<String, Peer>,
     decisions: HashMap<String, Sender<Decision>>,
-    sessions: HashMap<String, HashMap<String, FileSlot>>, // sessionId -> fileId -> slot
-    cancelled: HashSet<String>,                           // 已取消的 sessionId（收发双向）
+    sessions: HashMap<String, Session>, // sessionId -> 会话
+    cancelled: HashSet<String>,         // 已取消的 sessionId（收发双向）
     socket: Option<Arc<UdpSocket>>,
 }
 
@@ -440,6 +445,10 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             handle_upload(&app, &state, request, &query);
             Ok(())
         }
+        ("GET", "/api/baibao/v1/partial") => {
+            handle_partial(&state, request, &query);
+            Ok(())
+        }
         ("POST", "/api/localsend/v2/cancel") => {
             respond_text(request, 200, "ok");
             Ok(())
@@ -514,7 +523,13 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
     if slots.is_empty() {
         return respond_text(request, 403, "declined");
     }
-    state.0.lock().unwrap().sessions.insert(session_id.clone(), slots);
+    state.0.lock().unwrap().sessions.insert(
+        session_id.clone(),
+        Session {
+            peer: req.info.fingerprint.clone(),
+            files: slots,
+        },
+    );
 
     respond_json(
         request,
@@ -526,6 +541,34 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
     );
 }
 
+/// 部分文件存放目录（断点续传用），完成后再移动到接收目录。
+fn partial_path(dir: &std::path::Path, session_id: &str, file_id: &str) -> PathBuf {
+    dir.join(".baibao_partial")
+        .join(format!("{session_id}_{file_id}.part"))
+}
+
+/// 断点续传：发送方先查询接收方已落盘多少字节，再从该偏移续传。
+/// 百宝箱自有扩展端点；LocalSend 不认（查询失败时发送方按从 0 开始处理）。
+fn handle_partial(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(session_id), Some(file_id), Some(token)) =
+        (q.get("sessionId"), q.get("fileId"), q.get("token"))
+    else {
+        return respond_text(request, 400, "missing params");
+    };
+    let dir = {
+        let g = state.0.lock().unwrap();
+        match g.sessions.get(session_id).and_then(|s| s.files.get(file_id)) {
+            Some(slot) if &slot.token == token => g.download_dir.clone(),
+            _ => return respond_text(request, 403, "invalid token"),
+        }
+    };
+    let received = std::fs::metadata(partial_path(&dir, session_id, file_id))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    respond_json(request, 200, &serde_json::json!({ "received": received }));
+}
+
 fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Request, query: &str) {
     let q = parse_query(query);
     let (Some(session_id), Some(file_id), Some(token)) =
@@ -533,11 +576,14 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
     else {
         return respond_text(request, 400, "missing params");
     };
+    // 本次从哪个偏移续传（断点续传；缺省 0 = 从头）
+    let offset: u64 = q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // 校验 token，取出文件名/大小/期望哈希与下载目录
-    let (file_name, size, expect_sha, dir) = {
+    // 校验 token，取出文件名/大小/期望哈希/对端与下载目录
+    let (file_name, size, expect_sha, peer, dir) = {
         let g = state.0.lock().unwrap();
-        let slot = match g.sessions.get(session_id).and_then(|s| s.get(file_id)) {
+        let sess = g.sessions.get(session_id);
+        let slot = match sess.and_then(|s| s.files.get(file_id)) {
             Some(s) if &s.token == token => s,
             _ => {
                 drop(g);
@@ -548,26 +594,32 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
             slot.file_name.clone(),
             slot.size,
             slot.sha256.clone(),
+            sess.map(|s| s.peer.clone()).unwrap_or_default(),
             g.download_dir.clone(),
         )
     };
 
-    let dest = unique_path(&dir, &file_name);
-    let _ = std::fs::create_dir_all(&dir);
-    let mut file = match File::create(&dest) {
+    // 写入临时 .part 文件，从 offset 处续写
+    let part = partial_path(&dir, session_id, file_id);
+    let _ = std::fs::create_dir_all(part.parent().unwrap_or(&dir));
+    let mut file = match std::fs::OpenOptions::new().create(true).write(true).open(&part) {
         Ok(f) => f,
         Err(e) => return respond_text(request, 500, &format!("无法写入：{e}")),
     };
+    // 丢弃 offset 之后可能存在的脏数据，再定位到 offset
+    let _ = file.set_len(offset);
+    use std::io::Seek;
+    if file.seek(std::io::SeekFrom::Start(offset)).is_err() {
+        return respond_text(request, 500, "seek 失败");
+    }
 
     let reader = request.as_reader();
     let mut buf = [0u8; 64 * 1024];
-    let mut received: u64 = 0;
+    let mut received: u64 = offset;
     let mut last_emit: u64 = 0;
-    let mut hasher = Sha256::new();
     let mut cancelled = false;
-    let mut check_at: u64 = 0;
+    let mut check_at: u64 = offset;
     loop {
-        // 周期性检查是否被取消（约每 1MB 查一次状态锁）
         if received - check_at > 1024 * 1024 {
             check_at = received;
             if state.is_cancelled(session_id) {
@@ -581,7 +633,6 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
                 if file.write_all(&buf[..n]).is_err() {
                     break;
                 }
-                hasher.update(&buf[..n]);
                 received += n as u64;
                 if received - last_emit > 256 * 1024 || received == size {
                     last_emit = received;
@@ -589,46 +640,59 @@ fn handle_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Requ
                         "lan://progress",
                         serde_json::json!({
                             "direction": "in", "sessionId": session_id, "fileId": file_id,
-                            "fileName": file_name, "transferred": received, "size": size,
+                            "fileName": file_name, "transferred": received, "size": size, "peer": peer,
                         }),
                     );
                 }
             }
-            Err(_) => break,
+            Err(_) => break, // 连接中断：保留 .part，等待续传，不删
         }
     }
-
-    // 收尾：清理会话槽位
-    {
-        let mut g = state.0.lock().unwrap();
-        if let Some(s) = g.sessions.get_mut(session_id) {
-            s.remove(file_id);
-            if s.is_empty() {
-                g.sessions.remove(session_id);
-            }
-        }
-    }
+    drop(file);
 
     if cancelled {
-        drop(file);
-        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&part);
+        cleanup_session_file(state, session_id, file_id);
         let _ = app.emit(
             "lan://cancelled",
-            serde_json::json!({ "direction": "in", "sessionId": session_id, "fileName": file_name }),
+            serde_json::json!({ "direction": "in", "sessionId": session_id, "fileId": file_id, "fileName": file_name, "peer": peer }),
         );
         return respond_text(request, 400, "cancelled");
     }
 
-    let actual = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let verified = expect_sha.as_deref().map(|e| e.eq_ignore_ascii_case(&actual));
+    // 未收满：本次续传到此为止，保留 .part 等待下次续传
+    if received < size {
+        return respond_text(request, 200, "partial");
+    }
+
+    // 收满：校验 sha256，移动到接收目录
+    let actual = sha256_file(part.to_string_lossy().as_ref());
+    let verified = match (&expect_sha, &actual) {
+        (Some(e), Some(a)) => Some(e.eq_ignore_ascii_case(a)),
+        _ => None,
+    };
+    let dest = unique_path(&dir, &file_name);
+    let _ = std::fs::rename(&part, &dest);
+    cleanup_session_file(state, session_id, file_id);
     let _ = app.emit(
         "lan://received",
         serde_json::json!({
             "fileName": file_name, "path": dest.to_string_lossy(),
             "size": received, "verified": verified,
+            "sessionId": session_id, "fileId": file_id, "peer": peer,
         }),
     );
     respond_text(request, 200, "ok");
+}
+
+fn cleanup_session_file(state: &LanState, session_id: &str, file_id: &str) {
+    let mut g = state.0.lock().unwrap();
+    if let Some(s) = g.sessions.get_mut(session_id) {
+        s.files.remove(file_id);
+        if s.files.is_empty() {
+            g.sessions.remove(session_id);
+        }
+    }
 }
 
 fn sha256_file(path: &str) -> Option<String> {
@@ -881,7 +945,7 @@ pub async fn lan_send_message(
     .map_err(|e| format!("任务调度失败：{e}"))?
 }
 
-/// 发文件读取时上报进度的包装，同时支持中途取消。
+/// 发文件读取时上报进度的包装，支持中途取消与断点续传（base = 已传偏移）。
 struct ProgressReader {
     inner: File,
     app: AppHandle,
@@ -889,6 +953,8 @@ struct ProgressReader {
     session_id: String,
     file_id: String,
     file_name: String,
+    peer: String,
+    base: u64,
     size: u64,
     sent: u64,
     last_emit: u64,
@@ -905,19 +971,37 @@ impl Read for ProgressReader {
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.sent += n as u64;
-            if self.sent - self.last_emit > 256 * 1024 || self.sent >= self.size {
-                self.last_emit = self.sent;
+            let abs = self.base + self.sent;
+            if abs - self.last_emit > 256 * 1024 || abs >= self.size {
+                self.last_emit = abs;
                 let _ = self.app.emit(
                     "lan://progress",
                     serde_json::json!({
                         "direction": "out", "sessionId": self.session_id, "fileId": self.file_id,
-                        "fileName": self.file_name, "transferred": self.sent, "size": self.size,
+                        "fileName": self.file_name, "transferred": abs, "size": self.size, "peer": self.peer,
                     }),
                 );
             }
         }
         Ok(n)
     }
+}
+
+/// 向接收方查询某文件已落盘的字节数（断点续传偏移）。非百宝箱对端会失败 → 返回 0。
+fn query_offset(client: &reqwest::blocking::Client, base: &str, sid: &str, fid: &str, token: &str) -> u64 {
+    let r = client
+        .get(format!("{base}/api/baibao/v1/partial"))
+        .query(&[("sessionId", sid), ("fileId", fid), ("token", token)])
+        .timeout(Duration::from_secs(8))
+        .send();
+    if let Ok(resp) = r {
+        if resp.status().is_success() {
+            if let Ok(v) = resp.json::<serde_json::Value>() {
+                return v.get("received").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 #[tauri::command]
@@ -958,8 +1042,9 @@ pub async fn lan_send_files(
             metas.push((id, path.clone(), size, name));
         }
 
+        // 不设总超时（大文件可能传很久），仅限制建连耗时；中断由断点续传重试兜底
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(8))
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -981,54 +1066,91 @@ pub async fn lan_send_files(
             .map_err(|e| format!("解析响应失败：{e}"))?;
         let _ = my_alias;
 
-        // 逐个上传被接受的文件
+        // 通知前端：这些文件已被接受、开始发送（用于在对话里立即显示文件气泡）
+        let accepted: Vec<&(String, String, u64, String)> =
+            metas.iter().filter(|(id, ..)| resp.files.contains_key(id)).collect();
+        let _ = app.emit(
+            "lan://outgoing",
+            serde_json::json!({
+                "sessionId": resp.session_id, "peer": fingerprint,
+                "files": accepted.iter().map(|(id, _, size, name)| {
+                    serde_json::json!({ "fileId": id, "fileName": name, "size": size })
+                }).collect::<Vec<_>>(),
+            }),
+        );
+
+        // 逐个上传被接受的文件；断点续传：失败后查偏移重试，覆盖网络抖动/中断
+        const MAX_RETRY: u32 = 6;
         for (id, path, size, name) in &metas {
             let Some(token) = resp.files.get(id) else {
                 continue; // 该文件未被接受
             };
-            let f = File::open(path).map_err(|e| format!("打开 {path} 失败：{e}"))?;
-            let reader = ProgressReader {
-                inner: f,
-                app: app.clone(),
-                state: state.clone(),
-                session_id: resp.session_id.clone(),
-                file_id: id.clone(),
-                file_name: name.clone(),
-                size: *size,
-                sent: 0,
-                last_emit: 0,
-                check_at: 0,
-            };
-            let body = reqwest::blocking::Body::sized(reader, *size);
-            let up = match client
-                .post(format!("{base}/api/localsend/v2/upload"))
-                .query(&[
-                    ("sessionId", resp.session_id.as_str()),
-                    ("fileId", id.as_str()),
-                    ("token", token.as_str()),
-                ])
-                .body(body)
-                .send()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    // 被用户取消时不当作错误
-                    if state.is_cancelled(&resp.session_id) {
+            let mut attempt = 0u32;
+            loop {
+                if state.is_cancelled(&resp.session_id) {
+                    let _ = app.emit(
+                        "lan://cancelled",
+                        serde_json::json!({ "direction": "out", "sessionId": resp.session_id, "fileId": id, "fileName": name, "peer": fingerprint }),
+                    );
+                    return Ok(());
+                }
+                let offset = query_offset(&client, &base, &resp.session_id, id, token).min(*size);
+                if offset >= *size {
+                    break; // 对端已收满
+                }
+                let mut f = File::open(path).map_err(|e| format!("打开 {path} 失败：{e}"))?;
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Start(offset))
+                    .map_err(|e| format!("定位 {name} 失败：{e}"))?;
+                let remaining = *size - offset;
+                let reader = ProgressReader {
+                    inner: f,
+                    app: app.clone(),
+                    state: state.clone(),
+                    session_id: resp.session_id.clone(),
+                    file_id: id.clone(),
+                    file_name: name.clone(),
+                    peer: fingerprint.clone(),
+                    base: offset,
+                    size: *size,
+                    sent: 0,
+                    last_emit: offset,
+                    check_at: 0,
+                };
+                let body = reqwest::blocking::Body::sized(reader, remaining);
+                let res = client
+                    .post(format!("{base}/api/localsend/v2/upload"))
+                    .query(&[
+                        ("sessionId", resp.session_id.as_str()),
+                        ("fileId", id.as_str()),
+                        ("token", token.as_str()),
+                        ("offset", offset.to_string().as_str()),
+                    ])
+                    .body(body)
+                    .send();
+                match res {
+                    Ok(r) if r.status().is_success() => break, // 整段发完
+                    Ok(r) => return Err(format!("上传 {name} 被拒绝：{}", r.status())),
+                    Err(_) if state.is_cancelled(&resp.session_id) => {
                         let _ = app.emit(
                             "lan://cancelled",
-                            serde_json::json!({ "direction": "out", "sessionId": resp.session_id, "fileName": name }),
+                            serde_json::json!({ "direction": "out", "sessionId": resp.session_id, "fileId": id, "fileName": name, "peer": fingerprint }),
                         );
                         return Ok(());
                     }
-                    return Err(format!("上传 {name} 失败：{e}"));
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt > MAX_RETRY {
+                            return Err(format!("上传 {name} 失败（已重试 {MAX_RETRY} 次）：{e}"));
+                        }
+                        std::thread::sleep(Duration::from_millis(800));
+                        // 回到循环开头：重新查偏移、从断点续传
+                    }
                 }
-            };
-            if !up.status().is_success() {
-                return Err(format!("上传 {name} 被拒绝：{}", up.status()));
             }
             let _ = app.emit(
                 "lan://sent",
-                serde_json::json!({ "fileName": name, "fingerprint": fingerprint }),
+                serde_json::json!({ "fileName": name, "fingerprint": fingerprint, "sessionId": resp.session_id, "fileId": id }),
             );
         }
         Ok(())

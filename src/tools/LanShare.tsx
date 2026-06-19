@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { useLan, type Peer } from "./lanContext";
+import { useLan, type Peer, type FileMsg } from "./lanContext";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -19,29 +19,69 @@ function deviceIcon(p: Peer): string {
   return "💻";
 }
 
+function fileEmoji(name: string): string {
+  const e = name.split(".").pop()?.toLowerCase() ?? "";
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic"].includes(e)) return "🖼️";
+  if (["mp4", "mov", "avi", "mkv"].includes(e)) return "🎬";
+  if (["mp3", "wav", "flac", "aac"].includes(e)) return "🎵";
+  if (["zip", "rar", "7z", "tar", "gz"].includes(e)) return "🗜️";
+  if (["pdf"].includes(e)) return "📕";
+  if (["doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md"].includes(e)) return "📄";
+  return "📎";
+}
+
+// 对话里的文件气泡
+function FileBubble({ f, onCancel }: { f: FileMsg; onCancel: (sid: string) => void }) {
+  const pct = f.size ? Math.min(100, (f.transferred / f.size) * 100) : 0;
+  const statusText =
+    f.status === "cancelled"
+      ? "已取消"
+      : f.status === "failed"
+      ? "失败"
+      : f.status === "done"
+      ? fmtBytes(f.size)
+      : `${fmtBytes(f.transferred)} / ${fmtBytes(f.size)} · ${fmtBytes(f.speed)}/s`;
+  return (
+    <div className="lan-filecard">
+      <span className="lan-file-emoji">{fileEmoji(f.fileName)}</span>
+      <div className="lan-file-main">
+        <div className="lan-file-name" title={f.fileName}>
+          {f.fileName}
+          {f.verified === true && <span className="lan-verify-ok" title="校验通过"> ✓</span>}
+          {f.verified === false && <span className="lan-verify-warn" title="校验不一致"> ⚠</span>}
+        </div>
+        {f.status === "active" && (
+          <div className="lan-file-bar">
+            <span className="lan-file-fill" style={{ width: `${pct}%` }} />
+          </div>
+        )}
+        <div className="lan-file-meta dim">
+          <span>{statusText}</span>
+          {f.status === "active" && (
+            <button className="lan-file-cancel" onClick={() => onCancel(f.sessionId)}>
+              取消
+            </button>
+          )}
+          {f.status === "done" && f.direction === "in" && f.path && (
+            <button
+              className="lan-file-cancel"
+              onClick={() => invoke("lan_reveal", { path: f.path })}
+            >
+              打开位置
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function LanShare() {
-  const lan = useLan();
   const {
-    me,
-    peers,
-    messages,
-    transfers,
-    received,
-    unread,
-    selected,
-    error,
-    setSelected,
-    setError,
-    refreshPeers,
-    sendMessage,
-    sendFiles,
-    cancelTransfer,
-    clearFinishedTransfers,
-    setAlias,
-    setCompat,
-    pickDir,
-    addPeerByIp,
-  } = lan;
+    me, peers, items, unread, selected, error,
+    setSelected, setError, refreshPeers, sendMessage, sendFiles,
+    cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
+  } = useLan();
 
   const [aliasDraft, setAliasDraft] = useState("");
   const [draft, setDraft] = useState("");
@@ -51,6 +91,7 @@ export default function LanShare() {
   const [adding, setAdding] = useState(false);
 
   const bodyRef = useRef<HTMLDivElement>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
 
@@ -59,9 +100,17 @@ export default function LanShare() {
   }, [me]);
 
   const selectedPeer = peers.find((p) => p.fingerprint === selected) ?? null;
-  const chat = messages.filter((m) => m.fingerprint === selected);
+  const thread = useMemo(
+    () => items.filter((x) => x.fingerprint === selected).sort((a, b) => a.ts - b.ts),
+    [items, selected]
+  );
 
-  // 拖拽发送：把文件拖到窗口松手，发给当前选中的设备（仅本面板可见时生效）
+  // 新内容时滚到底部
+  useEffect(() => {
+    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  }, [thread.length, selected]);
+
+  // 拖拽发送：把文件拖进窗口松手发给当前选中设备（仅本面板可见时生效）
   useEffect(() => {
     let un: UnlistenFn | undefined;
     let alive = true;
@@ -70,21 +119,13 @@ export default function LanShare() {
         const visible = bodyRef.current && bodyRef.current.offsetParent !== null;
         if (!visible) return;
         const p = e.payload;
-        if (p.type === "over") {
-          setDragOver(!!selectedRef.current);
-        } else if (p.type === "drop") {
+        if (p.type === "over") setDragOver(!!selectedRef.current);
+        else if (p.type === "drop") {
           setDragOver(false);
-          if (selectedRef.current && p.paths?.length) {
-            sendFiles(selectedRef.current, p.paths);
-          }
-        } else {
-          setDragOver(false);
-        }
+          if (selectedRef.current && p.paths?.length) sendFiles(selectedRef.current, p.paths);
+        } else setDragOver(false);
       })
-      .then((u) => {
-        if (alive) un = u;
-        else u();
-      });
+      .then((u) => (alive ? (un = u) : u()));
     return () => {
       alive = false;
       un?.();
@@ -112,8 +153,6 @@ export default function LanShare() {
     }
   };
 
-  const activeTransfers = transfers.filter((t) => !t.done);
-
   return (
     <div className="tool-container">
       <div className="tool-header">
@@ -129,17 +168,12 @@ export default function LanShare() {
             onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
           />
           <label className="inline-check" title="开启后可与手机/电脑上的 LocalSend 互传">
-            <input
-              type="checkbox"
-              checked={!!me?.compat}
-              onChange={(e) => setCompat(e.target.checked)}
-            />
+            <input type="checkbox" checked={!!me?.compat} onChange={(e) => setCompat(e.target.checked)} />
             兼容 LocalSend
           </label>
         </div>
       </div>
 
-      {/* 状态条 */}
       <div className="lan-statusbar">
         <span className={`lan-dot${me?.running ? " on" : ""}`} />
         {me?.running ? "服务运行中" : "未运行"}
@@ -157,7 +191,6 @@ export default function LanShare() {
       )}
 
       <div className="lan-body" ref={bodyRef}>
-        {/* 设备列表 */}
         <div className="lan-peers">
           <div className="lan-section-title">
             设备（{peers.length}）
@@ -170,7 +203,7 @@ export default function LanShare() {
             <div className="dim lan-empty">
               暂未发现设备。<br />
               确保对方也开着本工具、在同一局域网，防火墙放行 UDP/TCP {me?.port ?? 53317}。
-              <br />网络隔离多播时，可用右上「+ IP」手动添加。
+              <br />网络隔离多播时，可用「+ IP」手动添加。
             </div>
           )}
           {peers.map((p) => (
@@ -186,14 +219,11 @@ export default function LanShare() {
                   {p.ip} {p.isBaibao ? "· 百宝箱" : "· LocalSend"}
                 </span>
               </span>
-              {unread[p.fingerprint] > 0 && (
-                <span className="lan-badge">{unread[p.fingerprint]}</span>
-              )}
+              {unread[p.fingerprint] > 0 && <span className="lan-badge">{unread[p.fingerprint]}</span>}
             </button>
           ))}
         </div>
 
-        {/* 会话 / 发送 */}
         <div className="lan-main">
           {!selectedPeer ? (
             <div className="dim lan-placeholder">← 从左侧选择一台设备开始</div>
@@ -207,18 +237,24 @@ export default function LanShare() {
                 </button>
               </div>
 
-              <div className="lan-chat">
-                {chat.length === 0 && (
+              <div className="lan-chat" ref={chatRef}>
+                {thread.length === 0 && (
                   <div className="dim">还没有消息。可发消息，或把文件拖进来发送。</div>
                 )}
-                {chat.map((m) => (
-                  <div key={m.id} className={`lan-msg${m.incoming ? " in" : " out"}`}>
-                    <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
-                      {m.text}
-                      {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
+                {thread.map((m) =>
+                  m.kind === "msg" ? (
+                    <div key={m.id} className={`lan-msg${m.incoming ? " in" : " out"}`}>
+                      <div className={`lan-msg-bubble${m.failed ? " failed" : ""}`}>
+                        {m.text}
+                        {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ) : (
+                    <div key={m.id} className={`lan-msg${m.direction === "in" ? " in" : " out"}`}>
+                      <FileBubble f={m} onCancel={cancelTransfer} />
+                    </div>
+                  )
+                )}
               </div>
 
               <div className="lan-input-row">
@@ -229,9 +265,7 @@ export default function LanShare() {
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && send()}
                 />
-                <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>
-                  发送
-                </button>
+                <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>发送</button>
               </div>
             </>
           )}
@@ -244,74 +278,6 @@ export default function LanShare() {
         </div>
       </div>
 
-      {/* 传输 / 已接收 */}
-      {(transfers.length > 0 || received.length > 0) && (
-        <div className="lan-foot">
-          {transfers.length > 0 && (
-            <div className="lan-foot-col">
-              <div className="lan-section-title">
-                传输（{activeTransfers.length} 进行中）
-                <button className="btn btn-ghost btn-sm" onClick={clearFinishedTransfers}>
-                  清理已完成
-                </button>
-              </div>
-              {transfers.map((t) => {
-                const pct = t.size ? Math.min(100, (t.transferred / t.size) * 100) : 0;
-                return (
-                  <div key={t.key} className="lan-xfer">
-                    <span className="lan-xfer-dir">{t.direction === "in" ? "↓" : "↑"}</span>
-                    <span className="lan-xfer-name" title={t.fileName}>{t.fileName}</span>
-                    <span className="lan-xfer-bar">
-                      <span
-                        className={`lan-xfer-fill${t.cancelled ? " cancelled" : ""}`}
-                        style={{ width: `${pct}%` }}
-                      />
-                    </span>
-                    <span className="dim lan-xfer-pct">
-                      {t.cancelled
-                        ? "已取消"
-                        : t.done
-                        ? "完成"
-                        : `${fmtBytes(t.transferred)}/${fmtBytes(t.size)} · ${fmtBytes(t.speed)}/s`}
-                    </span>
-                    {!t.done && (
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        onClick={() => cancelTransfer(t.sessionId)}
-                      >
-                        取消
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          {received.length > 0 && (
-            <div className="lan-foot-col">
-              <div className="lan-section-title">已接收</div>
-              {received.map((r, i) => (
-                <div key={i} className="lan-recv">
-                  <span className="lan-xfer-name" title={r.path}>
-                    {r.fileName}
-                    {r.verified === false && <span className="lan-verify-warn" title="校验不一致"> ⚠</span>}
-                    {r.verified === true && <span className="lan-verify-ok" title="校验通过"> ✓</span>}
-                  </span>
-                  <span className="dim">{fmtBytes(r.size)}</span>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => invoke("lan_reveal", { path: r.path })}
-                  >
-                    打开位置
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 手动按 IP 添加 */}
       {addOpen && (
         <div className="modal-overlay" onClick={() => setAddOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
