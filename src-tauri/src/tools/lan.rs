@@ -170,12 +170,27 @@ struct Inner {
 impl Default for Inner {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        // 从配置文件读回别名/指纹/兼容/接收目录，保证重启后稳定
+        let cfg = load_config();
+        let alias = cfg.alias.filter(|s| !s.is_empty()).unwrap_or_else(default_alias);
+        let fingerprint = cfg
+            .fingerprint
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| rand_hex(16));
+        let compat = cfg.compat.unwrap_or(false);
+        let download_dir = cfg
+            .download_dir
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&home).join("Downloads"));
+        // 落盘一次，确保（尤其是随机指纹）下次启动可复用
+        write_config(&alias, &fingerprint, compat, &download_dir);
         Inner {
             started: false,
-            alias: default_alias(),
-            fingerprint: rand_hex(16),
-            download_dir: PathBuf::from(home).join("Downloads"),
-            compat: false,
+            alias,
+            fingerprint,
+            download_dir,
+            compat,
             peers: HashMap::new(),
             decisions: HashMap::new(),
             sessions: HashMap::new(),
@@ -183,6 +198,52 @@ impl Default for Inner {
             socket: None,
         }
     }
+}
+
+// ── 配置持久化（别名/指纹/兼容/接收目录）─────────────────────
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LanConfig {
+    alias: Option<String>,
+    fingerprint: Option<String>,
+    compat: Option<bool>,
+    download_dir: Option<String>,
+}
+
+fn config_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join("Library/Application Support/com.baibao.toolbox/lan.json"),
+    )
+}
+
+fn load_config() -> LanConfig {
+    config_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn write_config(alias: &str, fingerprint: &str, compat: bool, dir: &std::path::Path) {
+    if let Some(p) = config_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let cfg = LanConfig {
+            alias: Some(alias.to_string()),
+            fingerprint: Some(fingerprint.to_string()),
+            compat: Some(compat),
+            download_dir: Some(dir.to_string_lossy().to_string()),
+        };
+        if let Ok(s) = serde_json::to_vec_pretty(&cfg) {
+            let _ = std::fs::write(p, s);
+        }
+    }
+}
+
+fn persist(g: &Inner) {
+    write_config(&g.alias, &g.fingerprint, g.compat, &g.download_dir);
 }
 
 #[derive(Clone, Default)]
@@ -756,13 +817,19 @@ pub fn lan_peers(state: State<'_, LanState>) -> Vec<Peer> {
 pub fn lan_set_alias(state: State<'_, LanState>, alias: String) {
     let a = alias.trim();
     if !a.is_empty() {
-        state.0.lock().unwrap().alias = a.to_string();
+        let mut g = state.0.lock().unwrap();
+        g.alias = a.to_string();
+        persist(&g);
     }
 }
 
 #[tauri::command]
 pub fn lan_set_compat(app: AppHandle, state: State<'_, LanState>, enabled: bool) {
-    state.0.lock().unwrap().compat = enabled;
+    {
+        let mut g = state.0.lock().unwrap();
+        g.compat = enabled;
+        persist(&g);
+    }
     emit_peers(&app, state.inner()); // 切换后立即按新规则刷新设备列表
 }
 
@@ -806,7 +873,9 @@ pub async fn lan_add_peer(
 #[tauri::command]
 pub fn lan_set_dir(state: State<'_, LanState>, dir: String) {
     if !dir.trim().is_empty() {
-        state.0.lock().unwrap().download_dir = PathBuf::from(dir);
+        let mut g = state.0.lock().unwrap();
+        g.download_dir = PathBuf::from(dir);
+        persist(&g);
     }
 }
 
