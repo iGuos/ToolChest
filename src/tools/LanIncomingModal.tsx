@@ -12,16 +12,25 @@ function fmtBytes(n: number): string {
 //   「当前文件」：确认你点击的这个文件；
 //   「全部待接收」：列出所有待接收文件，可勾选后接受所选。
 export default function LanIncomingModal() {
-  const { confirm: incoming, pendingFiles, peers, respond, acceptPendingFiles, dismissConfirm } =
-    useLan();
+  const {
+    confirm: incoming,
+    pendingFiles,
+    peers,
+    respond,
+    acceptPendingFiles,
+    rejectAllPending,
+    dismissConfirm,
+  } = useLan();
   const [tab, setTab] = useState<"current" | "all">("current");
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [confirmReject, setConfirmReject] = useState(false); // 全部拒绝二次确认
 
   useEffect(() => {
     if (incoming) {
       setTab("current");
       // 「全部待接收」默认勾选全部，可手动取消
       setPicked(new Set(pendingFiles.map((f) => f.id)));
+      setConfirmReject(false);
     }
     // 仅在弹框打开（incoming 变化）时重置选择
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -103,16 +112,37 @@ export default function LanIncomingModal() {
                 </label>
               ))}
             </div>
-            <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={dismissConfirm}>关闭</button>
-              <button
-                className="btn btn-primary"
-                disabled={pickedFiles.length === 0}
-                onClick={() => acceptPendingFiles(pickedFiles)}
-              >
-                接受所选（{pickedFiles.length} 项 · {fmtBytes(pickedTotal)}）
-              </button>
-            </div>
+            {confirmReject ? (
+              <div className="modal-actions">
+                <span className="dim" style={{ marginRight: "auto", fontSize: 13 }}>
+                  确认拒绝全部 {pendingFiles.length} 个文件？
+                </span>
+                <button className="btn btn-ghost" onClick={() => setConfirmReject(false)}>
+                  返回
+                </button>
+                <button className="btn btn-danger" onClick={rejectAllPending}>
+                  确认全部拒绝
+                </button>
+              </div>
+            ) : (
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={dismissConfirm}>关闭</button>
+                <button
+                  className="btn btn-danger"
+                  disabled={pendingFiles.length === 0}
+                  onClick={() => setConfirmReject(true)}
+                >
+                  全部拒绝（{pendingFiles.length}）
+                </button>
+                <button
+                  className="btn btn-primary"
+                  disabled={pickedFiles.length === 0}
+                  onClick={() => acceptPendingFiles(pickedFiles)}
+                >
+                  接受所选（{pickedFiles.length} 项 · {fmtBytes(pickedTotal)}）
+                </button>
+              </div>
+            )}
           </>
         )}
       </div>

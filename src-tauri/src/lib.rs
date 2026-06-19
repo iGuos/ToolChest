@@ -3,6 +3,8 @@ mod tools;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(tools::lan::LanState::default())
         .invoke_handler(tauri::generate_handler![
             tools::port::list_ports,
@@ -19,6 +21,7 @@ pub fn run() {
             tools::lan::lan_set_compat,
             tools::lan::lan_set_dir,
             tools::lan::lan_cancel,
+            tools::lan::lan_cancel_send,
             tools::lan::lan_add_peer,
             tools::lan::lan_respond,
             tools::lan::lan_pick_files,

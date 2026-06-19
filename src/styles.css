@@ -492,6 +492,10 @@ select { cursor: pointer; }
   line-height: 1.7;
   padding: 8px 4px;
 }
+.lan-peer.offline .lan-peer-icon,
+.lan-peer.offline .lan-peer-alias {
+  opacity: 0.55;
+}
 .lan-peer {
   display: flex;
   align-items: center;
@@ -568,12 +572,12 @@ select { cursor: pointer; }
   justify-content: flex-end;
 }
 .lan-msg-bubble {
-  max-width: 70%;
+  max-width: 100%; /* 宽度封顶交给外层 .lan-msg-col 的 75%，避免相对父列的百分比循环约束把中文压成一字一行 */
   padding: 8px 12px;
   border-radius: 12px;
   font-size: 13px;
   line-height: 1.5;
-  word-break: break-word;
+  overflow-wrap: anywhere; /* 只在超长连续串（如一长串数字）时断行，普通文本按自然换行 */
   white-space: pre-wrap;
 }
 .lan-msg.in .lan-msg-bubble {
@@ -1082,6 +1086,9 @@ select { cursor: pointer; }
 }
 .lan-icon-btn svg { width: 15px; height: 15px; display: block; }
 .lan-icon-btn + .lan-icon-btn { margin-left: 2px; }
+/* 刷新时图标旋转 */
+@keyframes lan-spin { to { transform: rotate(360deg); } }
+.lan-icon-btn.spinning svg { animation: lan-spin 0.6s linear infinite; }
 
 /* ── Table ── */
 .table-wrap {

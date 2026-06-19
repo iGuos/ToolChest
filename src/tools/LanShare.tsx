@@ -36,21 +36,26 @@ function fileExtLabel(name: string): string {
 function FileBubble({
   f,
   onCancel,
+  onCancelSend,
   onAccept,
 }: {
   f: FileMsg;
   onCancel: (sid: string) => void;
+  onCancelSend: (fileId: string) => void;
   onAccept: (sid: string) => void;
 }) {
   const pct = f.size ? Math.min(100, (f.transferred / f.size) * 100) : 0;
-  const clickable = f.status === "pending";
+  // 只有「收到的待接收文件」才可点击接收；发出去的「待发送」气泡不可点
+  const clickable = f.direction === "in" && f.status === "pending";
   const sub =
     f.status === "pending"
-      ? "点击接收"
+      ? f.direction === "in"
+        ? "点击接收"
+        : "等待对方接收…"
       : f.status === "cancelled"
       ? "已取消 / 已过期"
       : f.status === "failed"
-      ? "传输失败"
+      ? f.failReason ?? "传输失败"
       : f.status === "done"
       ? fmtBytes(f.size)
       : `${fmtBytes(f.transferred)} / ${fmtBytes(f.size)} · ${fmtBytes(f.speed)}/s`;
@@ -72,7 +77,18 @@ function FileBubble({
           </div>
         )}
         <div className="lan-file-sub dim">
-          <span className={f.status === "pending" ? "lan-file-accept" : ""}>{sub}</span>
+          <span className={clickable ? "lan-file-accept" : ""}>{sub}</span>
+          {f.direction === "out" && f.status === "pending" && (
+            <button
+              className="lan-file-act"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancelSend(f.fileId);
+              }}
+            >
+              取消发送
+            </button>
+          )}
           {f.status === "active" && (
             <button
               className="lan-file-act"
@@ -108,7 +124,7 @@ export default function LanShare() {
   const {
     me, peers, items, unread, selected, error,
     setSelected, setError, refreshPeers, sendMessage, sendFiles,
-    cancelTransfer, requestConfirm, addPeerByIp, setAlias, setCompat, pickDir,
+    cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, pickDir,
   } = useLan();
 
   const [draft, setDraft] = useState("");
@@ -118,6 +134,20 @@ export default function LanShare() {
   const [adding, setAdding] = useState(false);
   const [setOpen, setSetOpen] = useState(false);
   const [aliasDraft, setAliasDraft] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+
+  // 刷新设备列表：点击时图标转起来，至少转 0.6s 让动效可见
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    const started = Date.now();
+    try {
+      await refreshPeers();
+    } finally {
+      const wait = Math.max(0, 600 - (Date.now() - started));
+      window.setTimeout(() => setRefreshing(false), wait);
+    }
+  };
 
   useEffect(() => {
     if (setOpen && me) setAliasDraft(me.alias);
@@ -198,7 +228,7 @@ export default function LanShare() {
                 {m.failed && <span className="lan-msg-fail" title="发送失败"> ⚠</span>}
               </div>
             ) : (
-              <FileBubble f={m} onCancel={cancelTransfer} onAccept={requestConfirm} />
+              <FileBubble f={m} onCancel={cancelTransfer} onCancelSend={cancelSend} onAccept={requestConfirm} />
             )}
             <div className="lan-msg-time">{fmtTime(m.ts)}</div>
           </div>
@@ -245,10 +275,10 @@ export default function LanShare() {
                 </svg>
               </button>
               <button
-                className="lan-icon-btn"
+                className={`lan-icon-btn${refreshing ? " spinning" : ""}`}
                 title="刷新设备列表"
                 aria-label="刷新设备列表"
-                onClick={refreshPeers}
+                onClick={handleRefresh}
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <polyline points="23 4 23 10 17 10" />
@@ -268,14 +298,16 @@ export default function LanShare() {
           {peers.map((p) => (
             <button
               key={p.fingerprint}
-              className={`lan-peer${selected === p.fingerprint ? " active" : ""}`}
+              className={`lan-peer${selected === p.fingerprint ? " active" : ""}${
+                p.online === false ? " offline" : ""
+              }`}
               onClick={() => setSelected(p.fingerprint)}
             >
               <span className="lan-peer-icon">{deviceIcon(p)}</span>
               <span className="lan-peer-info">
                 <span className="lan-peer-alias">{p.alias}</span>
                 <span className="lan-peer-sub dim">
-                  {p.ip} {p.isBaibao ? "· 百宝箱" : "· LocalSend"}
+                  {p.online === false ? "离线 · 仅查看记录" : `${p.ip} ${p.isBaibao ? "· 百宝箱" : "· LocalSend"}`}
                 </span>
               </span>
               {unread[p.fingerprint] > 0 && <span className="lan-badge">{unread[p.fingerprint]}</span>}

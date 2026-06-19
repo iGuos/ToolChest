@@ -21,6 +21,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
 const PORT: u16 = 53317;
@@ -111,6 +113,12 @@ struct FileMeta {
     sha256: Option<String>,
     #[serde(default)]
     preview: Option<String>,
+    /// 发送顺序号（同一次发送内 0,1,2…）；接收端据此保证展示顺序与发送顺序一致
+    #[serde(default)]
+    order: Option<u32>,
+    /// 同一次发送的批次标识，配合 order 在接收端排序
+    #[serde(default)]
+    batch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +172,7 @@ struct Inner {
     decisions: HashMap<String, Sender<Decision>>,
     sessions: HashMap<String, Session>, // sessionId -> 会话
     cancelled: HashSet<String>,         // 已取消的 sessionId（收发双向）
+    cancelled_sends: HashSet<String>,   // 发送方取消的 fileId（对方还没接受前就撤销发送）
     socket: Option<Arc<UdpSocket>>,
 }
 
@@ -195,6 +204,7 @@ impl Default for Inner {
             decisions: HashMap::new(),
             sessions: HashMap::new(),
             cancelled: HashSet::new(),
+            cancelled_sends: HashSet::new(),
             socket: None,
         }
     }
@@ -250,17 +260,32 @@ fn persist(g: &Inner) {
 pub struct LanState(Arc<Mutex<Inner>>);
 
 fn default_alias() -> String {
-    // macOS：取「电脑名称」；失败回退用户名 / 通用名
-    if let Ok(out) = std::process::Command::new("scutil")
-        .args(["--get", "ComputerName"])
-        .output()
+    // macOS：取「电脑名称」
+    #[cfg(target_os = "macos")]
     {
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !name.is_empty() {
-            return name;
+        if let Ok(out) = std::process::Command::new("scutil")
+            .args(["--get", "ComputerName"])
+            .output()
+        {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
         }
     }
+    // Windows：取计算机名
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(name) = std::env::var("COMPUTERNAME") {
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    // 通用回退：用户名（USER=类 Unix，USERNAME=Windows）
     std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
         .map(|u| format!("{u} 的百宝箱"))
         .unwrap_or_else(|_| "百宝箱设备".into())
 }
@@ -284,6 +309,20 @@ impl LanState {
 
     fn is_cancelled(&self, session_id: &str) -> bool {
         self.0.lock().unwrap().cancelled.contains(session_id)
+    }
+
+    /// 发送方撤销某个文件的发送（对方接受前）。
+    fn cancel_send(&self, file_id: &str) {
+        self.0.lock().unwrap().cancelled_sends.insert(file_id.to_string());
+    }
+
+    fn is_send_cancelled(&self, file_id: &str) -> bool {
+        self.0.lock().unwrap().cancelled_sends.contains(file_id)
+    }
+
+    /// 用完即清，避免 fileId 集合无限增长。
+    fn take_send_cancelled(&self, file_id: &str) -> bool {
+        self.0.lock().unwrap().cancelled_sends.remove(file_id)
     }
 }
 
@@ -839,6 +878,12 @@ pub fn lan_cancel(state: State<'_, LanState>, session_id: String) {
     state.0.lock().unwrap().cancelled.insert(session_id);
 }
 
+/// 发送方撤销尚未被接受的发送（按 fileId）。握手返回后发送流程会据此跳过上传。
+#[tauri::command]
+pub fn lan_cancel_send(state: State<'_, LanState>, file_id: String) {
+    state.cancel_send(&file_id);
+}
+
 /// 发现失败时的兜底：手动按 IP 拉取对端信息并加入设备表。
 #[tauri::command]
 pub async fn lan_add_peer(
@@ -901,81 +946,51 @@ pub fn lan_respond(
 // ── 命令：原生选择器 ─────────────────────────────────────────
 
 #[tauri::command]
-pub async fn lan_pick_files() -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let out = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                "set fs to choose file with prompt \"选择要发送的文件\" with multiple selections allowed",
-                "-e",
-                "set t to \"\"",
-                "-e",
-                "repeat with f in fs",
-                "-e",
-                "set t to t & POSIX path of f & linefeed",
-                "-e",
-                "end repeat",
-                "-e",
-                "return t",
-            ])
-            .output()
-            .map_err(|e| format!("打开选择器失败：{e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect())
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            if err.contains("-128") || err.contains("User canceled") {
-                Ok(vec![])
-            } else {
-                Err(format!("选择失败：{}", err.trim()))
-            }
-        }
-    })
-    .await
-    .map_err(|e| format!("任务调度失败：{e}"))?
-}
-
-#[tauri::command]
-pub async fn lan_pick_dir() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let out = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                "POSIX path of (choose folder with prompt \"选择接收文件的保存目录\")",
-            ])
-            .output()
-            .map_err(|e| format!("打开选择器失败：{e}"))?;
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            Ok(if p.is_empty() { None } else { Some(p) })
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            if err.contains("-128") || err.contains("User canceled") {
-                Ok(None)
-            } else {
-                Err(format!("选择失败：{}", err.trim()))
-            }
-        }
-    })
-    .await
-    .map_err(|e| format!("任务调度失败：{e}"))?
-}
-
-#[tauri::command]
-pub async fn lan_reveal(path: String) -> Result<(), String> {
+pub async fn lan_pick_files(app: AppHandle) -> Result<Vec<String>, String> {
+    // 原生跨平台文件选择器（macOS / Windows / Linux 通用）。
+    // 仅支持选单个或多个文件，不支持文件夹。blocking_* 不能在主线程调用，
+    // 这里在阻塞线程池里调用，对话框本身仍由主线程弹出。
     tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new("open")
-            .args(["-R", &path])
-            .status()
-            .map(|_| ())
-            .map_err(|e| format!("打开失败：{e}"))
+        let picked = app
+            .dialog()
+            .file()
+            .set_title("选择要发送的文件")
+            .blocking_pick_files();
+        let paths = picked
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|fp| fp.into_path().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        Ok(paths)
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn lan_pick_dir(app: AppHandle) -> Result<Option<String>, String> {
+    // 原生跨平台目录选择器：选「接收文件的保存目录」。
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .set_title("选择接收文件的保存目录")
+            .blocking_pick_folder();
+        Ok(picked
+            .and_then(|fp| fp.into_path().ok())
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn lan_reveal(app: AppHandle, path: String) -> Result<(), String> {
+    // 在系统文件管理器中定位文件（Finder / 资源管理器 / 文件管理器）。
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("打开失败：{e}"))
 }
 
 // ── 命令：发送 ───────────────────────────────────────────────
@@ -1100,21 +1115,29 @@ pub async fn lan_send_files(
             .build()
             .map_err(|e| e.to_string())?;
 
-        // 每个文件各自作为一个独立会话发送：接收方可逐个确认/拒绝，互不影响。
-        // 只支持单文件，不支持文件夹。
-        let mut errs: Vec<String> = Vec::new();
-        let mut ok_any = false;
+        // 每个文件各自作为一个独立会话、并发发送：接收方可逐个确认/拒绝，互不影响。
+        // 并发是关键——prepare-upload 会阻塞等对方做决定，串行会导致后面的文件迟迟发不出、
+        // 发送方会话框里也看不到其余「待发送」气泡。只支持单文件，不支持文件夹。
+        // 单个文件的成功/失败（被拒、上传失败等）都通过对话里的文件卡片反映，不冒泡成顶部错误条；
+        // 只有「还没生成卡片」的前置问题（文件夹/读不出）才用错误条提示。
+        // 同一次发送共用一个批次号；文件按选择顺序编号 order=0,1,2…
+        // 发送方：在主循环里按序立刻发「待发送」气泡 → 自己看到的顺序 = 选择顺序。
+        // 接收方：order + batch 随 prepare-upload 带过去，据此排序 → 看到的顺序 = 发送顺序。
+        let batch = rand_hex(6);
+        let mut preflight_errs: Vec<String> = Vec::new();
+        let mut handles = Vec::new();
+        let mut order: u32 = 0;
         for path in &paths {
             let pb = PathBuf::from(path);
             let meta = match std::fs::metadata(&pb) {
                 Ok(m) => m,
                 Err(e) => {
-                    errs.push(format!("读取 {path} 失败：{e}"));
+                    preflight_errs.push(format!("读取 {path} 失败：{e}"));
                     continue;
                 }
             };
             if meta.is_dir() {
-                errs.push(format!("暂不支持发送文件夹：{path}"));
+                preflight_errs.push(format!("暂不支持发送文件夹：{path}"));
                 continue;
             }
             let name = pb
@@ -1122,16 +1145,33 @@ pub async fn lan_send_files(
                 .and_then(|n| n.to_str())
                 .unwrap_or("file")
                 .to_string();
-            match send_one_file(
-                &app, &state, &client, &base, &info, &fingerprint, &name, path, meta.len(),
-            ) {
-                Ok(()) => ok_any = true,
-                Err(e) => errs.push(e),
-            }
+            let size = meta.len();
+            let id = rand_hex(8);
+            let idx = order;
+            order += 1;
+            // 本地立即按序显示「待发送」气泡（带 order，前端据此保证发送方一侧的顺序）
+            let _ = app.emit(
+                "lan://send-pending",
+                serde_json::json!({ "fileId": id, "fileName": name, "size": size, "peer": fingerprint, "order": idx }),
+            );
+            // 每个文件单开线程并发发送（握手会阻塞等对方决定，必须并发，否则后面的文件发不出）。
+            // reqwest::blocking::Client / AppHandle / LanState 都可廉价 clone 跨线程。
+            let (app, state, client) = (app.clone(), state.clone(), client.clone());
+            let (base, info, fingerprint, path, batch) =
+                (base.clone(), info.clone(), fingerprint.clone(), path.clone(), batch.clone());
+            handles.push(std::thread::spawn(move || {
+                // 失败已由 send_one_file 通过 lan://send-rejected 标记到文件卡片，这里忽略返回值
+                let _ = send_one_file(
+                    &app, &state, &client, &base, &info, &fingerprint, &name, &path, size, &id, idx,
+                    &batch,
+                );
+            }));
         }
-        // 全部失败才算整体失败；部分被拒不影响其余文件
-        if !ok_any && !errs.is_empty() {
-            return Err(errs.join("；"));
+        for h in handles {
+            let _ = h.join();
+        }
+        if !preflight_errs.is_empty() {
+            return Err(preflight_errs.join("；"));
         }
         Ok(())
     })
@@ -1139,7 +1179,8 @@ pub async fn lan_send_files(
     .map_err(|e| format!("任务调度失败：{e}"))?
 }
 
-/// 发送单个文件（一个独立会话）：prepare-upload 握手 → 流式上传（带断点续传重试）。
+/// 发送单个文件（一个独立会话）：走握手 + 上传；「待发送」气泡已在主循环里按序发好。
+/// 任何失败都只把这条文件卡片标记为失败（lan://send-rejected），不冒泡成顶部错误条。
 #[allow(clippy::too_many_arguments)]
 fn send_one_file(
     app: &AppHandle,
@@ -1151,38 +1192,87 @@ fn send_one_file(
     name: &str,
     path: &str,
     size: u64,
+    id: &str,
+    order: u32,
+    batch: &str,
 ) -> Result<(), String> {
-    // 组装单文件清单（含 sha256，便于接收方校验完整性）
-    let id = rand_hex(8);
+    let r = send_one_file_inner(
+        app, state, client, base, info, fingerprint, name, path, size, id, order, batch,
+    );
+    // 用户在对方接受前撤销了发送：标记为「已取消」（而非失败），优先于失败原因
+    if state.take_send_cancelled(id) {
+        let _ = app.emit(
+            "lan://send-cancelled",
+            serde_json::json!({ "fileId": id, "peer": fingerprint }),
+        );
+        return Ok(());
+    }
+    if let Err(reason) = &r {
+        // 失败（被拒 / 上传失败 / 打开失败 / 未被接受）：把这条卡片标记为失败并带上原因，仅卡片可见
+        let _ = app.emit(
+            "lan://send-rejected",
+            serde_json::json!({ "fileId": id, "peer": fingerprint, "reason": reason }),
+        );
+    }
+    r
+}
+
+/// prepare-upload 握手 → 流式上传（带断点续传重试）。失败用 Err 返回，由 send_one_file 统一标记卡片。
+#[allow(clippy::too_many_arguments)]
+fn send_one_file_inner(
+    app: &AppHandle,
+    state: &LanState,
+    client: &reqwest::blocking::Client,
+    base: &str,
+    info: &DeviceInfo,
+    fingerprint: &str,
+    name: &str,
+    path: &str,
+    size: u64,
+    id: &str,
+    order: u32,
+    batch: &str,
+) -> Result<(), String> {
+    // 还没开始就被撤销
+    if state.is_send_cancelled(id) {
+        return Ok(());
+    }
+    // 组装单文件清单（含 sha256 校验完整性；order/batch 让接收端按发送顺序展示）
     let mut fj = serde_json::json!({
         "id": id, "fileName": name, "size": size, "fileType": ext_mime(name),
+        "order": order, "batch": batch,
     });
     if let Some(h) = sha256_file(path) {
         fj["sha256"] = serde_json::Value::String(h);
     }
     let mut files = serde_json::Map::new();
-    files.insert(id.clone(), fj);
+    files.insert(id.to_string(), fj);
 
     // 握手：prepare-upload
     let prep = client
         .post(format!("{base}/api/localsend/v2/prepare-upload"))
         .json(&serde_json::json!({ "info": info, "files": files }))
         .send()
-        .map_err(|e| format!("发起请求失败：{e}"))?;
+        .map_err(|_| "无法连接对方".to_string())?;
     let status = prep.status();
     if status == reqwest::StatusCode::FORBIDDEN {
-        return Err(format!("{name}：对方拒绝了接收"));
+        return Err("对方拒绝接收".to_string());
     }
     if !status.is_success() {
-        return Err(format!("{name}：对方返回 {status}（可能未接受）"));
+        return Err(format!("对方未接受（{status}）"));
     }
-    let resp: PrepareUploadResponse = prep.json().map_err(|e| format!("解析响应失败：{e}"))?;
+    let resp: PrepareUploadResponse = prep.json().map_err(|_| "握手响应异常".to_string())?;
 
-    let Some(token) = resp.files.get(&id) else {
-        return Ok(()); // 该文件未被接受
+    let Some(token) = resp.files.get(id) else {
+        return Err("对方未接受此文件".to_string());
     };
 
-    // 通知前端：文件已被接受、开始发送（在对话里立即显示文件气泡）
+    // 对方刚接受，但在等待期间用户已撤销 → 不再上传
+    if state.is_send_cancelled(id) {
+        return Ok(());
+    }
+
+    // 通知前端：文件已被接受、开始发送（把「待发送」气泡升级为传输中）
     let _ = app.emit(
         "lan://outgoing",
         serde_json::json!({
@@ -1202,21 +1292,21 @@ fn send_one_file(
             );
             return Ok(());
         }
-        let offset = query_offset(client, base, &resp.session_id, &id, token).min(size);
+        let offset = query_offset(client, base, &resp.session_id, id, token).min(size);
         if offset >= size {
             break; // 对端已收满
         }
-        let mut f = File::open(path).map_err(|e| format!("打开 {path} 失败：{e}"))?;
+        let mut f = File::open(path).map_err(|_| "读取文件失败".to_string())?;
         use std::io::Seek;
         f.seek(std::io::SeekFrom::Start(offset))
-            .map_err(|e| format!("定位 {name} 失败：{e}"))?;
+            .map_err(|_| "读取文件失败".to_string())?;
         let remaining = size - offset;
         let reader = ProgressReader {
             inner: f,
             app: app.clone(),
             state: state.clone(),
             session_id: resp.session_id.clone(),
-            file_id: id.clone(),
+            file_id: id.to_string(),
             file_name: name.to_string(),
             peer: fingerprint.to_string(),
             base: offset,
@@ -1230,7 +1320,7 @@ fn send_one_file(
             .post(format!("{base}/api/localsend/v2/upload"))
             .query(&[
                 ("sessionId", resp.session_id.as_str()),
-                ("fileId", id.as_str()),
+                ("fileId", id),
                 ("token", token.as_str()),
                 ("offset", offset.to_string().as_str()),
             ])
@@ -1238,7 +1328,7 @@ fn send_one_file(
             .send();
         match res {
             Ok(r) if r.status().is_success() => break, // 整段发完
-            Ok(r) => return Err(format!("上传 {name} 被拒绝：{}", r.status())),
+            Ok(r) => return Err(format!("对方中断接收（{}）", r.status())),
             Err(_) if state.is_cancelled(&resp.session_id) => {
                 let _ = app.emit(
                     "lan://cancelled",
@@ -1249,7 +1339,8 @@ fn send_one_file(
             Err(e) => {
                 attempt += 1;
                 if attempt > MAX_RETRY {
-                    return Err(format!("上传 {name} 失败（已重试 {MAX_RETRY} 次）：{e}"));
+                    let _ = e;
+                    return Err("传输失败（网络中断）".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(800));
                 // 回到循环开头：重新查偏移、从断点续传

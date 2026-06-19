@@ -3,6 +3,7 @@ import {
   useContext,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -32,12 +33,15 @@ export interface Peer {
   deviceType?: string | null;
   isBaibao: boolean;
   lastSeenMs: number;
+  online?: boolean; // 合并历史已知设备后：当前是否在线（用于展示离线设备的历史记录）
 }
 export interface FileMeta {
   id: string;
   fileName: string;
   size: number;
   fileType: string;
+  order?: number; // 同一次发送内的顺序号
+  batch?: string; // 同一次发送的批次标识
 }
 export interface Incoming {
   sessionId: string;
@@ -69,6 +73,7 @@ export interface FileMsg {
   status: FileStatus;
   verified: boolean | null;
   path?: string;
+  failReason?: string; // status="failed" 时的具体原因（如「对方拒绝接收」）
   speed: number;
   ts: number;
   updatedAt: number;
@@ -93,9 +98,11 @@ interface LanCtxValue {
   respond: (accept: boolean, fileIds: string[]) => Promise<void>;
   acceptPendingFiles: (files: FileMsg[]) => void;
   acceptAllPending: () => void;
+  rejectAllPending: () => void;
   sendMessage: (fp: string, text: string) => Promise<void>;
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
   cancelTransfer: (sessionId: string) => Promise<void>;
+  cancelSend: (fileId: string) => void;
   setAlias: (alias: string) => Promise<void>;
   setCompat: (enabled: boolean) => Promise<void>;
   pickDir: () => Promise<void>;
@@ -114,10 +121,41 @@ let idSeq = 0;
 const nextId = () => `${Date.now()}-${idSeq++}`;
 const fileKey = (dir: string, sid: string, fid: string) => `${dir}:${sid}:${fid}`;
 
+// ── 历史记录持久化（按设备唯一 ID = fingerprint 关联，改名也不丢）──
+const LS_ITEMS = "baibao.lan.items.v1";
+const LS_PEERS = "baibao.lan.knownpeers.v1";
+const HISTORY_CAP = 3000; // 最多保留多少条记录，避免无限增长
+
+function loadItems(): ChatItem[] {
+  try {
+    const raw = localStorage.getItem(LS_ITEMS);
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as ChatItem[];
+    // 重启后无法续传：把未完成的传输状态归一为「已取消」，避免卡在「传输中/待接收」
+    return arr.map((x) =>
+      x.kind === "file" && (x.status === "active" || x.status === "pending")
+        ? { ...x, status: "cancelled" as FileStatus, speed: 0 }
+        : x
+    );
+  } catch {
+    return [];
+  }
+}
+
+function loadKnownPeers(): Record<string, Peer> {
+  try {
+    const raw = localStorage.getItem(LS_PEERS);
+    return raw ? (JSON.parse(raw) as Record<string, Peer>) : {};
+  } catch {
+    return {};
+  }
+}
+
 export function LanProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<MyInfo | null>(null);
-  const [peers, setPeers] = useState<Peer[]>([]);
-  const [items, setItems] = useState<ChatItem[]>([]);
+  const [livePeers, setLivePeers] = useState<Peer[]>([]); // 当前在线发现到的设备
+  const [knownPeers, setKnownPeers] = useState<Record<string, Peer>>(loadKnownPeers); // 历史已知设备（持久化）
+  const [items, setItems] = useState<ChatItem[]>(loadItems);
   const [confirm, setConfirm] = useState<Incoming | null>(null);
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [selected, setSelectedRaw] = useState<string | null>(null);
@@ -126,6 +164,56 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
   const offersRef = useRef<Record<string, Incoming>>({}); // sessionId -> 待接收请求
+  const batchBaseRef = useRef<Record<string, number>>({}); // batch -> 基准时间戳，配合 order 保证接收顺序=发送顺序
+
+  // 设备列表 = 在线发现 + 历史已知（离线）。按 fingerprint 去重，online 标记是否在线。
+  const peers = useMemo<Peer[]>(() => {
+    const map = new Map<string, Peer>();
+    for (const fp of Object.keys(knownPeers)) map.set(fp, { ...knownPeers[fp], online: false });
+    for (const p of livePeers) map.set(p.fingerprint, { ...p, online: true });
+    return [...map.values()].sort(
+      (a, b) =>
+        Number(!!b.online) - Number(!!a.online) || (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)
+    );
+  }, [livePeers, knownPeers]);
+
+  // 在线设备并入历史已知表（保留最新 alias/ip；改名后历史仍按 fingerprint 关联）
+  useEffect(() => {
+    if (livePeers.length === 0) return;
+    setKnownPeers((kp) => {
+      let changed = false;
+      const next = { ...kp };
+      for (const p of livePeers) {
+        const rec: Peer = { ...p };
+        if (JSON.stringify(next[p.fingerprint]) !== JSON.stringify(rec)) {
+          next[p.fingerprint] = rec;
+          changed = true;
+        }
+      }
+      return changed ? next : kp;
+    });
+  }, [livePeers]);
+
+  // 持久化：历史已知设备 + 聊天/传输记录（防抖、裁剪到上限）
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_PEERS, JSON.stringify(knownPeers));
+    } catch {
+      /* ignore */
+    }
+  }, [knownPeers]);
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      try {
+        const trimmed =
+          items.length > HISTORY_CAP ? items.slice(items.length - HISTORY_CAP) : items;
+        localStorage.setItem(LS_ITEMS, JSON.stringify(trimmed));
+      } catch {
+        /* ignore */
+      }
+    }, 500);
+    return () => window.clearTimeout(t);
+  }, [items]);
 
   const bumpUnread = useCallback((fp: string) => {
     if (fp && fp !== selectedRef.current) {
@@ -151,20 +239,22 @@ export function LanProvider({ children }: { children: ReactNode }) {
           verified: patch.verified ?? null,
           path: patch.path,
           speed: patch.speed ?? 0,
-          ts: Date.now(),
+          ts: patch.ts ?? Date.now(), // 允许调用方指定 ts，用于保证展示顺序
           updatedAt: Date.now(),
         };
         return [...list, f];
       }
       const copy = [...list];
-      copy[idx] = { ...(copy[idx] as FileMsg), ...patch, updatedAt: Date.now() };
+      // 已存在的不覆盖 ts（保持原有顺序），只更新其余字段
+      const { ts: _ignoredTs, ...rest } = patch;
+      copy[idx] = { ...(copy[idx] as FileMsg), ...rest, updatedAt: Date.now() };
       return copy;
     });
   }, []);
 
   const refreshPeers = useCallback(async () => {
     try {
-      setPeers(await invoke<Peer[]>("lan_peers"));
+      setLivePeers(await invoke<Peer[]>("lan_peers"));
     } catch {
       /* ignore */
     }
@@ -189,13 +279,21 @@ export function LanProvider({ children }: { children: ReactNode }) {
         if (alive) setError(String(e));
       }
 
-      track(await listen<Peer[]>("lan://peers", (e) => setPeers(e.payload)));
+      track(await listen<Peer[]>("lan://peers", (e) => setLivePeers(e.payload)));
       track(
         await listen<Incoming>("lan://incoming", (e) => {
           // 不立即弹窗：登记请求 + 在对话里放「待接收」文件气泡
           const inc = e.payload;
           offersRef.current = { ...offersRef.current, [inc.sessionId]: inc };
           for (const f of inc.files) {
+            // 并发发送时各文件到达顺序是乱的；用「批次基准时间 + 顺序号」给气泡定 ts，
+            // 保证接收端展示顺序 = 发送顺序（同批共用基准，跨批/消息仍按到达时间）。
+            let ts = Date.now();
+            if (f.batch) {
+              const base = batchBaseRef.current[f.batch] ?? ts;
+              batchBaseRef.current[f.batch] = base;
+              ts = base + (f.order ?? 0);
+            }
             upsertFile({
               id: fileKey("in", inc.sessionId, f.id),
               sessionId: inc.sessionId,
@@ -205,6 +303,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
               size: f.size,
               direction: "in",
               status: "pending",
+              ts,
             });
           }
           bumpUnread(inc.fingerprint);
@@ -234,6 +333,52 @@ export function LanProvider({ children }: { children: ReactNode }) {
           bumpUnread(m.fingerprint);
         })
       );
+      // 发送方点了发送：先在本地放一个「待发送」气泡（还没拿到会话号，按 fileId 临时归位）
+      track(
+        await listen<{ fileId: string; fileName: string; size: number; peer: string; order?: number }>(
+          "lan://send-pending",
+          (e) => {
+            const o = e.payload;
+            upsertFile({
+              id: fileKey("out", "", o.fileId),
+              sessionId: "",
+              fileId: o.fileId,
+              fingerprint: o.peer,
+              fileName: o.fileName,
+              size: o.size,
+              direction: "out",
+              status: "pending",
+              ts: Date.now() + (o.order ?? 0), // 保证发送方一侧的气泡顺序 = 选择顺序
+            });
+          }
+        )
+      );
+      // 握手被拒/失败：把「待发送」气泡标记为失败
+      track(
+        await listen<{ fileId: string; peer: string; reason?: string }>("lan://send-rejected", (e) => {
+          const { fileId, reason } = e.payload;
+          setItems((list) =>
+            list.map((x) =>
+              x.kind === "file" && x.direction === "out" && x.fileId === fileId
+                ? { ...x, status: "failed", failReason: reason, updatedAt: Date.now() }
+                : x
+            )
+          );
+        })
+      );
+      // 后端确认撤销成功
+      track(
+        await listen<{ fileId: string; peer: string }>("lan://send-cancelled", (e) => {
+          const { fileId } = e.payload;
+          setItems((list) =>
+            list.map((x) =>
+              x.kind === "file" && x.direction === "out" && x.fileId === fileId
+                ? { ...x, status: "cancelled", updatedAt: Date.now() }
+                : x
+            )
+          );
+        })
+      );
       track(
         await listen<{
           sessionId: string;
@@ -241,18 +386,45 @@ export function LanProvider({ children }: { children: ReactNode }) {
           files: { fileId: string; fileName: string; size: number }[];
         }>("lan://outgoing", (e) => {
           const o = e.payload;
-          for (const f of o.files) {
-            upsertFile({
-              id: fileKey("out", o.sessionId, f.fileId),
-              sessionId: o.sessionId,
-              fileId: f.fileId,
-              fingerprint: o.peer,
-              fileName: f.fileName,
-              size: f.size,
-              direction: "out",
-              status: "active",
-            });
-          }
+          // 对方已接受：把之前按 fileId 临时落位的「待发送」气泡升级为「传输中」，
+          // 并补上真正的会话号（id 也随之换成 out:sessionId:fileId）。
+          setItems((list) => {
+            const copy = [...list];
+            const now = Date.now();
+            for (const f of o.files) {
+              const realId = fileKey("out", o.sessionId, f.fileId);
+              const idx = copy.findIndex(
+                (x) => x.kind === "file" && x.direction === "out" && x.fileId === f.fileId
+              );
+              if (idx >= 0) {
+                copy[idx] = {
+                  ...(copy[idx] as FileMsg),
+                  id: realId,
+                  sessionId: o.sessionId,
+                  status: "active",
+                  updatedAt: now,
+                };
+              } else {
+                copy.push({
+                  kind: "file",
+                  id: realId,
+                  sessionId: o.sessionId,
+                  fileId: f.fileId,
+                  fingerprint: o.peer,
+                  fileName: f.fileName,
+                  size: f.size,
+                  transferred: 0,
+                  direction: "out",
+                  status: "active",
+                  verified: null,
+                  speed: 0,
+                  ts: now,
+                  updatedAt: now,
+                });
+              }
+            }
+            return copy;
+          });
         })
       );
       track(
@@ -413,6 +585,22 @@ export function LanProvider({ children }: { children: ReactNode }) {
     setConfirm(null);
   }, [upsertFile]);
 
+  // 一次拒绝所有待接收会话
+  const rejectAllPending = useCallback(() => {
+    const offers = offersRef.current;
+    for (const sid of Object.keys(offers)) {
+      const inc = offers[sid];
+      invoke("lan_respond", { sessionId: sid, accept: false, fileIds: [] }).catch((e) =>
+        setError(String(e))
+      );
+      for (const f of inc.files) {
+        upsertFile({ id: fileKey("in", sid, f.id), status: "cancelled" });
+      }
+    }
+    offersRef.current = {};
+    setConfirm(null);
+  }, [upsertFile]);
+
   const sendMessage = useCallback(async (fp: string, text: string) => {
     const t = text.trim();
     if (!t) return;
@@ -447,6 +635,21 @@ export function LanProvider({ children }: { children: ReactNode }) {
       setError(String(e));
     }
   }, []);
+
+  // 撤销一个还没被对方接受的发送（「待发送」气泡）：本地立即标记已取消，并通知后端跳过上传
+  const cancelSend = useCallback(
+    (fileId: string) => {
+      invoke("lan_cancel_send", { fileId }).catch((e) => setError(String(e)));
+      setItems((list) =>
+        list.map((x) =>
+          x.kind === "file" && x.direction === "out" && x.fileId === fileId && x.status === "pending"
+            ? { ...x, status: "cancelled", updatedAt: Date.now() }
+            : x
+        )
+      );
+    },
+    []
+  );
 
   const setAlias = useCallback(async (alias: string) => {
     const a = alias.trim();
@@ -484,14 +687,14 @@ export function LanProvider({ children }: { children: ReactNode }) {
 
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
   const pendingFiles = items.filter(
-    (x) => x.kind === "file" && x.status === "pending"
+    (x) => x.kind === "file" && x.direction === "in" && x.status === "pending"
   ) as FileMsg[];
 
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
-    acceptPendingFiles, acceptAllPending,
-    sendMessage, sendFiles, cancelTransfer, setAlias, setCompat, pickDir, addPeerByIp,
+    acceptPendingFiles, acceptAllPending, rejectAllPending,
+    sendMessage, sendFiles, cancelTransfer, cancelSend, setAlias, setCompat, pickDir, addPeerByIp,
   };
 
   return <LanCtx.Provider value={value}>{children}</LanCtx.Provider>;
