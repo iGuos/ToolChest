@@ -4,6 +4,7 @@ import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
 import TrustApp from "./tools/TrustApp";
 import TodoList from "./tools/TodoList";
+import LanShare from "./tools/LanShare";
 import { openDeepSeek } from "./tools/deepseek";
 
 interface ToolMeta {
@@ -21,6 +22,7 @@ const TOOLS: ToolMeta[] = [
   { id: "hosts-editor", name: "Hosts 编辑器", icon: "📝" },
   { id: "trust-app", name: "Mac 应用授权", icon: "🔓" },
   { id: "todo", name: "待办事项", icon: "📋" },
+  { id: "lan-share", name: "局域网互传", icon: "📡" },
   { id: "deepseek", name: "DeepSeek", icon: "🤖" },
 ];
 
@@ -64,6 +66,8 @@ function renderTool(
       return <TrustApp />;
     case "todo":
       return <TodoList />;
+    case "lan-share":
+      return <LanShare />;
     default:
       return null;
   }

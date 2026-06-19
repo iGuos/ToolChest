@@ -16,7 +16,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip", "rustls-tls", "json"] }
+tiny_http = "0.12"
+socket2 = { version = "0.5", features = ["all"] }
+getrandom = "0.2"
 
 [profile.release]
 panic = "abort"
