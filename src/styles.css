@@ -130,19 +130,44 @@ select { cursor: pointer; }
   color: var(--text-hi);
   margin-bottom: 4px;
 }
-.settings-row {
+.settings-cards {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 4px;
-  border-bottom: 1px solid var(--border);
-  cursor: pointer;
-}
-.settings-row:last-child { border-bottom: none; }
-.settings-row-label {
-  display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
+}
+.settings-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: grab;
+  transition: background 0.1s, opacity 0.1s, border-color 0.1s;
+}
+.settings-card:hover {
+  border-color: var(--accent);
+}
+.settings-card.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+.settings-card.off {
+  opacity: 0.55;
+}
+.settings-grip {
+  color: var(--text-dim);
+  font-size: 15px;
+  cursor: grab;
+  user-select: none;
+}
+.settings-card-name {
+  flex: 1;
+  font-size: 13px;
+}
+.settings-reset {
+  margin-right: auto;
 }
 
 /* ── Content ── */

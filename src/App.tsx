@@ -35,8 +35,9 @@ const tabName = (id: string) =>
 const SETTINGS_KEY = "baibao.settings.v1";
 interface Settings {
   hiddenTools: string[]; // 在侧栏/首页隐藏的工具 id
+  order: string[]; // 工具自定义排序（id 顺序；不在此列的按 TOOLS 默认序追加）
 }
-const DEFAULT_SETTINGS: Settings = { hiddenTools: [] };
+const DEFAULT_SETTINGS: Settings = { hiddenTools: [], order: [] };
 
 function loadSettings(): Settings {
   try {
@@ -46,6 +47,21 @@ function loadSettings(): Settings {
     /* 损坏则回退默认 */
   }
   return DEFAULT_SETTINGS;
+}
+
+// 按设置里的 order 排好工具；order 里没有的（新加的工具）按 TOOLS 默认序追加到末尾
+function orderTools(order: string[]): ToolMeta[] {
+  const byId = new Map(TOOLS.map((t) => [t.id, t]));
+  const result: ToolMeta[] = [];
+  for (const id of order) {
+    const t = byId.get(id);
+    if (t) {
+      result.push(t);
+      byId.delete(id);
+    }
+  }
+  for (const t of TOOLS) if (byId.has(t.id)) result.push(t);
+  return result;
 }
 
 function Home({
@@ -119,9 +135,10 @@ export default function App() {
     active: boolean;
     pointerId: number;
   } | null>(null);
-  // 应用设置 + 设置弹框开关
+  // 应用设置 + 设置弹框开关 + 设置内拖拽排序的当前项
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [dragToolId, setDragToolId] = useState<string | null>(null);
   useEffect(() => {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -130,7 +147,8 @@ export default function App() {
     }
   }, [settings]);
   const hiddenTools = new Set(settings.hiddenTools);
-  const visibleTools = TOOLS.filter((t) => !hiddenTools.has(t.id));
+  const orderedTools = orderTools(settings.order);
+  const visibleTools = orderedTools.filter((t) => !hiddenTools.has(t.id));
   const toggleToolVisible = (id: string) =>
     setSettings((s) => {
       const hid = new Set(s.hiddenTools);
@@ -138,6 +156,18 @@ export default function App() {
       else hid.add(id);
       return { ...s, hiddenTools: [...hid] };
     });
+  // 把 fromId 这张卡拖到 overId 的位置
+  const moveTool = (fromId: string, overId: string) =>
+    setSettings((s) => {
+      const ids = orderTools(s.order).map((t) => t.id);
+      const from = ids.indexOf(fromId);
+      const to = ids.indexOf(overId);
+      if (from < 0 || to < 0 || from === to) return s;
+      ids.splice(from, 1);
+      ids.splice(to, 0, fromId);
+      return { ...s, order: ids };
+    });
+  const resetSettings = () => setSettings({ ...DEFAULT_SETTINGS });
 
   // 哪些 tab 有未保存改动（用于 tab 上的变更指示灯）
   const [dirtyTabs, setDirtyTabs] = useState<Set<string>>(new Set());
@@ -423,24 +453,44 @@ export default function App() {
             <h3>设置</h3>
             <div className="settings-section">
               <div className="settings-section-title">功能菜单</div>
-              <div className="dim" style={{ fontSize: 12, marginBottom: 6 }}>
-                选择在侧边栏和首页显示哪些工具
+              <div className="dim" style={{ fontSize: 12, marginBottom: 8 }}>
+                勾选是否显示，拖拽 ⠿ 调整顺序（侧边栏与首页同步生效）
               </div>
-              {TOOLS.map((t) => (
-                <label key={t.id} className="settings-row">
-                  <span className="settings-row-label">
+              <div className="settings-cards">
+                {orderedTools.map((t) => (
+                  <div
+                    key={t.id}
+                    className={`settings-card${dragToolId === t.id ? " dragging" : ""}${
+                      hiddenTools.has(t.id) ? " off" : ""
+                    }`}
+                    draggable
+                    onDragStart={(e) => {
+                      setDragToolId(t.id);
+                      e.dataTransfer.effectAllowed = "move";
+                    }}
+                    onDragEnd={() => setDragToolId(null)}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      if (dragToolId && dragToolId !== t.id) moveTool(dragToolId, t.id);
+                    }}
+                  >
+                    <span className="settings-grip" title="拖拽排序">⠿</span>
                     <span className="tool-icon">{t.icon}</span>
-                    {t.name}
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={!hiddenTools.has(t.id)}
-                    onChange={() => toggleToolVisible(t.id)}
-                  />
-                </label>
-              ))}
+                    <span className="settings-card-name">{t.name}</span>
+                    <input
+                      type="checkbox"
+                      checked={!hiddenTools.has(t.id)}
+                      onChange={() => toggleToolVisible(t.id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
             <div className="modal-actions">
+              <button className="btn btn-ghost settings-reset" onClick={resetSettings}>
+                重置
+              </button>
               <button className="btn btn-primary" onClick={() => setSettingsOpen(false)}>
                 完成
               </button>
