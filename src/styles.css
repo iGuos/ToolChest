@@ -115,6 +115,36 @@ select { cursor: pointer; }
 .tool-icon { font-size: 15px; width: 20px; text-align: center; }
 .tool-name { font-size: 13px; }
 
+.sidebar-footer {
+  border-top: 1px solid var(--border);
+  padding: 6px 0;
+}
+
+/* ── 设置弹框 ── */
+.settings-section {
+  margin: 14px 0 4px;
+}
+.settings-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-hi);
+  margin-bottom: 4px;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.settings-row:last-child { border-bottom: none; }
+.settings-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 /* ── Content ── */
 .content {
   flex: 1;

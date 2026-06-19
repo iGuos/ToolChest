@@ -29,7 +29,30 @@ const TOOLS: ToolMeta[] = [
 const tabName = (id: string) =>
   id === HOME_ID ? "首页" : TOOLS.find((t) => t.id === id)?.name ?? id;
 
-function Home({ onOpen }: { onOpen: (id: string) => void }) {
+// ── 应用设置（localStorage 持久化，结构预留以便后续扩展）──
+const SETTINGS_KEY = "baibao.settings.v1";
+interface Settings {
+  hiddenTools: string[]; // 在侧栏/首页隐藏的工具 id
+}
+const DEFAULT_SETTINGS: Settings = { hiddenTools: [] };
+
+function loadSettings(): Settings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    /* 损坏则回退默认 */
+  }
+  return DEFAULT_SETTINGS;
+}
+
+function Home({
+  onOpen,
+  tools,
+}: {
+  onOpen: (id: string) => void;
+  tools: ToolMeta[];
+}) {
   return (
     <div className="home">
       <div className="home-hero">
@@ -37,7 +60,7 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
         <div className="home-tagline">开发者工具箱 · 选择一个工具开始</div>
       </div>
       <div className="home-grid">
-        {TOOLS.map((t) => (
+        {tools.map((t) => (
           <button key={t.id} className="home-card" onClick={() => onOpen(t.id)}>
             <span className="home-card-icon">{t.icon}</span>
             <span className="home-card-name">{t.name}</span>
@@ -51,11 +74,12 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
 function renderTool(
   id: string,
   onOpen: (id: string) => void,
-  onDirty: (id: string, dirty: boolean) => void
+  onDirty: (id: string, dirty: boolean) => void,
+  homeTools: ToolMeta[]
 ) {
   switch (id) {
     case HOME_ID:
-      return <Home onOpen={onOpen} />;
+      return <Home onOpen={onOpen} tools={homeTools} />;
     case "port-scanner":
       return <PortScanner />;
     case "http-client":
@@ -92,6 +116,26 @@ export default function App() {
     active: boolean;
     pointerId: number;
   } | null>(null);
+  // 应用设置 + 设置弹框开关
+  const [settings, setSettings] = useState<Settings>(loadSettings);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch {
+      /* 忽略写入失败 */
+    }
+  }, [settings]);
+  const hiddenTools = new Set(settings.hiddenTools);
+  const visibleTools = TOOLS.filter((t) => !hiddenTools.has(t.id));
+  const toggleToolVisible = (id: string) =>
+    setSettings((s) => {
+      const hid = new Set(s.hiddenTools);
+      if (hid.has(id)) hid.delete(id);
+      else hid.add(id);
+      return { ...s, hiddenTools: [...hid] };
+    });
+
   // 哪些 tab 有未保存改动（用于 tab 上的变更指示灯）
   const [dirtyTabs, setDirtyTabs] = useState<Set<string>>(new Set());
   const markDirty = useCallback((id: string, dirty: boolean) => {
@@ -232,7 +276,7 @@ export default function App() {
             <span className="tool-icon">🏠</span>
             <span className="tool-name">首页</span>
           </button>
-          {TOOLS.map((tool) => (
+          {visibleTools.map((tool) => (
             <button
               key={tool.id}
               className={`tool-btn${activeTab === tool.id ? " active" : ""}`}
@@ -243,6 +287,12 @@ export default function App() {
             </button>
           ))}
         </nav>
+        <div className="sidebar-footer">
+          <button className="tool-btn" onClick={() => setSettingsOpen(true)}>
+            <span className="tool-icon">⚙️</span>
+            <span className="tool-name">设置</span>
+          </button>
+        </div>
       </aside>
 
       <main className="content">
@@ -354,11 +404,44 @@ export default function App() {
               key={id}
               className={`tool-pane${id === activeTab ? "" : " hidden"}`}
             >
-              {renderTool(id, openTool, markDirty)}
+              {renderTool(id, openTool, markDirty, visibleTools)}
             </div>
           ))}
         </div>
       </main>
+
+      {/* 设置弹框 */}
+      {settingsOpen && (
+        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>设置</h3>
+            <div className="settings-section">
+              <div className="settings-section-title">功能菜单</div>
+              <div className="dim" style={{ fontSize: 12, marginBottom: 6 }}>
+                选择在侧边栏和首页显示哪些工具
+              </div>
+              {TOOLS.map((t) => (
+                <label key={t.id} className="settings-row">
+                  <span className="settings-row-label">
+                    <span className="tool-icon">{t.icon}</span>
+                    {t.name}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={!hiddenTools.has(t.id)}
+                    onChange={() => toggleToolVisible(t.id)}
+                  />
+                </label>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-primary" onClick={() => setSettingsOpen(false)}>
+                完成
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
