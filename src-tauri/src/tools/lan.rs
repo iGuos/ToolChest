@@ -32,6 +32,11 @@ const ANNOUNCE_EVERY: Duration = Duration::from_secs(5);
 // TTL 取得比 announce 间隔大得多（≈4-5 个周期），容忍多播偶发丢包，避免设备在线/离线反复闪烁
 const PEER_TTL_MS: u128 = 22_000;
 
+// 共享密码防暴力破解：同一来源 IP 在 AUTH_WINDOW_MS 内累计 AUTH_MAX_FAILS 次失败 → 锁定 AUTH_LOCKOUT_MS。
+const AUTH_MAX_FAILS: u32 = 8;
+const AUTH_WINDOW_MS: u128 = 60_000; // 失败计数窗口：1 分钟
+const AUTH_LOCKOUT_MS: u128 = 300_000; // 锁定时长：5 分钟
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,6 +49,16 @@ fn rand_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     let _ = getrandom::getrandom(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 随机密码：大小写字母+数字（去掉易混的 0/O/1/l/I），区分大小写。
+fn rand_password(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut buf = vec![0u8; len];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
 fn ext_mime(name: &str) -> String {
@@ -89,6 +104,9 @@ struct DeviceInfo {
     /// 百宝箱标记；LocalSend 会忽略未知字段
     #[serde(default)]
     app: Option<String>,
+    /// 对外共享目录数量（>0 表示该设备有共享，供对端展示标签）
+    #[serde(default)]
+    shares: Option<u32>,
 }
 
 #[derive(Clone, Serialize)]
@@ -102,6 +120,7 @@ pub struct Peer {
     device_type: Option<String>,
     is_baibao: bool,
     last_seen_ms: u128,
+    shares: u32, // 对方对外共享的目录数量（0=无）
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -173,6 +192,26 @@ struct Session {
     files: HashMap<String, FileSlot>,
 }
 
+/// 一个对外共享的本地目录。password 为明文（None=无密码）；需要展示给用户以便告知对端，
+/// 鉴权时按需 sha256 比对（局域网共享场景，明文存储于本机配置可接受）。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareCfg {
+    id: String,
+    name: String,
+    path: String,
+    #[serde(default, alias = "passwordHash")]
+    password: Option<String>,
+}
+
+/// 某来源 IP 的共享密码失败记录（防暴力破解）。
+#[derive(Default, Clone)]
+struct AuthFail {
+    count: u32,
+    window_start_ms: u128,
+    locked_until_ms: u128,
+}
+
 struct Inner {
     started: bool,
     alias: String,
@@ -180,6 +219,8 @@ struct Inner {
     download_dir: PathBuf,
     compat: bool,
     invisible: bool, // 隐身：不对外广播/应答，其他设备看到本机为离线
+    shares: Vec<ShareCfg>, // 对外共享的目录列表
+    auth_fails: HashMap<String, AuthFail>, // 共享密码失败记录（按来源 IP），用于防暴力破解
     peers: HashMap<String, Peer>,
     decisions: HashMap<String, Sender<Decision>>,
     sessions: HashMap<String, Session>, // sessionId -> 会话
@@ -188,9 +229,17 @@ struct Inner {
     socket: Option<Arc<UdpSocket>>,
 }
 
+/// 用户主目录（跨平台：类 Unix 用 HOME，Windows 用 USERPROFILE）。
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
 impl Default for Inner {
     fn default() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let home = home_dir();
         // 从配置文件读回别名/指纹/兼容/接收目录，保证重启后稳定
         let cfg = load_config();
         let alias = cfg.alias.filter(|s| !s.is_empty()).unwrap_or_else(default_alias);
@@ -204,23 +253,27 @@ impl Default for Inner {
             .download_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join("Downloads"));
-        // 落盘一次，确保（尤其是随机指纹）下次启动可复用
-        write_config(&alias, &fingerprint, compat, invisible, &download_dir);
-        Inner {
+            .unwrap_or_else(|| home.join("Downloads"));
+        let shares = cfg.shares.unwrap_or_default();
+        let inner = Inner {
             started: false,
             alias,
             fingerprint,
             download_dir,
             compat,
             invisible,
+            shares,
+            auth_fails: HashMap::new(),
             peers: HashMap::new(),
             decisions: HashMap::new(),
             sessions: HashMap::new(),
             cancelled: HashSet::new(),
             cancelled_sends: HashSet::new(),
             socket: None,
-        }
+        };
+        // 落盘一次，确保（尤其是随机指纹）下次启动可复用
+        persist(&inner);
+        inner
     }
 }
 
@@ -233,14 +286,27 @@ struct LanConfig {
     compat: Option<bool>,
     invisible: Option<bool>,
     download_dir: Option<String>,
+    #[serde(default)]
+    shares: Option<Vec<ShareCfg>>,
 }
 
 fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join("Library/Application Support/com.baibao.toolbox/lan.json"),
-    )
+    // 跨平台配置位置：macOS 用 Application Support，Windows 用 %APPDATA%，其余用 ~/.config
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home).join("Library/Application Support/com.baibao.toolbox/lan.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("APPDATA").ok()?;
+        Some(PathBuf::from(base).join("com.baibao.toolbox").join("lan.json"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home).join(".config/com.baibao.toolbox/lan.json"))
+    }
 }
 
 fn load_config() -> LanConfig {
@@ -250,26 +316,26 @@ fn load_config() -> LanConfig {
         .unwrap_or_default()
 }
 
-fn write_config(alias: &str, fingerprint: &str, compat: bool, invisible: bool, dir: &std::path::Path) {
+fn save_config(cfg: &LanConfig) {
     if let Some(p) = config_path() {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let cfg = LanConfig {
-            alias: Some(alias.to_string()),
-            fingerprint: Some(fingerprint.to_string()),
-            compat: Some(compat),
-            invisible: Some(invisible),
-            download_dir: Some(dir.to_string_lossy().to_string()),
-        };
-        if let Ok(s) = serde_json::to_vec_pretty(&cfg) {
+        if let Ok(s) = serde_json::to_vec_pretty(cfg) {
             let _ = std::fs::write(p, s);
         }
     }
 }
 
 fn persist(g: &Inner) {
-    write_config(&g.alias, &g.fingerprint, g.compat, g.invisible, &g.download_dir);
+    save_config(&LanConfig {
+        alias: Some(g.alias.clone()),
+        fingerprint: Some(g.fingerprint.clone()),
+        compat: Some(g.compat),
+        invisible: Some(g.invisible),
+        download_dir: Some(g.download_dir.to_string_lossy().to_string()),
+        shares: Some(g.shares.clone()),
+    });
 }
 
 #[derive(Clone, Default)]
@@ -320,6 +386,7 @@ impl LanState {
             download: Some(false),
             announce,
             app: Some("baibao".into()),
+            shares: Some(g.shares.len() as u32),
         }
     }
 
@@ -378,8 +445,48 @@ fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String)
             device_type: info.device_type.clone(),
             is_baibao: info.app.as_deref() == Some("baibao"),
             last_seen_ms: now_ms(),
+            shares: info.shares.unwrap_or(0),
         };
         g.peers.insert(info.fingerprint.clone(), peer);
+    }
+    emit_peers(app, state);
+}
+
+/// 仅凭 alias + fingerprint + 来源 IP 登记一个百宝箱设备（用于收到消息时自动认识发送方）。
+/// 已存在的设备只刷新别名/IP/活跃时间，保留其 shares 等已知信息，不被消息覆盖清零。
+fn upsert_peer_minimal(app: &AppHandle, state: &LanState, alias: &str, fingerprint: &str, ip: String) {
+    if fingerprint.is_empty() {
+        return;
+    }
+    {
+        let mut g = state.0.lock().unwrap();
+        if fingerprint == g.fingerprint {
+            return; // 自己
+        }
+        let now = now_ms();
+        match g.peers.get_mut(fingerprint) {
+            Some(p) => {
+                p.alias = alias.to_string();
+                p.ip = ip;
+                p.last_seen_ms = now;
+            }
+            None => {
+                g.peers.insert(
+                    fingerprint.to_string(),
+                    Peer {
+                        alias: alias.to_string(),
+                        fingerprint: fingerprint.to_string(),
+                        ip,
+                        port: PORT,
+                        protocol: "http".into(),
+                        device_type: None,
+                        is_baibao: true,
+                        last_seen_ms: now,
+                        shares: 0,
+                    },
+                );
+            }
+        }
     }
     emit_peers(app, state);
 }
@@ -635,12 +742,17 @@ pub fn lan_overlay_routes() -> Vec<OverlayRoute> {
 }
 
 /// 加入多播组。VPN 切换后新出现的接口会在 announcer 周期里被重新加入，实现「开关 VPN 自愈」。
+/// 只按每张真实网卡的具体 IP 加入（en0/eth0 等 LAN 网卡靠这个收多播，最可靠）。
+/// 不再混用 INADDR_ANY——单 socket 上 INADDR_ANY 会与具体网卡成员资格相互抢占，
+/// 反而让真实 LAN 收不到多播；VPN/utun/组网这类多播到不了的，用「+ IP」手动添加兜底。
 fn join_all_ifaces(udp: &UdpSocket) {
-    // 始终在「默认接口」(INADDR_ANY) 加入一次：这是 VPN/点对点接口(utun)能收到多播的关键——
-    // 这类接口按具体 IP 加入往往不生效，只有默认成员资格能收到经隧道到达的多播。
-    let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
-    // 再按每张网卡各加入一次：覆盖「多网卡/VPN 共存时默认接口选错」导致真实 LAN 收不到的情况。
-    for ip in local_ipv4_ifaces() {
+    let ifaces = local_ipv4_ifaces();
+    if ifaces.is_empty() {
+        // 枚举不到任何网卡时才退回默认接口
+        let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
+        return;
+    }
+    for ip in ifaces {
         let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &ip);
     }
 }
@@ -650,12 +762,14 @@ fn join_all_ifaces(udp: &UdpSocket) {
 /// （单播走路由表，不受此选项影响）。
 fn announce_to_all(udp: &UdpSocket, buf: &[u8]) {
     let dst = SocketAddr::from((MULTICAST_ADDR, PORT));
+    let ifaces = local_ipv4_ifaces();
+    if ifaces.is_empty() {
+        let _ = udp.send_to(buf, dst);
+        return;
+    }
+    // 按每张网卡各发一次：确保真实 LAN 网卡也发得出去（而不止默认/VPN 网卡）。
     let sref = socket2::SockRef::from(udp);
-    // 默认接口发一次：显式指定点对点接口(utun)的 IP 作为出口可能发不出去，默认出口才行。
-    let _ = sref.set_multicast_if_v4(&Ipv4Addr::UNSPECIFIED);
-    let _ = udp.send_to(buf, dst);
-    // 再按每张网卡各发一次：确保真实 LAN 网卡也发得出去（而不止默认/VPN 网卡）。
-    for ip in local_ipv4_ifaces() {
+    for ip in ifaces {
         let _ = sref.set_multicast_if_v4(&ip);
         let _ = udp.send_to(buf, dst);
     }
@@ -745,6 +859,12 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
 
+    // WebDAV：把共享目录映射成系统磁盘（macOS 访达 / Windows 盘符）走这里，路径前缀 /webdav
+    if path == "/webdav" || path.starts_with("/webdav/") {
+        handle_webdav(&state, request, &method, &path);
+        return;
+    }
+
     let result: Result<(), ()> = match (method.as_str(), path.as_str()) {
         ("GET", "/api/localsend/v2/info") => {
             let info = state.device_info(None);
@@ -763,6 +883,9 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
         }
         ("POST", "/api/baibao/v1/message") => {
             if let Ok(msg) = read_json::<MessagePayload>(&mut request) {
+                // 用连接来源 IP 自动登记发送方：组网/VPN 等多播发现不到的场景，
+                // 只要一方「+ IP」发起，收到消息的一方即自动认识对方，从而能回复。
+                upsert_peer_minimal(&app, &state, &msg.alias, &msg.fingerprint, remote_ip.clone());
                 let _ = app.emit(
                     "lan://message",
                     serde_json::json!({
@@ -807,6 +930,19 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             handle_partial(&state, request, &query);
             Ok(())
         }
+        // 共享磁盘：列共享根 / 列目录 / 下载文件（详见下方处理函数）
+        ("GET", "/api/baibao/v1/shares") => {
+            handle_share_roots(&state, request);
+            Ok(())
+        }
+        ("GET", "/api/baibao/v1/share/list") => {
+            handle_share_list(&state, request, &query);
+            Ok(())
+        }
+        ("GET", "/api/baibao/v1/share/download") => {
+            handle_share_download(&state, request, &query);
+            Ok(())
+        }
         ("POST", "/api/localsend/v2/cancel") => {
             respond_text(request, 200, "ok");
             Ok(())
@@ -819,7 +955,470 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
     let _ = result;
 }
 
+// ── 共享磁盘：对外提供只读的目录浏览 / 文件下载 ───────────────
+
+fn sha256_hex(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn header_value(req: &tiny_http::Request, name: &str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.to_string().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// 把相对路径安全地拼到共享根下：拒绝 `..`/绝对前缀，并用 canonicalize 确认没逃出根目录。
+fn resolve_share_path(root: &str, rel: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(root);
+    let mut p = root.clone();
+    for comp in std::path::Path::new(rel).components() {
+        match comp {
+            std::path::Component::Normal(c) => p.push(c),
+            std::path::Component::CurDir => {}
+            _ => return None, // .. / 根 / 盘符前缀 一律拒绝，防穿越
+        }
+    }
+    let canon = p.canonicalize().ok()?;
+    let root_canon = root.canonicalize().ok()?;
+    canon.starts_with(&root_canon).then_some(canon)
+}
+
+enum ShareAuth {
+    Open(String),   // 无密码，直接放行
+    Ok(String),     // 有密码且正确
+    Denied,         // 有密码但缺失/错误
+    NotFound,
+}
+
+/// 校验某共享：无密码 → Open；有密码且 X-Share-Auth == sha256(密码) → Ok；否则 Denied。
+fn authorize_share(g: &Inner, id: &str, auth: Option<&str>) -> ShareAuth {
+    let Some(share) = g.shares.iter().find(|s| s.id == id) else {
+        return ShareAuth::NotFound;
+    };
+    match &share.password {
+        None => ShareAuth::Open(share.path.clone()),
+        Some(pw) => {
+            let expected = sha256_hex(pw);
+            if auth.map(|a| a.eq_ignore_ascii_case(&expected)).unwrap_or(false) {
+                ShareAuth::Ok(share.path.clone())
+            } else {
+                ShareAuth::Denied
+            }
+        }
+    }
+}
+
+/// 该来源 IP 当前是否处于锁定期。
+fn auth_is_locked(g: &Inner, ip: &str) -> bool {
+    g.auth_fails.get(ip).map(|f| f.locked_until_ms > now_ms()).unwrap_or(false)
+}
+
+/// 记一次失败：滑动窗口内累计；达到上限则进入锁定期。
+fn auth_record_fail(g: &mut Inner, ip: &str) {
+    let now = now_ms();
+    let f = g.auth_fails.entry(ip.to_string()).or_default();
+    if now.saturating_sub(f.window_start_ms) > AUTH_WINDOW_MS {
+        f.window_start_ms = now;
+        f.count = 0;
+    }
+    f.count += 1;
+    if f.count >= AUTH_MAX_FAILS {
+        f.locked_until_ms = now + AUTH_LOCKOUT_MS;
+        f.count = 0;
+        f.window_start_ms = now;
+    }
+}
+
+/// 认证成功：清除该 IP 的失败记录。
+fn auth_record_success(g: &mut Inner, ip: &str) {
+    g.auth_fails.remove(ip);
+}
+
+/// 带限流的鉴权：无密码共享不限流；密码保护的共享先查锁定期，再按对错计数。
+/// 成功返回根路径；失败返回应答用的 HTTP 状态码（404 / 401 / 429）。
+fn authorize_with_throttle(g: &mut Inner, id: &str, auth: Option<&str>, ip: &str) -> Result<String, u16> {
+    match authorize_share(g, id, auth) {
+        ShareAuth::Open(p) => Ok(p),
+        ShareAuth::NotFound => Err(404),
+        ShareAuth::Ok(p) => {
+            if auth_is_locked(g, ip) {
+                return Err(429); // 锁定期内即便密码正确也拒绝
+            }
+            auth_record_success(g, ip);
+            Ok(p)
+        }
+        ShareAuth::Denied => {
+            if auth_is_locked(g, ip) {
+                return Err(429);
+            }
+            auth_record_fail(g, ip);
+            if auth_is_locked(g, ip) {
+                Err(429)
+            } else {
+                Err(401)
+            }
+        }
+    }
+}
+
+/// GET /api/baibao/v1/shares —— 列出共享根（仅元数据：id/名称/是否加锁，无需认证）。
+fn handle_share_roots(state: &LanState, request: tiny_http::Request) {
+    let list: Vec<serde_json::Value> = state
+        .0
+        .lock()
+        .unwrap()
+        .shares
+        .iter()
+        .map(|s| {
+            serde_json::json!({ "id": s.id, "name": s.name, "locked": s.password.is_some() })
+        })
+        .collect();
+    respond_json(request, 200, &serde_json::Value::Array(list));
+}
+
+/// GET /api/baibao/v1/share/list?id=&path= —— 列目录（加锁的需 X-Share-Auth）。
+fn handle_share_list(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let Some(id) = q.get("id") else {
+        return respond_text(request, 400, "missing id");
+    };
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let root = {
+        let mut g = state.0.lock().unwrap();
+        match authorize_with_throttle(&mut g, id, auth.as_deref(), &ip) {
+            Ok(r) => r,
+            Err(401) => return respond_text(request, 401, "auth required"),
+            Err(429) => return respond_text(request, 429, "尝试过多，请稍后再试"),
+            Err(_) => return respond_text(request, 404, "not found"),
+        }
+    };
+    let Some(dir) = resolve_share_path(&root, &rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return respond_text(request, 404, "not a directory");
+    };
+    // (是否目录, 名称, 大小, 修改时间ms)
+    let mut rows: Vec<(bool, String, u64, u128)> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // 跳过隐藏文件
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        rows.push((meta.is_dir(), name, meta.len(), mtime));
+    }
+    // 目录在前，再按名称（不区分大小写）排序
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+    let entries: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(dir, name, size, mtime)| {
+            serde_json::json!({ "name": name, "dir": dir, "size": size, "mtime": mtime })
+        })
+        .collect();
+    respond_json(request, 200, &serde_json::json!({ "entries": entries }));
+}
+
+/// GET /api/baibao/v1/share/download?id=&path= —— 下载单个文件（加锁的需 X-Share-Auth）。
+fn handle_share_download(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let Some(id) = q.get("id") else {
+        return respond_text(request, 400, "missing id");
+    };
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let root = {
+        let mut g = state.0.lock().unwrap();
+        match authorize_with_throttle(&mut g, id, auth.as_deref(), &ip) {
+            Ok(r) => r,
+            Err(401) => return respond_text(request, 401, "auth required"),
+            Err(429) => return respond_text(request, 429, "尝试过多，请稍后再试"),
+            Err(_) => return respond_text(request, 404, "not found"),
+        }
+    };
+    let Some(file) = resolve_share_path(&root, &rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    if !file.is_file() {
+        return respond_text(request, 404, "not a file");
+    }
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    match File::open(&file) {
+        Ok(f) => {
+            let ctype = tiny_http::Header::from_bytes(&b"Content-Type"[..], ext_mime(&name).as_bytes())
+                .ok();
+            let disp = tiny_http::Header::from_bytes(
+                &b"Content-Disposition"[..],
+                format!("attachment; filename=\"{name}\"").as_bytes(),
+            )
+            .ok();
+            let mut resp = tiny_http::Response::from_file(f);
+            if let Some(h) = ctype {
+                resp.add_header(h);
+            }
+            if let Some(h) = disp {
+                resp.add_header(h);
+            }
+            let _ = request.respond(resp);
+        }
+        Err(_) => respond_text(request, 500, "open failed"),
+    }
+}
+
+// ── 共享磁盘：只读 WebDAV（供系统挂载成盘符/访达卷）──────────────
+// 复用上面的共享配置/鉴权/路径防护；只实现挂载只读卷所需的 OPTIONS/PROPFIND/GET/HEAD。
+
+fn dav_hdr(name: &str, value: &str) -> Option<tiny_http::Header> {
+    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).ok()
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hexv = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hexv(b[i + 1]), hexv(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 百分号编码路径（保留 `/` 与 unreserved 字符），用于 PROPFIND 的 href。
+fn url_encode_path(s: &str) -> String {
+    let mut out = String::new();
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// 校验 HTTP Basic 认证：取出密码部分，与共享的明文密码比对。
+fn check_basic_auth(req: &tiny_http::Request, expected: &str) -> bool {
+    use base64::Engine as _;
+    let Some(h) = header_value(req, "Authorization") else {
+        return false;
+    };
+    let Some(b64) = h.strip_prefix("Basic ").or_else(|| h.strip_prefix("basic ")) else {
+        return false;
+    };
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+        return false;
+    };
+    let s = String::from_utf8_lossy(&raw);
+    let pass = s.splitn(2, ':').nth(1).unwrap_or("");
+    pass == expected
+}
+
+fn dav_entry(href: &str, name: &str, meta: &std::fs::Metadata) -> String {
+    let modified = meta.modified().map(httpdate::fmt_http_date).unwrap_or_default();
+    let mut s = String::from("<D:response>");
+    s.push_str(&format!("<D:href>{}</D:href>", xml_escape(href)));
+    s.push_str("<D:propstat><D:prop>");
+    s.push_str(&format!("<D:displayname>{}</D:displayname>", xml_escape(name)));
+    if meta.is_dir() {
+        s.push_str("<D:resourcetype><D:collection/></D:resourcetype>");
+    } else {
+        s.push_str("<D:resourcetype/>");
+        s.push_str(&format!("<D:getcontentlength>{}</D:getcontentlength>", meta.len()));
+    }
+    if !modified.is_empty() {
+        s.push_str(&format!("<D:getlastmodified>{modified}</D:getlastmodified>"));
+    }
+    s.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>");
+    s
+}
+
+fn webdav_propfind(request: tiny_http::Request, fspath: &std::path::Path, req_path: &str, root_name: &str) {
+    let depth = header_value(&request, "Depth").unwrap_or_else(|| "1".into());
+    let Ok(meta) = std::fs::metadata(fspath) else {
+        return respond_text(request, 404, "not found");
+    };
+    let self_name = fspath
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root_name.to_string());
+    let mut body = String::from(r#"<?xml version="1.0" encoding="utf-8"?>"#);
+    body.push_str(r#"<D:multistatus xmlns:D="DAV:">"#);
+    body.push_str(&dav_entry(req_path, &self_name, &meta));
+    if meta.is_dir() && depth != "0" {
+        let base = if req_path.ends_with('/') {
+            req_path.to_string()
+        } else {
+            format!("{req_path}/")
+        };
+        if let Ok(rd) = std::fs::read_dir(fspath) {
+            for e in rd.flatten() {
+                let Ok(cm) = e.metadata() else { continue };
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let mut href = format!("{base}{}", url_encode_path(&name));
+                if cm.is_dir() {
+                    href.push('/');
+                }
+                body.push_str(&dav_entry(&href, &name, &cm));
+            }
+        }
+    }
+    body.push_str("</D:multistatus>");
+    let mut resp = tiny_http::Response::from_string(body).with_status_code(207);
+    if let Some(h) = dav_hdr("Content-Type", "application/xml; charset=utf-8") {
+        resp.add_header(h);
+    }
+    let _ = request.respond(resp);
+}
+
+fn webdav_get(request: tiny_http::Request, fspath: &std::path::Path, head: bool) {
+    if !fspath.is_file() {
+        return respond_text(request, 405, "not a file");
+    }
+    let name = fspath.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let ctype = ext_mime(name);
+    if head {
+        let len = std::fs::metadata(fspath).map(|m| m.len()).unwrap_or(0);
+        let mut resp = tiny_http::Response::empty(200);
+        if let Some(h) = dav_hdr("Content-Type", &ctype) {
+            resp.add_header(h);
+        }
+        if let Some(h) = dav_hdr("Content-Length", &len.to_string()) {
+            resp.add_header(h);
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+    match File::open(fspath) {
+        Ok(f) => {
+            let mut resp = tiny_http::Response::from_file(f);
+            if let Some(h) = dav_hdr("Content-Type", &ctype) {
+                resp.add_header(h);
+            }
+            let _ = request.respond(resp);
+        }
+        Err(_) => respond_text(request, 500, "open failed"),
+    }
+}
+
+fn handle_webdav(state: &LanState, request: tiny_http::Request, method: &str, path: &str) {
+    // OPTIONS：宣告 DAV 能力，挂载客户端据此识别这是 WebDAV
+    if method == "OPTIONS" {
+        let mut resp = tiny_http::Response::empty(200);
+        for (k, v) in [
+            ("DAV", "1,2"),
+            ("Allow", "OPTIONS, GET, HEAD, PROPFIND"),
+            ("MS-Author-Via", "DAV"),
+            ("Content-Length", "0"),
+        ] {
+            if let Some(h) = dav_hdr(k, v) {
+                resp.add_header(h);
+            }
+        }
+        let _ = request.respond(resp);
+        return;
+    }
+
+    let rest = path.strip_prefix("/webdav").unwrap_or("").trim_start_matches('/');
+    let segs: Vec<String> = rest.split('/').filter(|s| !s.is_empty()).map(url_decode).collect();
+    let Some(share_id) = segs.first().cloned() else {
+        return respond_text(request, 404, "no share");
+    };
+    let rel = segs[1..].join("/");
+    let (root, password, share_name) = {
+        let g = state.0.lock().unwrap();
+        match g.shares.iter().find(|s| s.id == share_id) {
+            Some(s) => (s.path.clone(), s.password.clone(), s.name.clone()),
+            None => return respond_text(request, 404, "no share"),
+        }
+    };
+    if let Some(pw) = &password {
+        let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+        let ok = check_basic_auth(&request, pw);
+        // 同一套防暴力破解限流（按来源 IP）
+        let deny: Option<u16> = {
+            let mut g = state.0.lock().unwrap();
+            if auth_is_locked(&g, &ip) {
+                Some(429)
+            } else if ok {
+                auth_record_success(&mut g, &ip);
+                None
+            } else {
+                auth_record_fail(&mut g, &ip);
+                Some(if auth_is_locked(&g, &ip) { 429 } else { 401 })
+            }
+        };
+        if let Some(code) = deny {
+            let resp = if code == 429 {
+                tiny_http::Response::from_string("尝试过多，请稍后再试").with_status_code(429)
+            } else {
+                let realm = share_name.replace('"', "");
+                let mut r = tiny_http::Response::from_string("Unauthorized").with_status_code(401);
+                if let Some(h) = dav_hdr("WWW-Authenticate", &format!("Basic realm=\"{realm}\"")) {
+                    r.add_header(h);
+                }
+                r
+            };
+            let _ = request.respond(resp);
+            return;
+        }
+    }
+    let Some(fspath) = resolve_share_path(&root, &rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    match method {
+        "PROPFIND" => webdav_propfind(request, &fspath, path, &share_name),
+        "GET" | "HEAD" => webdav_get(request, &fspath, method == "HEAD"),
+        _ => respond_text(request, 405, "method not allowed"),
+    }
+}
+
 fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Request) {
+    let remote_ip = request
+        .remote_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
     let req: PrepareUploadRequest = match read_json(&mut request) {
         Ok(v) => v,
         Err(_) => return respond_text(request, 400, "bad request"),
@@ -830,6 +1429,8 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
     if !is_baibao && !state.0.lock().unwrap().compat {
         return respond_text(request, 403, "rejected: 未开启 LocalSend 兼容");
     }
+    // 用连接来源 IP 自动登记发送方（含其完整设备信息），实现单边「+ IP」即可双向。
+    upsert_peer(app, state, &req.info, remote_ip);
 
     let session_id = rand_hex(12);
     let (tx, rx) = mpsc::channel::<Decision>();
@@ -1200,6 +1801,252 @@ pub fn lan_set_dir(state: State<'_, LanState>, dir: String) {
         g.download_dir = PathBuf::from(dir);
         persist(&g);
     }
+}
+
+// ── 命令：共享磁盘（主机端：管理「我」共享出去的目录）─────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareView {
+    id: String,
+    name: String,
+    path: String,
+    locked: bool,
+    password: Option<String>, // 明文，供主机端展示/复制告知对端
+}
+
+fn share_views(g: &Inner) -> Vec<ShareView> {
+    g.shares
+        .iter()
+        .map(|s| ShareView {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            path: s.path.clone(),
+            locked: s.password.is_some(),
+            password: s.password.clone(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn lan_list_shares(state: State<'_, LanState>) -> Vec<ShareView> {
+    share_views(&state.0.lock().unwrap())
+}
+
+#[tauri::command]
+pub fn lan_add_share(
+    state: State<'_, LanState>,
+    path: String,
+    name: Option<String>,
+    password: Option<String>,
+) -> Result<Vec<ShareView>, String> {
+    let p = PathBuf::from(&path);
+    if !p.is_dir() {
+        return Err("不是有效目录".into());
+    }
+    let nm = name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "共享".into())
+        });
+    let mut g = state.0.lock().unwrap();
+    if g.shares.iter().any(|s| s.path == path) {
+        return Err("该目录已在共享列表".into());
+    }
+    // 默认生成 21 位随机密码（大小写字母+数字，区分大小写）；显式传了密码则用传入的。
+    let pw = password
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| rand_password(21));
+    g.shares.push(ShareCfg {
+        id: rand_hex(8),
+        name: nm,
+        path,
+        password: Some(pw),
+    });
+    persist(&g);
+    Ok(share_views(&g))
+}
+
+#[tauri::command]
+pub fn lan_remove_share(state: State<'_, LanState>, id: String) -> Vec<ShareView> {
+    let mut g = state.0.lock().unwrap();
+    g.shares.retain(|s| s.id != id);
+    persist(&g);
+    share_views(&g)
+}
+
+/// 设置/清除某共享的密码（password 为空或 None = 取消密码）。
+#[tauri::command]
+pub fn lan_set_share_password(
+    state: State<'_, LanState>,
+    id: String,
+    password: Option<String>,
+) -> Vec<ShareView> {
+    let mut g = state.0.lock().unwrap();
+    if let Some(s) = g.shares.iter_mut().find(|s| s.id == id) {
+        s.password = password.filter(|p| !p.is_empty());
+    }
+    persist(&g);
+    share_views(&g)
+}
+
+// ── 命令：共享磁盘（客户端：浏览「对方」共享的目录，走 HTTP 经隧道也可达）──
+
+/// 与对端共享相关的 HTTP 客户端：固定较短超时，避免界面卡住。
+fn share_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// 列出对端的共享根。
+#[tauri::command]
+pub async fn lan_share_roots(
+    state: State<'_, LanState>,
+    fingerprint: String,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = share_client()?;
+        let resp = client
+            .get(format!("{base}/api/baibao/v1/shares"))
+            .send()
+            .map_err(|e| format!("连接失败：{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("对方返回 {}", resp.status()));
+        }
+        resp.json::<serde_json::Value>().map_err(|e| format!("解析失败：{e}"))
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 列出对端某共享下某目录。auth = sha256(密码) 的十六进制；401 时返回 Err("auth") 让前端弹密码框。
+#[tauri::command]
+pub async fn lan_share_list(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    id: String,
+    path: String,
+    auth: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = share_client()?;
+        let mut req = client
+            .get(format!("{base}/api/baibao/v1/share/list"))
+            .query(&[("id", id.as_str()), ("path", path.as_str())]);
+        if let Some(a) = auth {
+            req = req.header("X-Share-Auth", a);
+        }
+        let resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
+        match resp.status().as_u16() {
+            200 => resp.json::<serde_json::Value>().map_err(|e| format!("解析失败：{e}")),
+            401 => Err("auth".into()),
+            429 => Err("密码错误次数过多，请稍后再试".into()),
+            c => Err(format!("对方返回 {c}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 下载对端某共享里的一个文件到本机接收目录，返回保存路径。401 时返回 Err("auth")。
+#[tauri::command]
+pub async fn lan_share_download(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    id: String,
+    path: String,
+    auth: Option<String>,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let dir = state.0.lock().unwrap().download_dir.clone();
+    let file_name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("file")
+        .to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = share_client()?;
+        let mut req = client
+            .get(format!("{base}/api/baibao/v1/share/download"))
+            .query(&[("id", id.as_str()), ("path", path.as_str())]);
+        if let Some(a) = auth {
+            req = req.header("X-Share-Auth", a);
+        }
+        let mut resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
+        match resp.status().as_u16() {
+            200 => {}
+            401 => return Err("auth".into()),
+            429 => return Err("密码错误次数过多，请稍后再试".into()),
+            c => return Err(format!("对方返回 {c}")),
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = unique_path(&dir, &file_name);
+        let mut f = File::create(&dest).map_err(|e| format!("无法写入：{e}"))?;
+        resp.copy_to(&mut f).map_err(|e| format!("下载中断：{e}"))?;
+        Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 把对端某共享映射成系统磁盘：macOS 走访达(osascript mount volume)，Windows 走 `net use` 盘符。
+/// 加锁的共享由系统在挂载时弹出账号密码框并存入钥匙串/凭据(即「保存签名」)。
+#[tauri::command]
+pub async fn lan_mount_share(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    share_id: String,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let url = format!("{base}/webdav/{share_id}/");
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        {
+            // 访达挂载：加锁时弹凭据框，挂载后出现在访达「位置」里
+            let script = format!("mount volume \"{url}\"");
+            let out = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .output()
+                .map_err(|e| format!("挂载失败：{e}"))?;
+            if out.status.success() {
+                Ok("已在访达中挂载该共享".to_string())
+            } else {
+                Err(format!("挂载失败：{}", String::from_utf8_lossy(&out.stderr).trim()))
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // 映射一个空闲盘符；加锁时系统会提示输入账号密码
+            let out = std::process::Command::new("net")
+                .args(["use", "*", &url, "/persistent:no"])
+                .output()
+                .map_err(|e| format!("映射失败：{e}"))?;
+            if out.status.success() {
+                Ok("已在资源管理器中映射为磁盘盘符".to_string())
+            } else {
+                Err(format!("映射失败：{}", String::from_utf8_lossy(&out.stderr).trim()))
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = url;
+            Err("当前系统不支持磁盘映射".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
 }
 
 /// 接收方对一次文件请求作出决定。

@@ -37,6 +37,7 @@ export interface Peer {
   online?: boolean; // 合并历史已知设备后：当前是否在线（用于展示离线设备的历史记录）
   remark?: string; // 备注名（仅 UI 派生，按 fingerprint 单独持久化）
   pinned?: boolean; // 是否置顶（仅 UI 派生）
+  shares?: number; // 对方对外共享的目录数量（>0 显示「共享」标签）
 }
 export interface FileMeta {
   id: string;

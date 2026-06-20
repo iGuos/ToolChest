@@ -246,7 +246,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "baibao"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "getrandom 0.2.17",
+ "httpdate",
  "if-addrs",
  "reqwest 0.12.28",
  "serde",

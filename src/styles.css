@@ -325,6 +325,143 @@ select { cursor: pointer; }
 .lan-netiface-tag.overlay {
   background: var(--accent, #1f6feb);
 }
+/* ===== 共享磁盘 ===== */
+/* 设备列表「共享」小标签 */
+.lan-share-tag {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: #fff;
+  background: #2ca06a;
+  vertical-align: middle;
+}
+.lan-peer.active .lan-share-tag {
+  background: rgba(255, 255, 255, 0.28);
+}
+/* 设置面板内：我的共享目录管理 */
+.lan-shares {
+  padding: 10px 2px 4px;
+  border-top: 1px solid var(--border);
+}
+.lan-share-mgr {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.lan-share-mgr-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--bg-elev, rgba(127, 127, 127, 0.08));
+  font-size: 12px;
+}
+.lan-share-mgr-name {
+  flex-shrink: 0;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.lan-share-mgr-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.lan-share-mgr-pw {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--gold, #e8b339);
+}
+/* 网上邻居式共享浏览器 */
+.share-modal {
+  width: min(560px, 92%);
+}
+.share-crumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+.share-crumb button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+.share-crumb span {
+  color: var(--text-dim);
+}
+.share-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+}
+.share-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 7px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.share-item.isdir {
+  cursor: pointer;
+}
+.share-item.isdir:hover {
+  background: var(--bg2);
+}
+.share-ic {
+  flex-shrink: 0;
+  font-size: 16px;
+}
+.share-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.share-size {
+  flex-shrink: 0;
+  font-size: 11px;
+}
+.share-lock {
+  font-size: 11px;
+}
+.share-pw {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 /* 补充展示：经隧道可达的组网/覆盖网地址 */
 .lan-overlay {
   margin-top: 12px;

@@ -5,6 +5,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useLan, type Peer, type FileMsg, type ChatItem } from "./lanContext";
 import { useEscToClose, useDragReorder } from "../hooks";
+import ShareBrowser from "./ShareBrowser";
 
 interface NetIface {
   name: string;
@@ -318,6 +319,53 @@ export default function LanShare() {
       window.removeEventListener("keydown", onKey);
     };
   }, [peerMenu]);
+
+  // 查看对方共享文件的浏览器弹框
+  const [shareView, setShareView] = useState<{ fp: string; name: string } | null>(null);
+
+  // 我自己的共享目录（设置面板内管理）
+  interface ShareView { id: string; name: string; path: string; locked: boolean; password?: string | null }
+  const [myShares, setMyShares] = useState<ShareView[]>([]);
+  useEffect(() => {
+    if (!setOpen) return;
+    invoke<ShareView[]>("lan_list_shares").then(setMyShares).catch(() => setMyShares([]));
+  }, [setOpen]);
+  const addShare = async () => {
+    try {
+      const dir = await invoke<string | null>("lan_pick_dir");
+      if (!dir) return;
+      setMyShares(await invoke<ShareView[]>("lan_add_share", { path: dir, name: null, password: null }));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const removeShare = async (id: string) => {
+    try {
+      setMyShares(await invoke<ShareView[]>("lan_remove_share", { id }));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const setSharePassword = async (id: string, password: string | null) => {
+    try {
+      setMyShares(await invoke<ShareView[]>("lan_set_share_password", { id, password }));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  // 共享密码编辑弹框（替代不可用的 window.prompt）
+  const [pwEdit, setPwEdit] = useState<{ id: string; name: string; value: string } | null>(null);
+  useEscToClose(!!pwEdit, () => setPwEdit(null));
+  const genPassword = () => {
+    // 21 位、大小写字母+数字（去掉易混字符），区分大小写
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    return Array.from(crypto.getRandomValues(new Uint8Array(21)), (b) => alphabet[b % alphabet.length]).join("");
+  };
+  const savePw = async () => {
+    if (!pwEdit) return;
+    await setSharePassword(pwEdit.id, pwEdit.value.trim() || null);
+    setPwEdit(null);
+  };
 
   // 修改备注弹框
   const [remarkEdit, setRemarkEdit] = useState<{ fp: string; value: string } | null>(null);
@@ -664,7 +712,12 @@ export default function LanShare() {
               {p.pinned && <span className="lan-peer-corner" title="已置顶" />}
               <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>
               <span className="lan-peer-info">
-                <span className="lan-peer-alias">{p.remark || p.alias}</span>
+                <span className="lan-peer-alias">
+                  {p.remark || p.alias}
+                  {p.online !== false && (p.shares ?? 0) > 0 && (
+                    <span className="lan-share-tag" title="有共享目录">共享</span>
+                  )}
+                </span>
                 <span className="lan-peer-sub dim">
                   {p.remark
                     ? p.alias
@@ -803,6 +856,17 @@ export default function LanShare() {
                 >
                   修改备注
                 </button>
+                {(p?.shares ?? 0) > 0 && p?.online !== false && (
+                  <button
+                    className="tab-menu-item"
+                    onClick={() => {
+                      setShareView({ fp: peerMenu.fp, name: p?.remark || p?.alias || "设备" });
+                      setPeerMenu(null);
+                    }}
+                  >
+                    查看共享文件
+                  </button>
+                )}
                 <button
                   className="tab-menu-item"
                   onClick={() => {
@@ -845,6 +909,53 @@ export default function LanShare() {
           })(),
           document.body
         )}
+
+      {/* 共享密码编辑弹框 */}
+      {pwEdit &&
+        createPortal(
+          <div className="modal-overlay">
+            <div className="modal" style={{ width: "min(400px, 90%)" }}>
+              <div className="modal-head">
+                <h3>「{pwEdit.name}」访问密码</h3>
+                <button className="modal-close" onClick={() => setPwEdit(null)}>×</button>
+              </div>
+              <div className="dim" style={{ fontSize: 12 }}>
+                其他设备访问此目录时需要输入。留空则取消密码（任何人可访问）。
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <input
+                  className="kv-input"
+                  style={{ flex: 1 }}
+                  value={pwEdit.value}
+                  autoFocus
+                  placeholder="访问密码"
+                  onChange={(e) => setPwEdit((p) => (p ? { ...p, value: e.target.value } : p))}
+                  onKeyDown={(e) => e.key === "Enter" && savePw()}
+                />
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => setPwEdit((p) => (p ? { ...p, value: genPassword() } : p))}
+                >
+                  随机生成
+                </button>
+              </div>
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={() => setPwEdit(null)}>取消</button>
+                <button className="btn btn-primary" onClick={savePw}>保存</button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {/* 查看对方共享文件 */}
+      {shareView && (
+        <ShareBrowser
+          fingerprint={shareView.fp}
+          peerName={shareView.name}
+          onClose={() => setShareView(null)}
+        />
+      )}
 
       {/* 修改备注弹框 */}
       {remarkEdit &&
@@ -910,6 +1021,41 @@ export default function LanShare() {
               <span className="settings-field-val dim" title={me?.downloadDir}>{me?.downloadDir}</span>
               <button className="btn btn-ghost btn-sm" onClick={pickDir}>更改</button>
             </div>
+
+            <div className="lan-shares">
+              <div className="lan-netifaces-head">
+                <span>共享目录（{myShares.length}）</span>
+                <button className="btn btn-ghost btn-sm" onClick={addShare}>添加目录</button>
+              </div>
+              <div className="dim" style={{ fontSize: 12, marginBottom: 6 }}>
+                列出的目录局域网其他设备可浏览/下载;可为每个目录单独设密码。
+              </div>
+              {myShares.length === 0 ? (
+                <div className="dim" style={{ fontSize: 12 }}>暂无共享目录</div>
+              ) : (
+                <ul className="lan-share-mgr">
+                  {myShares.map((s) => (
+                    <li key={s.id} className="lan-share-mgr-item">
+                      <span className="lan-share-mgr-name">{s.name}</span>
+                      <span className="lan-share-mgr-path dim" title={s.path}>{s.path}</span>
+                      {s.locked ? (
+                        <span className="share-lock" title="已设密码">🔒</span>
+                      ) : (
+                        <span className="dim" style={{ fontSize: 11 }}>无密码</span>
+                      )}
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setPwEdit({ id: s.id, name: s.name, value: s.password ?? "" })}
+                      >
+                        改密码
+                      </button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => removeShare(s.id)}>移除</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
             <div className="lan-netifaces">
               <div className="lan-netifaces-head">
                 <span>当前网段（{ifaces.length}）</span>
