@@ -661,7 +661,7 @@ export default function LanShare() {
               onPointerCancel={peerDnd.onPointerEnd}
               title={p.pinned ? "拖拽可调整置顶顺序" : undefined}
             >
-              {p.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
+              {p.pinned && <span className="lan-peer-corner" title="已置顶" />}
               <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>
               <span className="lan-peer-info">
                 <span className="lan-peer-alias">{p.remark || p.alias}</span>
@@ -837,7 +837,7 @@ export default function LanShare() {
                 className="lan-peer-ghost"
                 style={{ left: peerDnd.drag.x + 12, top: peerDnd.drag.y + 8 }}
               >
-                <span className="lan-peer-pin">📌</span>
+                <span className="lan-peer-corner" />
                 <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>
                 <span className="lan-peer-alias">{p.remark || p.alias}</span>
               </div>

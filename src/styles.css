@@ -642,6 +642,8 @@ select { cursor: pointer; }
   opacity: 0.55;
 }
 .lan-peer {
+  position: relative;
+  overflow: hidden; /* 让置顶角标裁切到圆角内 */
   display: flex;
   align-items: center;
   gap: 10px;
@@ -676,9 +678,22 @@ select { cursor: pointer; }
   font-size: 11px;
   line-height: 1;
 }
+/* 置顶角标：卡片左上角的折角三角（金色，在深色/选中蓝底上都清晰） */
+.lan-peer-corner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 15px 15px 0 0;
+  border-color: var(--gold, #e8b339) transparent transparent transparent;
+  pointer-events: none;
+}
 /* 置顶设备拖拽时跟随鼠标的浮层 */
 .lan-peer-ghost {
   position: fixed;
+  overflow: hidden;
   z-index: 3000;
   display: flex;
   align-items: center;
