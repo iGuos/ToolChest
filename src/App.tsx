@@ -9,6 +9,7 @@ import LanIncomingModal from "./tools/LanIncomingModal";
 import { useLan } from "./tools/lanContext";
 import { openDeepSeek } from "./tools/deepseek";
 import { useEscToClose } from "./hooks";
+import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
 
 interface ToolMeta {
   id: string;
@@ -205,6 +206,29 @@ export default function App() {
     });
   const resetSettings = () => setSettings({ ...DEFAULT_SETTINGS });
   useEscToClose(settingsOpen, () => setSettingsOpen(false));
+
+  // 开机自启动：打开设置时检测当前状态，切换时调用插件 enable/disable（macOS / Windows 通用）
+  const [autostart, setAutostart] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  useEffect(() => {
+    if (!settingsOpen) return;
+    autostartIsEnabled()
+      .then(setAutostart)
+      .catch(() => setAutostart(null));
+  }, [settingsOpen]);
+  const toggleAutostart = async (next: boolean) => {
+    setAutostartBusy(true);
+    try {
+      if (next) await autostartEnable();
+      else await autostartDisable();
+      setAutostart(await autostartIsEnabled());
+    } catch {
+      // 失败时回读真实状态，避免开关与实际不一致
+      autostartIsEnabled().then(setAutostart).catch(() => {});
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
 
   // 功能菜单卡片拖拽排序（指针事件 + 自定义浮层，整张卡片可拖，点勾选框不触发拖拽）
   const startToolDrag = (e: React.PointerEvent, id: string) => {
@@ -574,6 +598,21 @@ export default function App() {
                     {opt.name}
                   </button>
                 ))}
+              </div>
+            </div>
+            <div className="settings-section">
+              <div className="settings-section-title">通用</div>
+              <div className="settings-field">
+                <span>开机时自动启动</span>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={!!autostart}
+                    disabled={autostart === null || autostartBusy}
+                    onChange={(e) => toggleAutostart(e.target.checked)}
+                  />
+                  <span className="switch-slider" />
+                </label>
               </div>
             </div>
             <div className="modal-actions">

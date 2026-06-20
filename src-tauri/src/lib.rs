@@ -5,6 +5,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // 开机自启动：macOS 用 LaunchAgent，Windows 用注册表，跨平台统一 API
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(tools::lan::LanState::default())
         .invoke_handler(tauri::generate_handler![
             tools::port::list_ports,
@@ -25,6 +30,7 @@ pub fn run() {
             tools::lan::lan_cancel_send,
             tools::lan::lan_add_peer,
             tools::lan::lan_interfaces,
+            tools::lan::lan_overlay_routes,
             tools::lan::lan_respond,
             tools::lan::lan_pick_files,
             tools::lan::lan_pick_dir,

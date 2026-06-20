@@ -8,6 +8,9 @@
     "core:window:allow-show",
     "core:window:allow-set-focus",
     "core:window:allow-unminimize",
-    "core:window:allow-close"
+    "core:window:allow-close",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled"
   ]
 }

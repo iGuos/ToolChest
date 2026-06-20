@@ -4,7 +4,9 @@
   "type": "module",
   "packageManager": "pnpm@10.33.2",
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "scripts": {
     "dev": "tauri dev",
@@ -16,6 +18,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-autostart": "^2.5.1",
     "react": "^18",
     "react-dom": "^18"
   },

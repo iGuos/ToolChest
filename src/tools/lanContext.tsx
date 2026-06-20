@@ -217,7 +217,13 @@ export function LanProvider({ children }: { children: ReactNode }) {
       const bi = pinIndex.get(b.fingerprint);
       if (ai !== undefined && bi !== undefined) return ai - bi; // 都置顶 → 按自定义顺序
       if ((ai !== undefined) !== (bi !== undefined)) return ai !== undefined ? -1 : 1; // 置顶在前
-      return Number(!!b.online) - Number(!!a.online) || (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0);
+      // 未置顶：在线优先，然后按「名称 → fingerprint」稳定排序。
+      // 不再用 lastSeenMs 作次序——它每次心跳都变，会导致设备顺序来回跳。
+      return (
+        Number(!!b.online) - Number(!!a.online) ||
+        (a.alias || "").localeCompare(b.alias || "") ||
+        a.fingerprint.localeCompare(b.fingerprint)
+      );
     });
   }, [livePeers, knownPeers, remarks, pins]);
 

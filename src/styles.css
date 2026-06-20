@@ -322,6 +322,19 @@ select { cursor: pointer; }
   color: #fff;
   background: var(--warn, #e0883a);
 }
+.lan-netiface-tag.overlay {
+  background: var(--accent, #1f6feb);
+}
+/* 补充展示：经隧道可达的组网/覆盖网地址 */
+.lan-overlay {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.lan-overlay-head {
+  font-size: 12px;
+  margin-bottom: 6px;
+}
 .lan-netifaces-tip {
   margin-top: 8px;
   font-size: 11px;
@@ -685,6 +698,14 @@ select { cursor: pointer; }
 }
 .lan-peer-icon {
   font-size: 20px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+.lan-dev-svg {
+  width: 22px;
+  height: 22px;
+  display: block;
 }
 .lan-peer-info {
   display: flex;

@@ -28,8 +28,9 @@ use tauri_plugin_opener::OpenerExt;
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
 const PORT: u16 = 53317;
 const PROTOCOL_VERSION: &str = "2.1";
-const ANNOUNCE_EVERY: Duration = Duration::from_secs(4);
-const PEER_TTL_MS: u128 = 15_000;
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(3);
+// TTL 取得比 announce 间隔大得多（≈7 个周期），容忍多播偶发丢包，避免设备在线/离线反复闪烁
+const PEER_TTL_MS: u128 = 22_000;
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -511,6 +512,121 @@ pub fn lan_interfaces() -> Vec<NetIface> {
     // VPN/虚拟网卡排在后面，真实 LAN 网卡靠前，便于一眼看到主网段
     out.sort_by_key(|n| n.is_vpn);
     out
+}
+
+/// 「经隧道路由可达」的组网/覆盖网地址（如 Tailglobal 类 mesh 的 100.64.0.0/10 节点）。
+/// 这类地址不绑定在本机网卡上，只存在于路由表里（经 utun 等隧道的下一跳转发），
+/// 因此不会出现在 lan_interfaces 里——单独作为「补充展示」，不影响真实网卡列表。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRoute {
+    dest: String,    // 目标地址/网段（已展开缩写）
+    gateway: String, // 下一跳
+    iface: String,   // 出口接口（macOS 为 utunN；Windows 为接口标识）
+}
+
+/// 展开 macOS netstat 里缩写的网段：如 "100.64/10" → "100.64.0.0/10"；纯主机地址原样返回。
+#[cfg(target_os = "macos")]
+fn expand_dest(d: &str) -> String {
+    if let Some((addr, prefix)) = d.split_once('/') {
+        let mut parts: Vec<&str> = addr.split('.').collect();
+        while parts.len() < 4 {
+            parts.push("0");
+        }
+        format!("{}/{}", parts.join("."), prefix)
+    } else {
+        d.to_string()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn overlay_routes_impl() -> Vec<OverlayRoute> {
+    // 用绝对路径：GUI 启动的 App 环境 PATH 很精简，避免找不到 netstat
+    let Ok(out) = std::process::Command::new("/usr/sbin/netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut routes = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let (dest, gateway, flags, netif) = (parts[0], parts[1], parts[2], parts[3]);
+        if dest == "default" || !looks_like_vpn(netif) {
+            continue;
+        }
+        // 仅取「网关路由」(Flags 含大写 G)：经下一跳转发的覆盖网地址，
+        // 排除接口自身的 on-link 直连路由（默认路由的 cloned 标记是小写 g，不会被选中）。
+        if !flags.contains('G') {
+            continue;
+        }
+        routes.push(OverlayRoute {
+            dest: expand_dest(dest),
+            gateway: gateway.to_string(),
+            iface: netif.to_string(),
+        });
+        if routes.len() >= 50 {
+            break;
+        }
+    }
+    routes
+}
+
+#[cfg(target_os = "windows")]
+fn overlay_routes_impl() -> Vec<OverlayRoute> {
+    let Ok(out) = std::process::Command::new("route").args(["print", "-4"]).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut routes = Vec::new();
+    let mut in_active = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("Active Routes:") {
+            in_active = true;
+            continue;
+        }
+        if l.starts_with("Persistent Routes:") {
+            break;
+        }
+        if !in_active {
+            continue;
+        }
+        let parts: Vec<&str> = l.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let (dest, mask, gateway, iface) = (parts[0], parts[1], parts[2], parts[3]);
+        // On-link 是接口直连，跳过；只保留有真实下一跳的覆盖网路由
+        if gateway.eq_ignore_ascii_case("On-link") || dest == "0.0.0.0" {
+            continue;
+        }
+        let prefix = mask.parse::<Ipv4Addr>().map(netmask_to_prefix).unwrap_or(32);
+        routes.push(OverlayRoute {
+            dest: format!("{dest}/{prefix}"),
+            gateway: gateway.to_string(),
+            iface: iface.to_string(),
+        });
+        if routes.len() >= 50 {
+            break;
+        }
+    }
+    routes
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn overlay_routes_impl() -> Vec<OverlayRoute> {
+    Vec::new()
+}
+
+/// 列出经隧道可达的组网/覆盖网地址（补充展示用）。
+#[tauri::command]
+pub fn lan_overlay_routes() -> Vec<OverlayRoute> {
+    overlay_routes_impl()
 }
 
 /// 在每一张接口上加入多播组（重复加入返回错误，忽略即可）。VPN 切换后新出现的接口

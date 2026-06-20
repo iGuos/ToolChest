@@ -14,6 +14,11 @@ interface NetIface {
   cidr: string;
   isVpn: boolean;
 }
+interface OverlayRoute {
+  dest: string;
+  gateway: string;
+  iface: string;
+}
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -30,12 +35,27 @@ function fmtTime(ts: number): string {
   return `${d.getMonth() + 1}-${d.getDate()} ${hm}`;
 }
 
-function deviceIcon(p: Peer): string {
-  if (!p.isBaibao) return "📱";
-  const t = p.deviceType ?? "";
-  if (t === "mobile") return "📱";
-  if (t === "web") return "🌐";
-  return "💻";
+// 统一的设备状态图标（不用 emoji，避免 Windows/macOS 渲染不一致）：
+// 在线 → 屏幕亮蓝色；离线 → 屏幕黑色。手机类设备用手机外形，其余用电脑/显示器外形。
+function DeviceIcon({ peer }: { peer: Peer }) {
+  const online = peer.online !== false;
+  const screen = online ? "#4c9bff" : "#2b2f36"; // 蓝屏 / 黑屏
+  if ((peer.deviceType ?? "") === "mobile") {
+    return (
+      <svg className="lan-dev-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="6.5" y="2.5" width="11" height="19" rx="2.5" stroke="currentColor" strokeWidth="1.6" />
+        <rect x="8" y="4.5" width="8" height="12.6" rx="0.6" fill={screen} />
+        <circle cx="12" cy="19.4" r="0.9" fill="currentColor" />
+      </svg>
+    );
+  }
+  return (
+    <svg className="lan-dev-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="2.5" y="3.5" width="19" height="13" rx="2" stroke="currentColor" strokeWidth="1.6" />
+      <rect x="4.3" y="5.3" width="15.4" height="9.4" rx="0.6" fill={screen} />
+      <path d="M9 19.5h6M12 16.5v3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 function fileExtLabel(name: string): string {
@@ -206,11 +226,17 @@ export default function LanShare() {
   const [aliasDraft, setAliasDraft] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [ifaces, setIfaces] = useState<NetIface[]>([]); // 当前所有网段（设置面板里展示）
+  const [routes, setRoutes] = useState<OverlayRoute[]>([]); // 经隧道可达的组网地址（补充展示）
   const [statusOpen, setStatusOpen] = useState(false); // 在线/隐身下拉
-  // 打开设置面板时拉一次本机网段，用于诊断「VPN 导致多网段、互相发现不到」
+  // 拉取本机网段 + 组网可达地址（诊断「VPN 多网段」「mesh 组网 IP 在哪条隧道」）
+  const loadNet = () => {
+    invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([]));
+    invoke<OverlayRoute[]>("lan_overlay_routes").then(setRoutes).catch(() => setRoutes([]));
+  };
+  // 打开设置面板时拉一次
   useEffect(() => {
     if (!setOpen) return;
-    invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([]));
+    loadNet();
   }, [setOpen]);
   // 点击空白 / Esc 关闭在线状态下拉
   useEffect(() => {
@@ -675,7 +701,7 @@ export default function LanShare() {
               title={p.pinned ? "拖拽可调整置顶顺序" : undefined}
             >
               {p.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
-              <span className="lan-peer-icon">{deviceIcon(p)}</span>
+              <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>
               <span className="lan-peer-info">
                 <span className="lan-peer-alias">{p.remark || p.alias}</span>
                 <span className="lan-peer-sub dim">
@@ -851,7 +877,7 @@ export default function LanShare() {
                 style={{ left: peerDrag.x + 12, top: peerDrag.y + 8 }}
               >
                 <span className="lan-peer-pin">📌</span>
-                <span className="lan-peer-icon">{deviceIcon(p)}</span>
+                <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>
                 <span className="lan-peer-alias">{p.remark || p.alias}</span>
               </div>
             ) : null;
@@ -926,12 +952,7 @@ export default function LanShare() {
             <div className="lan-netifaces">
               <div className="lan-netifaces-head">
                 <span>当前网段（{ifaces.length}）</span>
-                <button
-                  className="btn btn-ghost btn-sm"
-                  onClick={() =>
-                    invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([]))
-                  }
-                >
+                <button className="btn btn-ghost btn-sm" onClick={loadNet}>
                   刷新
                 </button>
               </div>
@@ -953,6 +974,25 @@ export default function LanShare() {
               {ifaces.filter((n) => !n.isVpn).length > 1 && (
                 <div className="lan-netifaces-tip dim">
                   检测到多个真实网段：两台设备只有处于同一网段才能自动发现。若开了 VPN，可临时关闭，或用「+ IP」手动添加对方。
+                </div>
+              )}
+              {routes.length > 0 && (
+                <div className="lan-overlay">
+                  <div className="lan-overlay-head">组网可达地址（经隧道路由）</div>
+                  <ul className="lan-netifaces-list">
+                    {routes.map((r, i) => (
+                      <li key={`${r.dest}-${i}`} className="lan-netiface">
+                        <span className="lan-netiface-cidr">{r.dest}</span>
+                        <span className="lan-netiface-meta dim">
+                          经 {r.iface} · 网关 {r.gateway}
+                        </span>
+                        <span className="lan-netiface-tag overlay">组网</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="lan-netifaces-tip dim">
+                    这些地址不在本机网卡上，而是经隧道路由可达的组网/覆盖网节点。多播发现不过隧道，可用「+ IP」填这里的地址直连。
+                  </div>
                 </div>
               )}
             </div>
