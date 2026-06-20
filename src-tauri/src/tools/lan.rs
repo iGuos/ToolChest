@@ -28,8 +28,8 @@ use tauri_plugin_opener::OpenerExt;
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
 const PORT: u16 = 53317;
 const PROTOCOL_VERSION: &str = "2.1";
-const ANNOUNCE_EVERY: Duration = Duration::from_secs(3);
-// TTL 取得比 announce 间隔大得多（≈7 个周期），容忍多播偶发丢包，避免设备在线/离线反复闪烁
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(5);
+// TTL 取得比 announce 间隔大得多（≈4-5 个周期），容忍多播偶发丢包，避免设备在线/离线反复闪烁
 const PEER_TTL_MS: u128 = 22_000;
 
 fn now_ms() -> u128 {
@@ -600,16 +600,21 @@ fn overlay_routes_impl() -> Vec<OverlayRoute> {
         if parts.len() < 4 {
             continue;
         }
-        let (dest, mask, gateway, iface) = (parts[0], parts[1], parts[2], parts[3]);
-        // On-link 是接口直连，跳过；只保留有真实下一跳的覆盖网路由
-        if gateway.eq_ignore_ascii_case("On-link") || dest == "0.0.0.0" {
+        let (dest, mask, gateway) = (parts[0], parts[1], parts[2]);
+        // 不靠列位置/表头文字（会随系统语言变化），而是校验值本身：
+        // 目标与掩码必须是合法 IPv4，否则是表头/分隔/IPv6 行，跳过。
+        let (Ok(_), Ok(maskv4)) = (dest.parse::<Ipv4Addr>(), mask.parse::<Ipv4Addr>()) else {
+            continue;
+        };
+        // On-link 是接口直连，跳过；网关必须是合法 IPv4（真实下一跳）才算覆盖网路由。
+        if dest == "0.0.0.0" || gateway.parse::<Ipv4Addr>().is_err() {
             continue;
         }
-        let prefix = mask.parse::<Ipv4Addr>().map(netmask_to_prefix).unwrap_or(32);
+        let prefix = netmask_to_prefix(maskv4);
         routes.push(OverlayRoute {
             dest: format!("{dest}/{prefix}"),
             gateway: gateway.to_string(),
-            iface: iface.to_string(),
+            iface: parts.get(3).copied().unwrap_or("").to_string(),
         });
         if routes.len() >= 50 {
             break;
@@ -629,32 +634,28 @@ pub fn lan_overlay_routes() -> Vec<OverlayRoute> {
     overlay_routes_impl()
 }
 
-/// 在每一张接口上加入多播组（重复加入返回错误，忽略即可）。VPN 切换后新出现的接口
-/// 会在 announcer 周期里被重新加入，实现「开关 VPN 自愈」。
+/// 加入多播组。VPN 切换后新出现的接口会在 announcer 周期里被重新加入，实现「开关 VPN 自愈」。
 fn join_all_ifaces(udp: &UdpSocket) {
-    let ifaces = local_ipv4_ifaces();
-    if ifaces.is_empty() {
-        // 兜底：枚举失败时退回默认接口
-        let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
-        return;
-    }
-    for ip in ifaces {
+    // 始终在「默认接口」(INADDR_ANY) 加入一次：这是 VPN/点对点接口(utun)能收到多播的关键——
+    // 这类接口按具体 IP 加入往往不生效，只有默认成员资格能收到经隧道到达的多播。
+    let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
+    // 再按每张网卡各加入一次：覆盖「多网卡/VPN 共存时默认接口选错」导致真实 LAN 收不到的情况。
+    for ip in local_ipv4_ifaces() {
         let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &ip);
     }
 }
 
-/// 把一条多播报文从「每一张接口」各发一次。仅 announcer / 启动 / 取消隐身这几处调用，
-/// 不与监听线程的单播应答争用 multicast_if（单播走路由表，不受此选项影响）。
+/// 把一条多播报文发出去：先按默认接口发一次（兼容 VPN/点对点接口），再按每张网卡各发一次。
+/// 仅 announcer / 启动 / 取消隐身这几处调用，不与监听线程的单播应答争用 multicast_if
+/// （单播走路由表，不受此选项影响）。
 fn announce_to_all(udp: &UdpSocket, buf: &[u8]) {
     let dst = SocketAddr::from((MULTICAST_ADDR, PORT));
-    let ifaces = local_ipv4_ifaces();
-    if ifaces.is_empty() {
-        let _ = udp.send_to(buf, dst);
-        return;
-    }
     let sref = socket2::SockRef::from(udp);
-    for ip in ifaces {
-        // 指定出口网卡后再发，确保 LAN 网卡也发得出去（而不止默认/VPN 网卡）
+    // 默认接口发一次：显式指定点对点接口(utun)的 IP 作为出口可能发不出去，默认出口才行。
+    let _ = sref.set_multicast_if_v4(&Ipv4Addr::UNSPECIFIED);
+    let _ = udp.send_to(buf, dst);
+    // 再按每张网卡各发一次：确保真实 LAN 网卡也发得出去（而不止默认/VPN 网卡）。
+    for ip in local_ipv4_ifaces() {
         let _ = sref.set_multicast_if_v4(&ip);
         let _ = udp.send_to(buf, dst);
     }

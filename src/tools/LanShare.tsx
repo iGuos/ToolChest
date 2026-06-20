@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useLan, type Peer, type FileMsg, type ChatItem } from "./lanContext";
-import { useEscToClose } from "../hooks";
+import { useEscToClose, useDragReorder } from "../hooks";
 
 interface NetIface {
   name: string;
@@ -327,54 +327,15 @@ export default function LanShare() {
     setRemarkEdit(null);
   };
 
-  // 置顶设备拖拽排序：指针拖拽 + 跟随鼠标的浮层（与设置卡片排序一致）。仅置顶设备可拖。
-  const [peerDrag, setPeerDrag] = useState<{ fp: string; x: number; y: number } | null>(null);
-  const peerDragRef = useRef<{
-    fp: string;
-    startX: number;
-    startY: number;
-    active: boolean;
-    pointerId: number;
-  } | null>(null);
-  const suppressPeerClick = useRef(false); // 拖拽结束后吞掉随之而来的 click，避免误选中
-  const startPeerDrag = (e: React.PointerEvent, p: Peer) => {
-    if (!p.pinned || e.button !== 0) return; // 仅置顶设备可拖动排序
-    peerDragRef.current = {
-      fp: p.fingerprint,
-      startX: e.clientX,
-      startY: e.clientY,
-      active: false,
-      pointerId: e.pointerId,
-    };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-  const movePeerDrag = (e: React.PointerEvent) => {
-    const d = peerDragRef.current;
-    if (!d) return;
-    if (!d.active && Math.abs(e.clientX - d.startX) < 5 && Math.abs(e.clientY - d.startY) < 5)
-      return;
-    d.active = true;
-    setPeerDrag({ fp: d.fp, x: e.clientX, y: e.clientY });
-    const overFp = (
-      document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
-    )?.closest<HTMLElement>("[data-peer-fp]")?.dataset.peerFp;
-    // 仅在悬停到「另一台置顶设备」上时换位
-    if (overFp && overFp !== d.fp && peers.find((p) => p.fingerprint === overFp)?.pinned)
-      reorderPins(d.fp, overFp);
-  };
-  const endPeerDrag = (e: React.PointerEvent) => {
-    const d = peerDragRef.current;
-    if (d) {
-      if (d.active) suppressPeerClick.current = true; // 这次是拖拽，别触发选中
-      try {
-        e.currentTarget.releasePointerCapture(d.pointerId);
-      } catch {
-        /* 捕获可能已释放 */
-      }
-    }
-    peerDragRef.current = null;
-    setPeerDrag(null);
-  };
+  // 置顶设备拖拽排序：复用通用拖拽 hook。仅置顶设备可拖、且只能放到另一台置顶设备上。
+  const isPinned = (fp: string) => !!peers.find((p) => p.fingerprint === fp)?.pinned;
+  const peerDnd = useDragReorder({
+    selector: "[data-peer-fp]",
+    dataAttr: "peerFp",
+    canDrag: isPinned,
+    canDropOn: isPinned,
+    onReorder: reorderPins,
+  });
 
   // 刷新设备列表：点击时图标转起来，至少转 0.6s 让动效可见
   const handleRefresh = async () => {
@@ -681,10 +642,10 @@ export default function LanShare() {
               data-peer-fp={p.fingerprint}
               className={`lan-peer${selected === p.fingerprint ? " active" : ""}${
                 p.online === false ? " offline" : ""
-              }${p.pinned ? " pinned" : ""}${peerDrag?.fp === p.fingerprint ? " dragging" : ""}`}
+              }${p.pinned ? " pinned" : ""}${peerDnd.drag?.id === p.fingerprint ? " dragging" : ""}`}
               onClick={() => {
-                if (suppressPeerClick.current) {
-                  suppressPeerClick.current = false;
+                if (peerDnd.suppressNextClick.current) {
+                  peerDnd.suppressNextClick.current = false;
                   return;
                 }
                 setSelected(p.fingerprint);
@@ -694,10 +655,10 @@ export default function LanShare() {
                 e.stopPropagation();
                 setPeerMenu({ x: e.clientX, y: e.clientY, fp: p.fingerprint });
               }}
-              onPointerDown={(e) => startPeerDrag(e, p)}
-              onPointerMove={movePeerDrag}
-              onPointerUp={endPeerDrag}
-              onPointerCancel={endPeerDrag}
+              onPointerDown={(e) => peerDnd.onPointerDown(e, p.fingerprint)}
+              onPointerMove={peerDnd.onPointerMove}
+              onPointerUp={peerDnd.onPointerEnd}
+              onPointerCancel={peerDnd.onPointerEnd}
               title={p.pinned ? "拖拽可调整置顶顺序" : undefined}
             >
               {p.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
@@ -779,7 +740,7 @@ export default function LanShare() {
 
           {dragOver && (
             <div className="lan-drop-mask">
-              松手发送给 <b>{selectedPeer?.alias}</b>
+              松手发送给 <b>{selectedPeer?.remark || selectedPeer?.alias}</b>
             </div>
           )}
         </div>
@@ -867,14 +828,14 @@ export default function LanShare() {
         )}
 
       {/* 置顶设备拖拽时跟随鼠标的浮层 */}
-      {peerDrag &&
+      {peerDnd.drag &&
         createPortal(
           (() => {
-            const p = peers.find((x) => x.fingerprint === peerDrag.fp);
+            const p = peers.find((x) => x.fingerprint === peerDnd.drag!.id);
             return p ? (
               <div
                 className="lan-peer-ghost"
-                style={{ left: peerDrag.x + 12, top: peerDrag.y + 8 }}
+                style={{ left: peerDnd.drag.x + 12, top: peerDnd.drag.y + 8 }}
               >
                 <span className="lan-peer-pin">📌</span>
                 <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>

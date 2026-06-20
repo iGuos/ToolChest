@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import PortScanner from "./tools/PortScanner";
 import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
@@ -8,7 +8,7 @@ import LanShare from "./tools/LanShare";
 import LanIncomingModal from "./tools/LanIncomingModal";
 import { useLan } from "./tools/lanContext";
 import { openDeepSeek } from "./tools/deepseek";
-import { useEscToClose } from "./hooks";
+import { useEscToClose, useDragReorder } from "./hooks";
 import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
 
 interface ToolMeta {
@@ -133,29 +133,9 @@ export default function App() {
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(
     null
   );
-  // 拖拽：drag 为正在跟随鼠标的卡片状态，dragRef 记录手势细节
-  const [drag, setDrag] = useState<{ id: string; x: number; y: number } | null>(
-    null
-  );
-  const dragRef = useRef<{
-    id: string;
-    startX: number;
-    startY: number;
-    active: boolean;
-    pointerId: number;
-  } | null>(null);
-  // 应用设置 + 设置弹框开关 + 设置内拖拽排序的当前项
+  // 应用设置 + 设置弹框开关
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // 功能菜单卡片排序：指针拖拽（跟随鼠标的浮层 + 悬停处实时换位），与顶部 tab 拖拽一致
-  const [toolDrag, setToolDrag] = useState<{ id: string; x: number; y: number } | null>(null);
-  const toolDragRef = useRef<{
-    id: string;
-    startX: number;
-    startY: number;
-    active: boolean;
-    pointerId: number;
-  } | null>(null);
   useEffect(() => {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -230,44 +210,13 @@ export default function App() {
     }
   };
 
-  // 功能菜单卡片拖拽排序（指针事件 + 自定义浮层，整张卡片可拖，点勾选框不触发拖拽）
-  const startToolDrag = (e: React.PointerEvent, id: string) => {
-    if (e.button !== 0) return;
-    if ((e.target as HTMLElement).closest(".settings-card-check")) return; // 点的是勾选框
-    toolDragRef.current = {
-      id,
-      startX: e.clientX,
-      startY: e.clientY,
-      active: false,
-      pointerId: e.pointerId,
-    };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-  const moveToolDrag = (e: React.PointerEvent) => {
-    const d = toolDragRef.current;
-    if (!d) return;
-    // 超过阈值才算拖动，避免误触（与 tab 拖拽一致）
-    if (!d.active && Math.abs(e.clientX - d.startX) < 5 && Math.abs(e.clientY - d.startY) < 5)
-      return;
-    d.active = true;
-    setToolDrag({ id: d.id, x: e.clientX, y: e.clientY });
-    const overId = (
-      document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
-    )?.closest<HTMLElement>("[data-tool-card-id]")?.dataset.toolCardId;
-    if (overId && overId !== d.id) moveTool(d.id, overId);
-  };
-  const endToolDrag = (e: React.PointerEvent) => {
-    const d = toolDragRef.current;
-    if (d) {
-      try {
-        e.currentTarget.releasePointerCapture(d.pointerId);
-      } catch {
-        /* 捕获可能已释放 */
-      }
-    }
-    toolDragRef.current = null;
-    setToolDrag(null);
-  };
+  // 功能菜单卡片拖拽排序（整张卡片可拖，点勾选框不触发拖拽）。复用通用拖拽 hook。
+  const toolDnd = useDragReorder({
+    selector: "[data-tool-card-id]",
+    dataAttr: "toolCardId",
+    ignoreTargetSelector: ".settings-card-check",
+    onReorder: moveTool,
+  });
 
   // 哪些 tab 有未保存改动（用于 tab 上的变更指示灯）
   const [dirtyTabs, setDirtyTabs] = useState<Set<string>>(new Set());
@@ -330,50 +279,15 @@ export default function App() {
     });
   };
 
-  // 卡片式拖拽（基于 pointer 事件，自定义跟随鼠标的浮层）
-  const startDrag = (e: React.PointerEvent, id: string) => {
-    if (id === HOME_ID || e.button !== 0) return;
-    if ((e.target as HTMLElement).closest(".tab-close")) return; // 点的是关闭按钮
-    dragRef.current = {
-      id,
-      startX: e.clientX,
-      startY: e.clientY,
-      active: false,
-      pointerId: e.pointerId,
-    };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-
-  const moveDrag = (e: React.PointerEvent) => {
-    const d = dragRef.current;
-    if (!d) return;
-    // 超过阈值才算开始拖动，避免误触
-    if (
-      !d.active &&
-      Math.abs(e.clientX - d.startX) < 5 &&
-      Math.abs(e.clientY - d.startY) < 5
-    )
-      return;
-    d.active = true;
-    setDrag({ id: d.id, x: e.clientX, y: e.clientY });
-    const overId = (
-      document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
-    )?.closest<HTMLElement>("[data-tab-id]")?.dataset.tabId;
-    if (overId && overId !== HOME_ID && overId !== d.id) reorder(d.id, overId);
-  };
-
-  const endDrag = (e: React.PointerEvent) => {
-    const d = dragRef.current;
-    if (d) {
-      try {
-        e.currentTarget.releasePointerCapture(d.pointerId);
-      } catch {
-        /* 捕获可能已释放 */
-      }
-    }
-    dragRef.current = null;
-    setDrag(null);
-  };
+  // 顶部 tab 拖拽排序（首页固定最左，不参与拖拽，也不可作为放置目标）。复用通用拖拽 hook。
+  const tabDnd = useDragReorder({
+    selector: "[data-tab-id]",
+    dataAttr: "tabId",
+    canDrag: (id) => id !== HOME_ID,
+    canDropOn: (id) => id !== HOME_ID,
+    ignoreTargetSelector: ".tab-close",
+    onReorder: reorder,
+  });
 
   // 打开右键菜单后，点击空白处 / 滚动 / Esc 关闭它
   useEffect(() => {
@@ -442,7 +356,7 @@ export default function App() {
                   key={id}
                   data-tab-id={id}
                   className={`tab${active ? " active" : ""}${
-                    drag?.id === id ? " dragging" : ""
+                    tabDnd.drag?.id === id ? " dragging" : ""
                   }${id !== HOME_ID ? " draggable" : ""}`}
                   onClick={() => setActiveTab(id)}
                   onContextMenu={(e) => {
@@ -450,10 +364,10 @@ export default function App() {
                     e.stopPropagation();
                     setMenu({ id, x: e.clientX, y: e.clientY });
                   }}
-                  onPointerDown={(e) => startDrag(e, id)}
-                  onPointerMove={moveDrag}
-                  onPointerUp={endDrag}
-                  onPointerCancel={endDrag}
+                  onPointerDown={(e) => tabDnd.onPointerDown(e, id)}
+                  onPointerMove={tabDnd.onPointerMove}
+                  onPointerUp={tabDnd.onPointerEnd}
+                  onPointerCancel={tabDnd.onPointerEnd}
                   title={tabName(id)}
                 >
                   <span
@@ -521,13 +435,13 @@ export default function App() {
         )}
 
         {/* 拖拽时跟随鼠标的卡片 */}
-        {drag && (
+        {tabDnd.drag && (
           <div
             className="tab-ghost"
-            style={{ left: drag.x + 12, top: drag.y + 10 }}
+            style={{ left: tabDnd.drag.x + 12, top: tabDnd.drag.y + 10 }}
           >
             <span className="tab-dot on" />
-            <span className="tab-label">{tabName(drag.id)}</span>
+            <span className="tab-label">{tabName(tabDnd.drag.id)}</span>
           </div>
         )}
 
@@ -564,13 +478,13 @@ export default function App() {
                   <div
                     key={t.id}
                     data-tool-card-id={t.id}
-                    className={`settings-card${toolDrag?.id === t.id ? " dragging" : ""}${
+                    className={`settings-card${toolDnd.drag?.id === t.id ? " dragging" : ""}${
                       hiddenTools.has(t.id) ? " off" : ""
                     }`}
-                    onPointerDown={(e) => startToolDrag(e, t.id)}
-                    onPointerMove={moveToolDrag}
-                    onPointerUp={endToolDrag}
-                    onPointerCancel={endToolDrag}
+                    onPointerDown={(e) => toolDnd.onPointerDown(e, t.id)}
+                    onPointerMove={toolDnd.onPointerMove}
+                    onPointerUp={toolDnd.onPointerEnd}
+                    onPointerCancel={toolDnd.onPointerEnd}
                     title="拖拽排序"
                   >
                     <input
@@ -628,13 +542,13 @@ export default function App() {
       )}
 
       {/* 功能菜单拖拽时跟随鼠标的卡片浮层 */}
-      {toolDrag &&
+      {toolDnd.drag &&
         (() => {
-          const t = TOOLS.find((x) => x.id === toolDrag.id);
+          const t = TOOLS.find((x) => x.id === toolDnd.drag!.id);
           return t ? (
             <div
               className="settings-card-ghost"
-              style={{ left: toolDrag.x + 12, top: toolDrag.y + 10 }}
+              style={{ left: toolDnd.drag.x + 12, top: toolDnd.drag.y + 10 }}
             >
               <span className="tool-icon">{t.icon}</span>
               <span className="settings-card-name">{t.name}</span>

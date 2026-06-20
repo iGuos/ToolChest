@@ -199,19 +199,27 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const offersRef = useRef<Record<string, Incoming>>({}); // sessionId -> 待接收请求
   const batchBaseRef = useRef<Record<string, number>>({}); // batch -> 基准时间戳，配合 order 保证接收顺序=发送顺序
 
+  // 有聊天/传输记录的设备指纹集合（用于判断「离线且无记录」的设备可丢弃）
+  const historyFps = useMemo(() => new Set(items.map((x) => x.fingerprint)), [items]);
+
   // 设备列表 = 在线发现 + 历史已知（离线）。按 fingerprint 去重，online 标记是否在线。
   // 排序：置顶设备在最前（按 pins 自定义顺序），其余按「在线优先 + 最近活跃」。
   // 备注/置顶按 fingerprint 单独维护，附加到派生出的 Peer 上（不写回 knownPeers）。
+  // 离线 + 无聊天记录 + 未置顶的设备不展示（视为已删除）。
   const peers = useMemo<Peer[]>(() => {
     const map = new Map<string, Peer>();
     for (const fp of Object.keys(knownPeers)) map.set(fp, { ...knownPeers[fp], online: false });
     for (const p of livePeers) map.set(p.fingerprint, { ...p, online: true });
     const pinIndex = new Map(pins.map((fp, i) => [fp, i]));
-    const arr = [...map.values()].map((p) => ({
-      ...p,
-      remark: remarks[p.fingerprint] || undefined,
-      pinned: pinIndex.has(p.fingerprint),
-    }));
+    const arr = [...map.values()]
+      .map((p) => ({
+        ...p,
+        remark: remarks[p.fingerprint] || undefined,
+        pinned: pinIndex.has(p.fingerprint),
+      }))
+      .filter(
+        (p) => p.online !== false || p.pinned || historyFps.has(p.fingerprint)
+      );
     return arr.sort((a, b) => {
       const ai = pinIndex.get(a.fingerprint);
       const bi = pinIndex.get(b.fingerprint);
@@ -225,12 +233,14 @@ export function LanProvider({ children }: { children: ReactNode }) {
         a.fingerprint.localeCompare(b.fingerprint)
       );
     });
-  }, [livePeers, knownPeers, remarks, pins]);
+  }, [livePeers, knownPeers, remarks, pins, historyFps]);
 
-  // 在线设备并入历史已知表（保留最新 alias/ip；改名后历史仍按 fingerprint 关联）
+  // 维护历史已知表：在线设备刷新元数据；离线且「无聊天记录、未置顶」的设备删除，避免常驻堆积。
+  // 在线集合与被删集合不相交（删的都不在 livePeers 里），不会产生「加了又删」的抖动。
   useEffect(() => {
-    if (livePeers.length === 0) return;
     setKnownPeers((kp) => {
+      const liveFps = new Set(livePeers.map((p) => p.fingerprint));
+      const pinSet = new Set(pins);
       let changed = false;
       const next = { ...kp };
       for (const p of livePeers) {
@@ -240,9 +250,15 @@ export function LanProvider({ children }: { children: ReactNode }) {
           changed = true;
         }
       }
+      for (const fp of Object.keys(next)) {
+        if (!liveFps.has(fp) && !historyFps.has(fp) && !pinSet.has(fp)) {
+          delete next[fp];
+          changed = true;
+        }
+      }
       return changed ? next : kp;
     });
-  }, [livePeers]);
+  }, [livePeers, historyFps, pins]);
 
   // 持久化：历史已知设备 + 聊天/传输记录（防抖、裁剪到上限）
   useEffect(() => {
