@@ -151,8 +151,9 @@ select { cursor: pointer; }
   margin-bottom: 4px;
 }
 .settings-cards {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(4, 130px); /* 一行 4 个、窄卡片 */
+  justify-content: start; /* 左对齐，右侧留白 */
   gap: 8px;
 }
 /* 主题选择：三选一分段按钮 */
@@ -179,35 +180,66 @@ select { cursor: pointer; }
   border-color: var(--accent);
 }
 .settings-card {
+  position: relative;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 6px;
+  padding: 14px 8px 10px;
   background: var(--bg3);
   border: 1px solid var(--border);
   border-radius: 8px;
   cursor: grab;
+  text-align: center;
+  user-select: none;
   transition: background 0.1s, opacity 0.1s, border-color 0.1s;
 }
 .settings-card:hover {
   border-color: var(--accent);
 }
 .settings-card.dragging {
-  opacity: 0.4;
+  opacity: 0.35;
   cursor: grabbing;
 }
 .settings-card.off {
   opacity: 0.55;
 }
-.settings-grip {
-  color: var(--text-dim);
-  font-size: 15px;
-  cursor: grab;
-  user-select: none;
+.settings-card .tool-icon {
+  font-size: 22px;
 }
 .settings-card-name {
-  flex: 1;
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.25;
+}
+.settings-card-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  margin: 0;
+  cursor: pointer;
+}
+/* 拖拽时跟随鼠标的卡片浮层 */
+.settings-card-ghost {
+  position: fixed;
+  z-index: 3000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 130px;
+  padding: 14px 8px 10px;
+  background: var(--bg3);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  opacity: 0.95;
+}
+.settings-card-ghost .tool-icon {
+  font-size: 22px;
+}
+.settings-card-ghost .settings-card-name {
+  font-size: 12px;
 }
 .settings-reset {
   margin-right: auto;
@@ -238,6 +270,62 @@ select { cursor: pointer; }
 }
 .settings-field .kv-input {
   margin-left: auto;
+}
+
+/* 当前网段（局域网互传设置内的诊断列表） */
+.lan-netifaces {
+  padding: 10px 2px 4px;
+}
+.lan-netifaces-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.lan-netifaces-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.lan-netiface {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--bg-elev, rgba(127, 127, 127, 0.08));
+  font-size: 12px;
+}
+.lan-netiface-cidr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+.lan-netiface-meta {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.lan-netiface-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--warn, #e0883a);
+}
+.lan-netifaces-tip {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 /* 开关按钮 */
@@ -559,6 +647,41 @@ select { cursor: pointer; }
 .lan-peer.active {
   background: var(--accent, #1f6feb);
   color: #fff;
+}
+.lan-peer {
+  user-select: none;
+}
+.lan-peer.pinned {
+  cursor: grab;
+}
+.lan-peer.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+.lan-peer-pin {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1;
+}
+/* 置顶设备拖拽时跟随鼠标的浮层 */
+.lan-peer-ghost {
+  position: fixed;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 240px;
+  padding: 8px 12px;
+  background: var(--bg2);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  opacity: 0.95;
+}
+.lan-peer-ghost .lan-peer-alias {
+  font-size: 13px;
+  font-weight: 500;
 }
 .lan-peer-icon {
   font-size: 20px;
@@ -1810,6 +1933,28 @@ tr:hover td { background: #28282c; }
   max-width: 100%;
 }
 .drop-hint { font-size: 12px; color: var(--text-dim); }
+.trust-command {
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: -6px;
+}
+.trust-command-label { font-size: 12px; }
+.trust-command-input {
+  width: 100%;
+  padding: 9px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+.trust-command-input::placeholder { color: var(--text-dim); }
+.trust-command-input:focus { border-color: var(--accent); }
 .trust-actions { display: flex; gap: 10px; }
 .trust-desc {
   max-width: 560px;

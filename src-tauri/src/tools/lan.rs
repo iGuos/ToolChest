@@ -436,11 +436,113 @@ pub async fn lan_start(app: AppHandle, state: State<'_, LanState>) -> Result<ser
     if !state.0.lock().unwrap().invisible {
         let info = state.device_info(Some(true));
         if let Ok(buf) = serde_json::to_vec(&info) {
-            let _ = udp.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+            announce_to_all(&udp, &buf);
         }
     }
 
     Ok(my_info_value(&state))
+}
+
+/// 本机所有非回环 IPv4 接口地址。VPN 开启时会有多个（真实 LAN 网卡 + 虚拟 utun/tun），
+/// 多播必须覆盖全部接口，否则只走默认路由（常是 VPN）那一张网卡，导致与同一 LAN 的设备互相发现不到。
+fn local_ipv4_ifaces() -> Vec<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .map(|ifs| {
+            ifs.into_iter()
+                .filter_map(|i| match i.ip() {
+                    std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 一张本机网卡的网段信息，供前端「查看当前所有网段」诊断用。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIface {
+    name: String,
+    ip: String,
+    netmask: String,
+    prefix: u8,
+    cidr: String, // 网段，如 192.168.1.0/24
+    is_vpn: bool, // 依接口名猜测是否为 VPN/虚拟网卡
+}
+
+fn netmask_to_prefix(mask: Ipv4Addr) -> u8 {
+    u32::from(mask).count_ones() as u8
+}
+
+/// 接口名是否像 VPN/隧道虚拟网卡（utun/tun/tap/ppp/ipsec/wg…）。多个网段共存时据此提示用户。
+fn looks_like_vpn(name: &str) -> bool {
+    let n = name.to_lowercase();
+    ["utun", "tun", "tap", "ppp", "ipsec", "wg", "zt", "tailscale"]
+        .iter()
+        .any(|p| n.starts_with(p))
+        || n.contains("vpn")
+}
+
+/// 列出本机所有非回环 IPv4 网卡及其网段。前端用于诊断「VPN 导致多网段、互相发现不到」。
+#[tauri::command]
+pub fn lan_interfaces() -> Vec<NetIface> {
+    let mut out = Vec::new();
+    let Ok(ifs) = if_addrs::get_if_addrs() else {
+        return out;
+    };
+    for i in ifs {
+        let if_addrs::IfAddr::V4(v4) = i.addr else {
+            continue;
+        };
+        if v4.ip.is_loopback() || v4.ip.is_unspecified() {
+            continue;
+        }
+        let prefix = netmask_to_prefix(v4.netmask);
+        let net = Ipv4Addr::from(u32::from(v4.ip) & u32::from(v4.netmask));
+        out.push(NetIface {
+            name: i.name.clone(),
+            ip: v4.ip.to_string(),
+            netmask: v4.netmask.to_string(),
+            prefix,
+            cidr: format!("{net}/{prefix}"),
+            is_vpn: looks_like_vpn(&i.name),
+        });
+    }
+    // VPN/虚拟网卡排在后面，真实 LAN 网卡靠前，便于一眼看到主网段
+    out.sort_by_key(|n| n.is_vpn);
+    out
+}
+
+/// 在每一张接口上加入多播组（重复加入返回错误，忽略即可）。VPN 切换后新出现的接口
+/// 会在 announcer 周期里被重新加入，实现「开关 VPN 自愈」。
+fn join_all_ifaces(udp: &UdpSocket) {
+    let ifaces = local_ipv4_ifaces();
+    if ifaces.is_empty() {
+        // 兜底：枚举失败时退回默认接口
+        let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
+        return;
+    }
+    for ip in ifaces {
+        let _ = udp.join_multicast_v4(&MULTICAST_ADDR, &ip);
+    }
+}
+
+/// 把一条多播报文从「每一张接口」各发一次。仅 announcer / 启动 / 取消隐身这几处调用，
+/// 不与监听线程的单播应答争用 multicast_if（单播走路由表，不受此选项影响）。
+fn announce_to_all(udp: &UdpSocket, buf: &[u8]) {
+    let dst = SocketAddr::from((MULTICAST_ADDR, PORT));
+    let ifaces = local_ipv4_ifaces();
+    if ifaces.is_empty() {
+        let _ = udp.send_to(buf, dst);
+        return;
+    }
+    let sref = socket2::SockRef::from(udp);
+    for ip in ifaces {
+        // 指定出口网卡后再发，确保 LAN 网卡也发得出去（而不止默认/VPN 网卡）
+        let _ = sref.set_multicast_if_v4(&ip);
+        let _ = udp.send_to(buf, dst);
+    }
+    let _ = sref.set_multicast_if_v4(&Ipv4Addr::UNSPECIFIED);
 }
 
 fn build_multicast_socket() -> std::io::Result<UdpSocket> {
@@ -451,7 +553,7 @@ fn build_multicast_socket() -> std::io::Result<UdpSocket> {
     let bind: SocketAddr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, PORT));
     sock.bind(&bind.into())?;
     let udp: UdpSocket = sock.into();
-    udp.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+    join_all_ifaces(&udp); // 在所有接口上加入组，而非仅默认接口
     udp.set_multicast_ttl_v4(1)?;
     let _ = udp.set_multicast_loop_v4(true);
     Ok(udp)
@@ -491,11 +593,13 @@ fn multicast_listener(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
 fn announcer(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
     loop {
         std::thread::sleep(ANNOUNCE_EVERY);
+        // 每轮重新在所有接口加入组：覆盖运行期间新接入的网卡（如刚连上的 VPN / Wi-Fi 切换）
+        join_all_ifaces(&sock);
         // 隐身时不广播，让对端在 TTL 过后把本机判定为离线
         if !state.0.lock().unwrap().invisible {
             let info = state.device_info(Some(true));
             if let Ok(buf) = serde_json::to_vec(&info) {
-                let _ = sock.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+                announce_to_all(&sock, &buf);
             }
         }
         // 清理过期设备
@@ -923,7 +1027,7 @@ pub fn lan_set_invisible(state: State<'_, LanState>, enabled: bool) {
         if let Some(sock) = sock {
             let info = state.device_info(Some(true));
             if let Ok(buf) = serde_json::to_vec(&info) {
-                let _ = sock.send_to(&buf, SocketAddr::from((MULTICAST_ADDR, PORT)));
+                announce_to_all(&sock, &buf);
             }
         }
     }

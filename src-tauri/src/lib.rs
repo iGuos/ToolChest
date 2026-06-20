@@ -24,6 +24,7 @@ pub fn run() {
             tools::lan::lan_cancel,
             tools::lan::lan_cancel_send,
             tools::lan::lan_add_peer,
+            tools::lan::lan_interfaces,
             tools::lan::lan_respond,
             tools::lan::lan_pick_files,
             tools::lan::lan_pick_dir,

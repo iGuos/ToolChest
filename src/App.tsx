@@ -8,6 +8,7 @@ import LanShare from "./tools/LanShare";
 import LanIncomingModal from "./tools/LanIncomingModal";
 import { useLan } from "./tools/lanContext";
 import { openDeepSeek } from "./tools/deepseek";
+import { useEscToClose } from "./hooks";
 
 interface ToolMeta {
   id: string;
@@ -145,7 +146,15 @@ export default function App() {
   // 应用设置 + 设置弹框开关 + 设置内拖拽排序的当前项
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [dragToolId, setDragToolId] = useState<string | null>(null);
+  // 功能菜单卡片排序：指针拖拽（跟随鼠标的浮层 + 悬停处实时换位），与顶部 tab 拖拽一致
+  const [toolDrag, setToolDrag] = useState<{ id: string; x: number; y: number } | null>(null);
+  const toolDragRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    active: boolean;
+    pointerId: number;
+  } | null>(null);
   useEffect(() => {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -195,6 +204,46 @@ export default function App() {
       return { ...s, order: ids };
     });
   const resetSettings = () => setSettings({ ...DEFAULT_SETTINGS });
+  useEscToClose(settingsOpen, () => setSettingsOpen(false));
+
+  // 功能菜单卡片拖拽排序（指针事件 + 自定义浮层，整张卡片可拖，点勾选框不触发拖拽）
+  const startToolDrag = (e: React.PointerEvent, id: string) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest(".settings-card-check")) return; // 点的是勾选框
+    toolDragRef.current = {
+      id,
+      startX: e.clientX,
+      startY: e.clientY,
+      active: false,
+      pointerId: e.pointerId,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const moveToolDrag = (e: React.PointerEvent) => {
+    const d = toolDragRef.current;
+    if (!d) return;
+    // 超过阈值才算拖动，避免误触（与 tab 拖拽一致）
+    if (!d.active && Math.abs(e.clientX - d.startX) < 5 && Math.abs(e.clientY - d.startY) < 5)
+      return;
+    d.active = true;
+    setToolDrag({ id: d.id, x: e.clientX, y: e.clientY });
+    const overId = (
+      document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
+    )?.closest<HTMLElement>("[data-tool-card-id]")?.dataset.toolCardId;
+    if (overId && overId !== d.id) moveTool(d.id, overId);
+  };
+  const endToolDrag = (e: React.PointerEvent) => {
+    const d = toolDragRef.current;
+    if (d) {
+      try {
+        e.currentTarget.releasePointerCapture(d.pointerId);
+      } catch {
+        /* 捕获可能已释放 */
+      }
+    }
+    toolDragRef.current = null;
+    setToolDrag(null);
+  };
 
   // 哪些 tab 有未保存改动（用于 tab 上的变更指示灯）
   const [dirtyTabs, setDirtyTabs] = useState<Set<string>>(new Set());
@@ -475,41 +524,40 @@ export default function App() {
 
       {/* 设置弹框 */}
       {settingsOpen && (
-        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>设置</h3>
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-head">
+              <h3>设置</h3>
+              <button className="modal-close" onClick={() => setSettingsOpen(false)}>×</button>
+            </div>
             <div className="settings-section">
               <div className="settings-section-title">功能菜单</div>
               <div className="dim" style={{ fontSize: 12, marginBottom: 8 }}>
-                勾选是否显示，拖拽 ⠿ 调整顺序（侧边栏与首页同步生效）
+                勾选是否显示，拖拽卡片调整顺序（侧边栏与首页同步生效）
               </div>
               <div className="settings-cards">
                 {orderedTools.map((t) => (
                   <div
                     key={t.id}
-                    className={`settings-card${dragToolId === t.id ? " dragging" : ""}${
+                    data-tool-card-id={t.id}
+                    className={`settings-card${toolDrag?.id === t.id ? " dragging" : ""}${
                       hiddenTools.has(t.id) ? " off" : ""
                     }`}
-                    draggable
-                    onDragStart={(e) => {
-                      setDragToolId(t.id);
-                      e.dataTransfer.effectAllowed = "move";
-                    }}
-                    onDragEnd={() => setDragToolId(null)}
-                    onDragOver={(e) => {
-                      e.preventDefault();
-                      if (dragToolId && dragToolId !== t.id) moveTool(dragToolId, t.id);
-                    }}
+                    onPointerDown={(e) => startToolDrag(e, t.id)}
+                    onPointerMove={moveToolDrag}
+                    onPointerUp={endToolDrag}
+                    onPointerCancel={endToolDrag}
+                    title="拖拽排序"
                   >
-                    <span className="settings-grip" title="拖拽排序">⠿</span>
-                    <span className="tool-icon">{t.icon}</span>
-                    <span className="settings-card-name">{t.name}</span>
                     <input
+                      className="settings-card-check"
                       type="checkbox"
                       checked={!hiddenTools.has(t.id)}
                       onChange={() => toggleToolVisible(t.id)}
                       onClick={(e) => e.stopPropagation()}
                     />
+                    <span className="tool-icon">{t.icon}</span>
+                    <span className="settings-card-name">{t.name}</span>
                   </div>
                 ))}
               </div>
@@ -539,6 +587,21 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* 功能菜单拖拽时跟随鼠标的卡片浮层 */}
+      {toolDrag &&
+        (() => {
+          const t = TOOLS.find((x) => x.id === toolDrag.id);
+          return t ? (
+            <div
+              className="settings-card-ghost"
+              style={{ left: toolDrag.x + 12, top: toolDrag.y + 10 }}
+            >
+              <span className="tool-icon">{t.icon}</span>
+              <span className="settings-card-name">{t.name}</span>
+            </div>
+          ) : null;
+        })()}
 
       {/* 局域网收件确认：全局渲染，任何 tab 下都可见 */}
       <LanIncomingModal />

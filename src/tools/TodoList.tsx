@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useEscToClose } from "../hooks";
 
 interface Task {
   id: number;
@@ -109,6 +110,8 @@ export default function TodoList() {
   const [draft, setDraft] = useState("");
   const [pendingDelete, setPendingDelete] = useState<Task | null>(null);
   const [pendingGroupDelete, setPendingGroupDelete] = useState<Group | null>(null);
+  useEscToClose(!!pendingDelete, () => setPendingDelete(null));
+  useEscToClose(!!pendingGroupDelete, () => setPendingGroupDelete(null));
   const [groupDeleteInput, setGroupDeleteInput] = useState("");
 
   // 分组下拉
@@ -498,13 +501,12 @@ export default function TodoList() {
       </div>
 
       {pendingDelete && (
-        <div className="modal-overlay" onClick={() => setPendingDelete(null)}>
-          <div
-            className="modal"
-            style={{ width: "min(420px, 90%)" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3>删除已完成事项</h3>
+        <div className="modal-overlay">
+          <div className="modal" style={{ width: "min(420px, 90%)" }}>
+            <div className="modal-head">
+              <h3>删除已完成事项</h3>
+              <button className="modal-close" onClick={() => setPendingDelete(null)}>×</button>
+            </div>
             <p style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.6 }}>
               确认删除「{pendingDelete.text}」？此操作不可撤销。
             </p>
@@ -521,13 +523,12 @@ export default function TodoList() {
       )}
 
       {pendingGroupDelete && (
-        <div className="modal-overlay" onClick={() => setPendingGroupDelete(null)}>
-          <div
-            className="modal"
-            style={{ width: "min(440px, 90%)" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3>删除分组</h3>
+        <div className="modal-overlay">
+          <div className="modal" style={{ width: "min(440px, 90%)" }}>
+            <div className="modal-head">
+              <h3>删除分组</h3>
+              <button className="modal-close" onClick={() => setPendingGroupDelete(null)}>×</button>
+            </div>
             <p style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.7 }}>
               将永久删除分组「{pendingGroupDelete.name}」及其下全部待办与已完成事项，
               <span style={{ color: "var(--red)" }}>此操作不可撤销</span>。

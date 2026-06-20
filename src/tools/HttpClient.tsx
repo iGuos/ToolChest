@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { parseRequest } from "./importRequest";
+import { useEscToClose } from "../hooks";
 
 interface KV {
   key: string;
@@ -121,6 +122,7 @@ export default function HttpClient() {
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [importErr, setImportErr] = useState<string | null>(null);
+  useEscToClose(importOpen, () => setImportOpen(false));
 
   const applyImport = () => {
     let p;
@@ -459,9 +461,12 @@ export default function HttpClient() {
 
       {/* 导入 cURL / fetch / PowerShell */}
       {importOpen && (
-        <div className="modal-overlay" onClick={() => setImportOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>导入请求</h3>
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-head">
+              <h3>导入请求</h3>
+              <button className="modal-close" onClick={() => setImportOpen(false)}>×</button>
+            </div>
             <div className="dim" style={{ fontSize: 12 }}>
               粘贴浏览器「Copy as cURL / fetch / fetch (Node.js) / PowerShell」的内容，自动识别解析
             </div>

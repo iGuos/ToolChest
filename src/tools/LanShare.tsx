@@ -4,6 +4,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useLan, type Peer, type FileMsg, type ChatItem } from "./lanContext";
+import { useEscToClose } from "../hooks";
+
+interface NetIface {
+  name: string;
+  ip: string;
+  netmask: string;
+  prefix: number;
+  cidr: string;
+  isVpn: boolean;
+}
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -182,6 +192,7 @@ export default function LanShare() {
     me, peers, items, unread, selected, error,
     setSelected, setError, refreshPeers, sendMessage, resendMessage, recallMessage, deleteItem, sendFiles,
     cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
+    setRemark, clearChat, togglePin, reorderPins,
   } = useLan();
 
   const [draft, setDraft] = useState("");
@@ -190,9 +201,17 @@ export default function LanShare() {
   const [addIp, setAddIp] = useState("");
   const [adding, setAdding] = useState(false);
   const [setOpen, setSetOpen] = useState(false);
+  useEscToClose(addOpen, () => setAddOpen(false));
+  useEscToClose(setOpen, () => setSetOpen(false));
   const [aliasDraft, setAliasDraft] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [ifaces, setIfaces] = useState<NetIface[]>([]); // 当前所有网段（设置面板里展示）
   const [statusOpen, setStatusOpen] = useState(false); // 在线/隐身下拉
+  // 打开设置面板时拉一次本机网段，用于诊断「VPN 导致多网段、互相发现不到」
+  useEffect(() => {
+    if (!setOpen) return;
+    invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([]));
+  }, [setOpen]);
   // 点击空白 / Esc 关闭在线状态下拉
   useEffect(() => {
     if (!statusOpen) return;
@@ -254,6 +273,81 @@ export default function LanShare() {
       /* 复制失败静默 */
     }
     setMsgMenu(null);
+  };
+
+  // 设备右键菜单（备注 / 清空记录 / 置顶）
+  const [peerMenu, setPeerMenu] = useState<{ x: number; y: number; fp: string } | null>(null);
+  useEffect(() => {
+    if (!peerMenu) return;
+    const close = () => setPeerMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setPeerMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [peerMenu]);
+
+  // 修改备注弹框
+  const [remarkEdit, setRemarkEdit] = useState<{ fp: string; value: string } | null>(null);
+  useEscToClose(!!remarkEdit, () => setRemarkEdit(null));
+  const saveRemark = () => {
+    if (remarkEdit) setRemark(remarkEdit.fp, remarkEdit.value);
+    setRemarkEdit(null);
+  };
+
+  // 置顶设备拖拽排序：指针拖拽 + 跟随鼠标的浮层（与设置卡片排序一致）。仅置顶设备可拖。
+  const [peerDrag, setPeerDrag] = useState<{ fp: string; x: number; y: number } | null>(null);
+  const peerDragRef = useRef<{
+    fp: string;
+    startX: number;
+    startY: number;
+    active: boolean;
+    pointerId: number;
+  } | null>(null);
+  const suppressPeerClick = useRef(false); // 拖拽结束后吞掉随之而来的 click，避免误选中
+  const startPeerDrag = (e: React.PointerEvent, p: Peer) => {
+    if (!p.pinned || e.button !== 0) return; // 仅置顶设备可拖动排序
+    peerDragRef.current = {
+      fp: p.fingerprint,
+      startX: e.clientX,
+      startY: e.clientY,
+      active: false,
+      pointerId: e.pointerId,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const movePeerDrag = (e: React.PointerEvent) => {
+    const d = peerDragRef.current;
+    if (!d) return;
+    if (!d.active && Math.abs(e.clientX - d.startX) < 5 && Math.abs(e.clientY - d.startY) < 5)
+      return;
+    d.active = true;
+    setPeerDrag({ fp: d.fp, x: e.clientX, y: e.clientY });
+    const overFp = (
+      document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
+    )?.closest<HTMLElement>("[data-peer-fp]")?.dataset.peerFp;
+    // 仅在悬停到「另一台置顶设备」上时换位
+    if (overFp && overFp !== d.fp && peers.find((p) => p.fingerprint === overFp)?.pinned)
+      reorderPins(d.fp, overFp);
+  };
+  const endPeerDrag = (e: React.PointerEvent) => {
+    const d = peerDragRef.current;
+    if (d) {
+      if (d.active) suppressPeerClick.current = true; // 这次是拖拽，别触发选中
+      try {
+        e.currentTarget.releasePointerCapture(d.pointerId);
+      } catch {
+        /* 捕获可能已释放 */
+      }
+    }
+    peerDragRef.current = null;
+    setPeerDrag(null);
   };
 
   // 刷新设备列表：点击时图标转起来，至少转 0.6s 让动效可见
@@ -558,16 +652,38 @@ export default function LanShare() {
           {peers.map((p) => (
             <button
               key={p.fingerprint}
+              data-peer-fp={p.fingerprint}
               className={`lan-peer${selected === p.fingerprint ? " active" : ""}${
                 p.online === false ? " offline" : ""
-              }`}
-              onClick={() => setSelected(p.fingerprint)}
+              }${p.pinned ? " pinned" : ""}${peerDrag?.fp === p.fingerprint ? " dragging" : ""}`}
+              onClick={() => {
+                if (suppressPeerClick.current) {
+                  suppressPeerClick.current = false;
+                  return;
+                }
+                setSelected(p.fingerprint);
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setPeerMenu({ x: e.clientX, y: e.clientY, fp: p.fingerprint });
+              }}
+              onPointerDown={(e) => startPeerDrag(e, p)}
+              onPointerMove={movePeerDrag}
+              onPointerUp={endPeerDrag}
+              onPointerCancel={endPeerDrag}
+              title={p.pinned ? "拖拽可调整置顶顺序" : undefined}
             >
+              {p.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
               <span className="lan-peer-icon">{deviceIcon(p)}</span>
               <span className="lan-peer-info">
-                <span className="lan-peer-alias">{p.alias}</span>
+                <span className="lan-peer-alias">{p.remark || p.alias}</span>
                 <span className="lan-peer-sub dim">
-                  {p.online === false ? "离线 · 仅查看记录" : `${p.ip} ${p.isBaibao ? "· 百宝箱" : "· LocalSend"}`}
+                  {p.remark
+                    ? p.alias
+                    : p.online === false
+                    ? "离线 · 仅查看记录"
+                    : `${p.ip} ${p.isBaibao ? "· 百宝箱" : "· LocalSend"}`}
                 </span>
               </span>
               {unread[p.fingerprint] > 0 && <span className="lan-badge">{unread[p.fingerprint]}</span>}
@@ -585,8 +701,9 @@ export default function LanShare() {
           ) : (
             <>
               <div className="lan-chat-head">
-                <b>{selectedPeer.alias}</b>
-                <span className="dim">{selectedPeer.ip}</span>
+                {selectedPeer.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
+                <b>{selectedPeer.remark || selectedPeer.alias}</b>
+                <span className="dim">{selectedPeer.remark ? selectedPeer.alias : selectedPeer.ip}</span>
               </div>
 
               <div className="lan-chat" ref={chatRef} onScroll={onChatScroll}>
@@ -616,7 +733,7 @@ export default function LanShare() {
                     ref={taRef}
                     className="lan-input"
                     rows={1}
-                    placeholder={`给 ${selectedPeer.alias} 发消息…（Enter 发送，Shift+Enter 换行）`}
+                    placeholder={`给 ${selectedPeer.remark || selectedPeer.alias} 发消息…（Enter 发送，Shift+Enter 换行）`}
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
                     onKeyDown={(e) => {
@@ -679,9 +796,102 @@ export default function LanShare() {
           document.body
         )}
 
+      {/* 设备右键菜单：修改备注 / 清空聊天记录 / 置顶 */}
+      {peerMenu &&
+        createPortal(
+          (() => {
+            const p = peers.find((x) => x.fingerprint === peerMenu.fp);
+            return (
+              <div
+                className="tab-menu"
+                style={{ left: peerMenu.x, top: peerMenu.y }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <button
+                  className="tab-menu-item"
+                  onClick={() => {
+                    setRemarkEdit({ fp: peerMenu.fp, value: p?.remark ?? "" });
+                    setPeerMenu(null);
+                  }}
+                >
+                  修改备注
+                </button>
+                <button
+                  className="tab-menu-item"
+                  onClick={() => {
+                    togglePin(peerMenu.fp);
+                    setPeerMenu(null);
+                  }}
+                >
+                  {p?.pinned ? "取消置顶" : "置顶"}
+                </button>
+                <button
+                  className="tab-menu-item danger"
+                  onClick={() => {
+                    clearChat(peerMenu.fp);
+                    setPeerMenu(null);
+                  }}
+                >
+                  清空聊天记录
+                </button>
+              </div>
+            );
+          })(),
+          document.body
+        )}
+
+      {/* 置顶设备拖拽时跟随鼠标的浮层 */}
+      {peerDrag &&
+        createPortal(
+          (() => {
+            const p = peers.find((x) => x.fingerprint === peerDrag.fp);
+            return p ? (
+              <div
+                className="lan-peer-ghost"
+                style={{ left: peerDrag.x + 12, top: peerDrag.y + 8 }}
+              >
+                <span className="lan-peer-pin">📌</span>
+                <span className="lan-peer-icon">{deviceIcon(p)}</span>
+                <span className="lan-peer-alias">{p.remark || p.alias}</span>
+              </div>
+            ) : null;
+          })(),
+          document.body
+        )}
+
+      {/* 修改备注弹框 */}
+      {remarkEdit &&
+        createPortal(
+          <div className="modal-overlay">
+            <div className="modal" style={{ width: "min(380px, 90%)" }}>
+              <div className="modal-head">
+                <h3>修改备注</h3>
+                <button className="modal-close" onClick={() => setRemarkEdit(null)}>×</button>
+              </div>
+              <div className="dim" style={{ fontSize: 12 }}>
+                设置该设备的备注名（留空则恢复显示对方原始名称）。
+              </div>
+              <input
+                className="kv-input"
+                style={{ width: "100%", marginTop: 10 }}
+                placeholder={peers.find((x) => x.fingerprint === remarkEdit.fp)?.alias ?? "备注名"}
+                value={remarkEdit.value}
+                autoFocus
+                onChange={(e) => setRemarkEdit((r) => (r ? { ...r, value: e.target.value } : r))}
+                onKeyDown={(e) => e.key === "Enter" && saveRemark()}
+              />
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={() => setRemarkEdit(null)}>取消</button>
+                <button className="btn btn-primary" onClick={saveRemark}>保存</button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
       {setOpen && (
-        <div className="modal-overlay" onClick={() => setSetOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-overlay">
+          <div className="modal">
             <div className="modal-head">
               <h3>局域网互传设置</h3>
               <button className="modal-close" onClick={() => setSetOpen(false)}>×</button>
@@ -713,6 +923,39 @@ export default function LanShare() {
               <span className="settings-field-val dim" title={me?.downloadDir}>{me?.downloadDir}</span>
               <button className="btn btn-ghost btn-sm" onClick={pickDir}>更改</button>
             </div>
+            <div className="lan-netifaces">
+              <div className="lan-netifaces-head">
+                <span>当前网段（{ifaces.length}）</span>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() =>
+                    invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([]))
+                  }
+                >
+                  刷新
+                </button>
+              </div>
+              {ifaces.length === 0 ? (
+                <div className="dim" style={{ fontSize: 12 }}>未检测到可用网段</div>
+              ) : (
+                <ul className="lan-netifaces-list">
+                  {ifaces.map((nf) => (
+                    <li key={`${nf.name}-${nf.ip}`} className="lan-netiface">
+                      <span className="lan-netiface-cidr">{nf.cidr}</span>
+                      <span className="lan-netiface-meta dim">
+                        {nf.name} · {nf.ip}
+                      </span>
+                      {nf.isVpn && <span className="lan-netiface-tag">VPN</span>}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {ifaces.filter((n) => !n.isVpn).length > 1 && (
+                <div className="lan-netifaces-tip dim">
+                  检测到多个真实网段：两台设备只有处于同一网段才能自动发现。若开了 VPN，可临时关闭，或用「+ IP」手动添加对方。
+                </div>
+              )}
+            </div>
             <div className="modal-actions">
               <button className="btn btn-primary" onClick={() => setSetOpen(false)}>完成</button>
             </div>
@@ -721,9 +964,12 @@ export default function LanShare() {
       )}
 
       {addOpen && (
-        <div className="modal-overlay" onClick={() => setAddOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>按 IP 添加设备</h3>
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-head">
+              <h3>按 IP 添加设备</h3>
+              <button className="modal-close" onClick={() => setAddOpen(false)}>×</button>
+            </div>
             <div className="dim" style={{ fontSize: 12 }}>
               多播被网络隔离时使用。输入对方本机 IP（端口默认 {me?.port ?? 53317}）。
             </div>

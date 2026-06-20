@@ -39,7 +39,8 @@
       "icons/icon.png"
     ],
     "macOS": {
-      "minimumSystemVersion": "10.15"
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "Apple Development: 悦东 郭 (26T8PAG372)"
     }
   }
 }

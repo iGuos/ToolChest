@@ -35,6 +35,8 @@ export interface Peer {
   isBaibao: boolean;
   lastSeenMs: number;
   online?: boolean; // 合并历史已知设备后：当前是否在线（用于展示离线设备的历史记录）
+  remark?: string; // 备注名（仅 UI 派生，按 fingerprint 单独持久化）
+  pinned?: boolean; // 是否置顶（仅 UI 派生）
 }
 export interface FileMeta {
   id: string;
@@ -108,6 +110,10 @@ interface LanCtxValue {
   sendFiles: (fp: string, paths?: string[]) => Promise<void>;
   cancelTransfer: (sessionId: string) => Promise<void>;
   cancelSend: (fileId: string) => void;
+  setRemark: (fp: string, remark: string) => void; // 设置/清除设备备注（空字符串=清除）
+  clearChat: (fp: string) => void; // 清空与某设备的全部聊天/传输记录
+  togglePin: (fp: string) => void; // 置顶/取消置顶
+  reorderPins: (fromFp: string, toFp: string) => void; // 拖拽调整置顶设备顺序
   setAlias: (alias: string) => Promise<void>;
   setCompat: (enabled: boolean) => Promise<void>;
   setInvisible: (enabled: boolean) => Promise<void>;
@@ -130,7 +136,26 @@ const fileKey = (dir: string, sid: string, fid: string) => `${dir}:${sid}:${fid}
 // ── 历史记录持久化（按设备唯一 ID = fingerprint 关联，改名也不丢）──
 const LS_ITEMS = "baibao.lan.items.v1";
 const LS_PEERS = "baibao.lan.knownpeers.v1";
+const LS_REMARKS = "baibao.lan.remarks.v1"; // fingerprint -> 备注名
+const LS_PINS = "baibao.lan.pins.v1"; // 置顶设备的有序 fingerprint 列表
 const HISTORY_CAP = 3000; // 最多保留多少条记录，避免无限增长
+
+function loadRemarks(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(LS_REMARKS);
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+function loadPins(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_PINS);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
 
 function loadItems(): ChatItem[] {
   try {
@@ -162,6 +187,8 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const [livePeers, setLivePeers] = useState<Peer[]>([]); // 当前在线发现到的设备
   const [knownPeers, setKnownPeers] = useState<Record<string, Peer>>(loadKnownPeers); // 历史已知设备（持久化）
   const [items, setItems] = useState<ChatItem[]>(loadItems);
+  const [remarks, setRemarks] = useState<Record<string, string>>(loadRemarks); // 备注（持久化）
+  const [pins, setPins] = useState<string[]>(loadPins); // 置顶设备有序列表（持久化）
   const [confirm, setConfirm] = useState<Incoming | null>(null);
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [selected, setSelectedRaw] = useState<string | null>(null);
@@ -173,15 +200,26 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const batchBaseRef = useRef<Record<string, number>>({}); // batch -> 基准时间戳，配合 order 保证接收顺序=发送顺序
 
   // 设备列表 = 在线发现 + 历史已知（离线）。按 fingerprint 去重，online 标记是否在线。
+  // 排序：置顶设备在最前（按 pins 自定义顺序），其余按「在线优先 + 最近活跃」。
+  // 备注/置顶按 fingerprint 单独维护，附加到派生出的 Peer 上（不写回 knownPeers）。
   const peers = useMemo<Peer[]>(() => {
     const map = new Map<string, Peer>();
     for (const fp of Object.keys(knownPeers)) map.set(fp, { ...knownPeers[fp], online: false });
     for (const p of livePeers) map.set(p.fingerprint, { ...p, online: true });
-    return [...map.values()].sort(
-      (a, b) =>
-        Number(!!b.online) - Number(!!a.online) || (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)
-    );
-  }, [livePeers, knownPeers]);
+    const pinIndex = new Map(pins.map((fp, i) => [fp, i]));
+    const arr = [...map.values()].map((p) => ({
+      ...p,
+      remark: remarks[p.fingerprint] || undefined,
+      pinned: pinIndex.has(p.fingerprint),
+    }));
+    return arr.sort((a, b) => {
+      const ai = pinIndex.get(a.fingerprint);
+      const bi = pinIndex.get(b.fingerprint);
+      if (ai !== undefined && bi !== undefined) return ai - bi; // 都置顶 → 按自定义顺序
+      if ((ai !== undefined) !== (bi !== undefined)) return ai !== undefined ? -1 : 1; // 置顶在前
+      return Number(!!b.online) - Number(!!a.online) || (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0);
+    });
+  }, [livePeers, knownPeers, remarks, pins]);
 
   // 在线设备并入历史已知表（保留最新 alias/ip；改名后历史仍按 fingerprint 关联）
   useEffect(() => {
@@ -208,6 +246,20 @@ export function LanProvider({ children }: { children: ReactNode }) {
       /* ignore */
     }
   }, [knownPeers]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_REMARKS, JSON.stringify(remarks));
+    } catch {
+      /* ignore */
+    }
+  }, [remarks]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_PINS, JSON.stringify(pins));
+    } catch {
+      /* ignore */
+    }
+  }, [pins]);
   useEffect(() => {
     const t = window.setTimeout(() => {
       try {
@@ -702,6 +754,42 @@ export function LanProvider({ children }: { children: ReactNode }) {
     []
   );
 
+  // 设备备注：空字符串=清除，恢复显示对方原始名称
+  const setRemark = useCallback((fp: string, remark: string) => {
+    const r = remark.trim();
+    setRemarks((m) => {
+      if (r === (m[fp] ?? "")) return m;
+      const next = { ...m };
+      if (r) next[fp] = r;
+      else delete next[fp];
+      return next;
+    });
+  }, []);
+
+  // 清空与某设备的全部聊天/传输记录
+  const clearChat = useCallback((fp: string) => {
+    setItems((l) => l.filter((x) => x.fingerprint !== fp));
+    setUnread((u) => (u[fp] ? { ...u, [fp]: 0 } : u));
+  }, []);
+
+  // 置顶/取消置顶：新置顶的追加到置顶区末尾
+  const togglePin = useCallback((fp: string) => {
+    setPins((ps) => (ps.includes(fp) ? ps.filter((x) => x !== fp) : [...ps, fp]));
+  }, []);
+
+  // 拖拽调整置顶设备顺序：把 fromFp 移动到 toFp 所在位置
+  const reorderPins = useCallback((fromFp: string, toFp: string) => {
+    setPins((ps) => {
+      const from = ps.indexOf(fromFp);
+      const to = ps.indexOf(toFp);
+      if (from < 0 || to < 0 || from === to) return ps;
+      const next = [...ps];
+      next.splice(from, 1);
+      next.splice(to, 0, fromFp);
+      return next;
+    });
+  }, []);
+
   const setAlias = useCallback(async (alias: string) => {
     const a = alias.trim();
     if (!a) return;
@@ -750,7 +838,9 @@ export function LanProvider({ children }: { children: ReactNode }) {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
-    sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend, setAlias, setCompat, setInvisible, pickDir, addPeerByIp,
+    sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend,
+    setRemark, clearChat, togglePin, reorderPins,
+    setAlias, setCompat, setInvisible, pickDir, addPeerByIp,
   };
 
   return <LanCtx.Provider value={value}>{children}</LanCtx.Provider>;

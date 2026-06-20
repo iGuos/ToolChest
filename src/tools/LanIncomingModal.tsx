@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useLan } from "./lanContext";
+import { useEscToClose } from "../hooks";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -36,6 +37,9 @@ export default function LanIncomingModal() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incoming]);
 
+  // Esc 关闭（保留待接收），遮罩点击不再关闭
+  useEscToClose(!!incoming, dismissConfirm);
+
   if (!incoming) return null;
 
   const toggle = (id: string) =>
@@ -52,8 +56,8 @@ export default function LanIncomingModal() {
   const pickedTotal = pickedFiles.reduce((a, f) => a + f.size, 0);
 
   return (
-    <div className="modal-overlay" onClick={dismissConfirm}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay">
+      <div className="modal">
         <div className="modal-head">
           <h3>收到文件请求</h3>
           <button className="modal-close" title="关闭（保留待接收）" onClick={dismissConfirm}>

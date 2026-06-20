@@ -11,18 +11,19 @@ export default function TrustApp() {
   const zoneRef = useRef<HTMLDivElement>(null);
 
   const appName = path ? path.split("/").filter(Boolean).pop() ?? path : "";
+  // 与后端 trust_app 实际执行的命令保持一致（以管理员权限运行），供用户核对
+  const command = path
+    ? `sudo xattr -dr com.apple.quarantine "${path}"`
+    : "";
 
-  // 拖拽事件是整个 webview 全局的：用包围盒把它限定在本工具可见的投放区内，
-  // 顺带过滤掉非激活（隐藏，rect 为 0）的本组件实例。坐标是物理像素，需除以 DPR。
-  const inZone = useCallback((pos: { x: number; y: number }) => {
+  // 拖拽事件是整个 webview 全局的（所有已打开 tab 的组件都在监听）。这里不再做坐标命中判断
+  // （坐标系/DPR/偏移容易在边缘出错，导致左侧等区域失效），而是只在「本工具是当前可见 tab」时接收：
+  // 非激活 tab 是 display:none → 尺寸为 0，据此过滤；可见时整页任意位置都可投放。
+  const isViewVisible = useCallback(() => {
     const el = zoneRef.current;
     if (!el) return false;
     const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) return false;
-    const dpr = window.devicePixelRatio || 1;
-    const x = pos.x / dpr;
-    const y = pos.y / dpr;
-    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    return r.width > 0 && r.height > 0;
   }, []);
 
   const setApp = useCallback((p: string) => {
@@ -39,10 +40,10 @@ export default function TrustApp() {
     const un = getCurrentWebview().onDragDropEvent((event) => {
       const pl = event.payload;
       if (pl.type === "over") {
-        setOver(inZone(pl.position));
+        setOver(isViewVisible());
       } else if (pl.type === "drop") {
         setOver(false);
-        if (!inZone(pl.position)) return;
+        if (!isViewVisible()) return; // 非当前可见 tab 不接收
         const app =
           pl.paths.find((p) => p.toLowerCase().endsWith(".app")) ?? pl.paths[0];
         if (app) setApp(app);
@@ -53,7 +54,7 @@ export default function TrustApp() {
     return () => {
       un.then((u) => u());
     };
-  }, [inZone, setApp]);
+  }, [isViewVisible, setApp]);
 
   const pick = async () => {
     setError(null);
@@ -87,7 +88,7 @@ export default function TrustApp() {
   };
 
   return (
-    <div className="tool-container">
+    <div className="tool-container" ref={zoneRef}>
       <div className="tool-header">
         <h2>Mac 应用授权</h2>
       </div>
@@ -97,7 +98,6 @@ export default function TrustApp() {
 
       <div className="trust-body">
         <div
-          ref={zoneRef}
           className={`drop-zone${over ? " over" : ""}${path ? " filled" : ""}`}
           onClick={pick}
           title="点击选择，或将 App 拖拽到此处"
@@ -116,6 +116,19 @@ export default function TrustApp() {
               <div className="drop-hint">或点击，从「应用程序」中选择 .app</div>
             </>
           )}
+        </div>
+
+        <div className="trust-command">
+          <label className="trust-command-label dim">将执行的命令</label>
+          <input
+            className="trust-command-input"
+            type="text"
+            readOnly
+            value={command}
+            placeholder="选择 App 后，这里显示将要执行的命令"
+            title={command || undefined}
+            onFocus={(e) => e.currentTarget.select()}
+          />
         </div>
 
         <div className="trust-actions">
