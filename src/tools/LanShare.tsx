@@ -679,121 +679,116 @@ export default function LanShare() {
           document.body
         )}
 
-      {/* 全局上传任务面板：关闭共享浏览弹框后仍可见,可看进度/中断,可最小化 */}
-      {Object.keys(uploadTasks).length > 0 &&
-        uploadsMin &&
+      {/* 全局任务面板：接收(上)+上传(下)同在右下角竖向堆叠；关闭共享弹框后仍可见 */}
+      {(Object.keys(recvTasks).length > 0 || Object.keys(uploadTasks).length > 0) &&
         createPortal(
-          <button className="upload-tasks-pill" onClick={() => setUploadsMin(false)}>
-            上传任务 {Object.keys(uploadTasks).length} ▴
-          </button>,
-          document.body
-        )}
-      {Object.keys(uploadTasks).length > 0 &&
-        !uploadsMin &&
-        createPortal(
-          <div className="upload-tasks">
-            <div className="upload-tasks-head">
-              <span className="upload-tasks-title dim">上传任务</span>
-              <button className="lan-toast-x" title="最小化" onClick={() => setUploadsMin(true)}>—</button>
-            </div>
-            {Object.values(uploadTasks).map((t) => {
-              const active = t.phase === "upload" || t.phase === "zip";
-              // 尺寸未知（刚开始）才用不确定动画；有总量则显示真实百分比（含打包阶段）
-              const indeterminate = active && t.size === 0;
-              const pct = t.size ? Math.min(100, (t.transferred / t.size) * 100) : 0;
-              const statusText =
-                t.phase === "done"
-                  ? "已完成"
-                  : t.phase === "cancelled"
-                  ? "已取消"
-                  : t.phase === "error"
-                  ? t.error || "失败"
-                  : t.size === 0
-                  ? t.phase === "zip"
-                    ? "打包中…"
-                    : "准备中…"
-                  : `${t.phase === "zip" ? "打包中 " : ""}${fmtBytes(t.transferred)} / ${fmtBytes(t.size)} · ${Math.round(pct)}%`;
-              return (
-                <div key={t.id} className="upload-task">
-                  <div className="upload-task-row">
-                    <span className="upload-task-name" title={t.name}>{t.name}</span>
-                    {active ? (
-                      <button className="lan-toast-x" title="中断" onClick={() => cancelUpload(t.id)}>×</button>
-                    ) : (
-                      <>
-                        {t.phase === "error" && (
-                          <button className="upload-task-resume" title="从断点继续上传" onClick={() => resumeUpload(t.id)}>继续</button>
-                        )}
-                        <button className="lan-toast-x" title="移除" onClick={() => dismissUpload(t.id)}>×</button>
-                      </>
-                    )}
+          <div className="lan-task-stack">
+            {/* 接收任务（接收方）：显示进度、可拒绝、可最小化、无「继续」 */}
+            {Object.keys(recvTasks).length > 0 &&
+              (recvMin ? (
+                <button className="upload-tasks-pill" onClick={() => setRecvMin(false)}>
+                  接收任务 {Object.keys(recvTasks).length} ▴
+                </button>
+              ) : (
+                <div className="upload-tasks">
+                  <div className="upload-tasks-head">
+                    <span className="upload-tasks-title dim">接收任务</span>
+                    <button className="lan-toast-x" title="最小化" onClick={() => setRecvMin(true)}>—</button>
                   </div>
-                  <span className="upload-task-bar">
-                    <span
-                      className={indeterminate ? "indet" : ""}
-                      style={{
-                        width: indeterminate ? "100%" : `${pct}%`,
-                        background: t.phase === "error" ? "var(--red-h, #ff6b6b)" : undefined,
-                      }}
-                    />
-                  </span>
-                  <span className="dim upload-task-text">{statusText}</span>
+                  {Object.values(recvTasks).map((t) => {
+                    const active = t.phase === "recv" || t.phase === "extract";
+                    const indeterminate = active && t.total === 0;
+                    const pct = t.total ? Math.min(100, (t.received / t.total) * 100) : 0;
+                    const statusText =
+                      t.phase === "done"
+                        ? "已完成"
+                        : t.phase === "rejected"
+                        ? "已拒绝"
+                        : t.phase === "extract"
+                        ? "正在解压…"
+                        : t.total === 0
+                        ? "接收中…"
+                        : `${fmtBytes(t.received)} / ${fmtBytes(t.total)} · ${Math.round(pct)}%`;
+                    return (
+                      <div key={t.token} className="upload-task">
+                        <div className="upload-task-row">
+                          <span className="upload-task-name" title={t.name}>{t.name}</span>
+                          {active && (
+                            <button className="upload-task-reject" title="拒绝接收" onClick={() => rejectReceive(t.token)}>拒绝</button>
+                          )}
+                        </div>
+                        <span className="upload-task-bar">
+                          <span
+                            className={indeterminate ? "indet" : ""}
+                            style={{ width: indeterminate ? "100%" : `${pct}%` }}
+                          />
+                        </span>
+                        <span className="dim upload-task-text">{statusText}</span>
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
-          </div>,
-          document.body
-        )}
+              ))}
 
-      {/* 全局接收任务面板（接收方）：别人上传到本机时显示进度,可拒绝,可最小化,无「继续」 */}
-      {Object.keys(recvTasks).length > 0 &&
-        recvMin &&
-        createPortal(
-          <button className="upload-tasks-pill recv-tasks-pill" onClick={() => setRecvMin(false)}>
-            接收任务 {Object.keys(recvTasks).length} ▴
-          </button>,
-          document.body
-        )}
-      {Object.keys(recvTasks).length > 0 &&
-        !recvMin &&
-        createPortal(
-          <div className="upload-tasks recv-tasks">
-            <div className="upload-tasks-head">
-              <span className="upload-tasks-title dim">接收任务</span>
-              <button className="lan-toast-x" title="最小化" onClick={() => setRecvMin(true)}>—</button>
-            </div>
-            {Object.values(recvTasks).map((t) => {
-              const active = t.phase === "recv" || t.phase === "extract";
-              const indeterminate = active && t.total === 0;
-              const pct = t.total ? Math.min(100, (t.received / t.total) * 100) : 0;
-              const statusText =
-                t.phase === "done"
-                  ? "已完成"
-                  : t.phase === "rejected"
-                  ? "已拒绝"
-                  : t.phase === "extract"
-                  ? "正在解压…"
-                  : t.total === 0
-                  ? "接收中…"
-                  : `${fmtBytes(t.received)} / ${fmtBytes(t.total)} · ${Math.round(pct)}%`;
-              return (
-                <div key={t.token} className="upload-task">
-                  <div className="upload-task-row">
-                    <span className="upload-task-name" title={t.name}>{t.name}</span>
-                    {active && (
-                      <button className="upload-task-reject" title="拒绝接收" onClick={() => rejectReceive(t.token)}>拒绝</button>
-                    )}
+            {/* 上传任务（发送方）：进度/中断/继续/移除，可最小化 */}
+            {Object.keys(uploadTasks).length > 0 &&
+              (uploadsMin ? (
+                <button className="upload-tasks-pill" onClick={() => setUploadsMin(false)}>
+                  上传任务 {Object.keys(uploadTasks).length} ▴
+                </button>
+              ) : (
+                <div className="upload-tasks">
+                  <div className="upload-tasks-head">
+                    <span className="upload-tasks-title dim">上传任务</span>
+                    <button className="lan-toast-x" title="最小化" onClick={() => setUploadsMin(true)}>—</button>
                   </div>
-                  <span className="upload-task-bar">
-                    <span
-                      className={indeterminate ? "indet" : ""}
-                      style={{ width: indeterminate ? "100%" : `${pct}%` }}
-                    />
-                  </span>
-                  <span className="dim upload-task-text">{statusText}</span>
+                  {Object.values(uploadTasks).map((t) => {
+                    const active = t.phase === "upload" || t.phase === "zip";
+                    // 尺寸未知（刚开始）才用不确定动画；有总量则显示真实百分比（含打包阶段）
+                    const indeterminate = active && t.size === 0;
+                    const pct = t.size ? Math.min(100, (t.transferred / t.size) * 100) : 0;
+                    const statusText =
+                      t.phase === "done"
+                        ? "已完成"
+                        : t.phase === "cancelled"
+                        ? "已取消"
+                        : t.phase === "error"
+                        ? t.error || "失败"
+                        : t.size === 0
+                        ? t.phase === "zip"
+                          ? "打包中…"
+                          : "准备中…"
+                        : `${t.phase === "zip" ? "打包中 " : ""}${fmtBytes(t.transferred)} / ${fmtBytes(t.size)} · ${Math.round(pct)}%`;
+                    return (
+                      <div key={t.id} className="upload-task">
+                        <div className="upload-task-row">
+                          <span className="upload-task-name" title={t.name}>{t.name}</span>
+                          {active ? (
+                            <button className="lan-toast-x" title="中断" onClick={() => cancelUpload(t.id)}>×</button>
+                          ) : (
+                            <>
+                              {t.phase === "error" && (
+                                <button className="upload-task-resume" title="从断点继续上传" onClick={() => resumeUpload(t.id)}>继续</button>
+                              )}
+                              <button className="lan-toast-x" title="移除" onClick={() => dismissUpload(t.id)}>×</button>
+                            </>
+                          )}
+                        </div>
+                        <span className="upload-task-bar">
+                          <span
+                            className={indeterminate ? "indet" : ""}
+                            style={{
+                              width: indeterminate ? "100%" : `${pct}%`,
+                              background: t.phase === "error" ? "var(--red-h, #ff6b6b)" : undefined,
+                            }}
+                          />
+                        </span>
+                        <span className="dim upload-task-text">{statusText}</span>
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
+              ))}
           </div>,
           document.body
         )}

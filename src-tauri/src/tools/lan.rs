@@ -2465,6 +2465,18 @@ fn probe_upload_offset(
     }
 }
 
+/// 等待 secs 秒，期间每 100ms 检查一次取消标志；被取消立即返回 false。
+fn wait_cancellable(secs: u64, cancel: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    for _ in 0..(secs * 10) {
+        if cancel.load(Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
 fn human_bytes(n: u64) -> String {
     const KB: f64 = 1024.0;
     let f = n as f64;
@@ -2585,24 +2597,42 @@ pub async fn lan_share_upload(
         let size = std::fs::metadata(&send_path).map_err(|e| format!("读取失败：{e}"))?.len();
         let total_s = size.to_string();
 
-        // 发送（带断点续传）：失败不立即放弃，自动重试 1 次（共 2 次尝试）。
-        // 重试时若探测到对方「拒绝」或「网络不通」，则判定中断、停止重试。
-        let mut attempt = 0u32;
+        // 发送（带断点续传）：失败不立即放弃。
+        // 规则：只要本次尝试相比开始时「有新数据送达对方」就算有进展、重置失败计数；
+        // 只有「连续 2 次毫无进展」才判定中断。每次重试前等待 1 秒（可被取消打断）。
+        const MAX_STALL_RETRIES: u32 = 2; // 连续无进展的最大重试次数
+        const RETRY_WAIT_SECS: u64 = 1;
+        let mut stalls = 0u32; // 连续无进展次数
         let outcome: Result<(), String> = loop {
-            // 每次尝试前先探测对方已收字节，从断点继续（旧版/连不上 → 从 0 开始仍尝试发送）
-            let already: u64 = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
+            if cancel.load(Relaxed) {
+                break Err("cancelled".to_string());
+            }
+            // 1) 探测对方已收字节，作为本次断点 + 进展基准
+            let before: u64 = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
                 OffsetProbe::Bytes(n) => n.min(size),
                 OffsetProbe::Rejected => break Err("上传已停止：对方拒绝接收。".to_string()),
-                _ => 0,
+                OffsetProbe::Unreachable => {
+                    // 连不上：直接计一次无进展，避免白等 8 秒连接超时
+                    stalls += 1;
+                    if stalls >= MAX_STALL_RETRIES {
+                        break Err("上传中断：与对方网络连接已断开，请检查网络后点「继续」重试。".to_string());
+                    }
+                    if !wait_cancellable(RETRY_WAIT_SECS, &cancel) {
+                        break Err("cancelled".to_string());
+                    }
+                    continue;
+                }
+                OffsetProbe::Unsupported => 0, // 旧版无 offset 接口：从 0 起发，靠失败分类兜底
             };
 
+            // 2) 打开 + 定位到断点 + 发送
             let mut f = match File::open(&send_path) {
                 Ok(f) => f,
                 Err(e) => break Err(format!("打开失败：{e}")),
             };
-            if already > 0 {
+            if before > 0 {
                 use std::io::{Seek, SeekFrom};
-                if let Err(e) = f.seek(SeekFrom::Start(already)) {
+                if let Err(e) = f.seek(SeekFrom::Start(before)) {
                     break Err(format!("定位失败：{e}"));
                 }
             }
@@ -2611,13 +2641,13 @@ pub async fn lan_share_upload(
                 app: capp.clone(),
                 task_id: ctid.clone(),
                 name: cname.clone(),
-                sent: already,
+                sent: before,
                 size,
-                last_emit: already,
+                last_emit: before,
                 cancel: cancel.clone(),
             };
-            let body = reqwest::blocking::Body::sized(reader, size - already);
-            let offset_s = already.to_string();
+            let body = reqwest::blocking::Body::sized(reader, size - before);
+            let offset_s = before.to_string();
             let mut req = client
                 .post(format!("{base}/api/baibao/v1/{endpoint}"))
                 .query(&[
@@ -2633,38 +2663,47 @@ pub async fn lan_share_upload(
                 req = req.header("X-Share-Auth", a.clone());
             }
 
-            match req.send() {
-                Ok(resp) => break share_op_result(resp.status().as_u16()),
-                Err(_e) => {
-                    if cancel.load(Relaxed) {
-                        break Err("cancelled".to_string());
-                    }
-                    // 失败：向对方查一次，据此分类 + 决定是否重试
-                    match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
-                        OffsetProbe::Rejected => break Err("上传中断：对方拒绝接收。".to_string()),
-                        OffsetProbe::Unsupported => {
-                            break Err("上传中断：对方版本过旧、不保存已收数据，不支持断点续传，请让对方更新到最新版后重试。".to_string())
-                        }
-                        OffsetProbe::Unreachable => {
-                            if attempt == 0 {
-                                attempt += 1;
-                                continue; // 自动重试 1 次
-                            }
-                            break Err("上传中断：与对方网络连接已断开，请检查网络后点「继续」重试。".to_string());
-                        }
-                        OffsetProbe::Bytes(n) => {
-                            if attempt == 0 {
-                                attempt += 1;
-                                continue; // 自动重试 1 次（从断点续传）
-                            }
-                            break Err(format!(
-                                "上传中断：对方已收到 {} / {}，点「继续」可从断点续传。",
-                                human_bytes(n),
-                                human_bytes(size)
-                            ));
-                        }
-                    }
+            // 3) 成功（HTTP 拿到响应）→ 按状态码定结果
+            if let Ok(resp) = req.send() {
+                break share_op_result(resp.status().as_u16());
+            }
+            if cancel.load(Relaxed) {
+                break Err("cancelled".to_string());
+            }
+
+            // 4) 失败：再探测，判断本次相比开始时是否「有新数据送达」+ 分类
+            let (made_progress, fail_msg) = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
+                OffsetProbe::Rejected => break Err("上传中断：对方拒绝接收。".to_string()),
+                OffsetProbe::Unsupported => {
+                    break Err("上传中断：对方版本过旧、不保存已收数据，不支持断点续传，请让对方更新到最新版后重试。".to_string())
                 }
+                OffsetProbe::Unreachable => (
+                    false,
+                    "上传中断：与对方网络连接已断开，请检查网络后点「继续」重试。".to_string(),
+                ),
+                OffsetProbe::Bytes(after) => (
+                    after > before, // 有新字节送达对方 = 有进展
+                    format!(
+                        "上传中断：对方已收到 {} / {}，点「继续」可从断点续传。",
+                        human_bytes(after.min(size)),
+                        human_bytes(size)
+                    ),
+                ),
+            };
+
+            // 5) 有进展 → 重置失败计数；无进展 → 累加，连续 2 次无进展才判定中断
+            if made_progress {
+                stalls = 0;
+            } else {
+                stalls += 1;
+                if stalls >= MAX_STALL_RETRIES {
+                    break Err(fail_msg);
+                }
+            }
+
+            // 6) 等 1 秒再重试（可被取消打断）
+            if !wait_cancellable(RETRY_WAIT_SECS, &cancel) {
+                break Err("cancelled".to_string());
             }
         };
 

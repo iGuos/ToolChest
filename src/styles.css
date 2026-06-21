@@ -327,13 +327,21 @@ select { cursor: pointer; }
   background: var(--accent, #1f6feb);
 }
 /* 全局上传任务面板（右下角浮层，关闭共享弹框后仍可见） */
-.upload-tasks {
+/* 右下角任务堆叠容器：接收(上)+上传(下)竖向并排 */
+.lan-task-stack {
   position: fixed;
   right: 16px;
   bottom: 16px;
   z-index: 2500;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-height: calc(100vh - 32px);
+}
+.upload-tasks {
   width: 300px;
-  max-height: 50vh;
+  max-height: 42vh;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -355,10 +363,6 @@ select { cursor: pointer; }
   font-weight: 600;
 }
 .upload-tasks-pill {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  z-index: 2500;
   padding: 7px 12px;
   font-size: 12px;
   color: var(--text);
@@ -370,15 +374,6 @@ select { cursor: pointer; }
 }
 .upload-tasks-pill:hover {
   border-color: var(--accent);
-}
-/* 接收任务面板：放到左下角，与右下角的「上传任务」错开 */
-.upload-tasks.recv-tasks {
-  right: auto;
-  left: 16px;
-}
-.upload-tasks-pill.recv-tasks-pill {
-  right: auto;
-  left: 16px;
 }
 .upload-task-reject {
   flex: none;
