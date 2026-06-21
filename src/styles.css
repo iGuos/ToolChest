@@ -755,6 +755,11 @@ select { cursor: pointer; }
 .share-lock {
   font-size: 11px;
 }
+.share-nopw {
+  font-size: 11px;
+  color: var(--red-h, #ff6b6b);
+  white-space: nowrap;
+}
 /* 共享浏览器内的居中弹框（密码/命名/删除/覆盖确认） */
 .share-subdialog {
   width: min(420px, 90%);
@@ -955,8 +960,33 @@ select { cursor: pointer; }
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
 }
 
+.device-code {
+  font-family: "Menlo", "Monaco", "Consolas", monospace;
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--accent);
+  user-select: all;
+}
+.dev-info {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+}
+.dev-info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.dev-info-row > .dim {
+  flex: none;
+  width: 56px;
+}
 .tab-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 9px;
   width: 100%;
   padding: 6px 10px;
   text-align: left;
@@ -967,7 +997,12 @@ select { cursor: pointer; }
   font-size: 13px;
   cursor: pointer;
 }
+.tab-menu-item .menu-ico {
+  flex: none;
+  opacity: 0.75;
+}
 .tab-menu-item:hover:not(:disabled) { background: var(--bg-hover); }
+.tab-menu-item:hover:not(:disabled) .menu-ico { opacity: 1; }
 .tab-menu-item:disabled { opacity: 0.4; cursor: not-allowed; }
 .tab-menu-item.danger { color: var(--red); }
 

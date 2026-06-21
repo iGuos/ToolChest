@@ -28,6 +28,43 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+// 右键菜单图标（Feather 风格描边，随主题色 currentColor）
+function MenuIcon({ d }: { d: string }) {
+  return (
+    <svg
+      className="menu-ico"
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {d.split("|").map((p, i) => (
+        <path key={i} d={p} />
+      ))}
+    </svg>
+  );
+}
+const ICON = {
+  info: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20|M12 16v-4|M12 8h.01",
+  edit: "M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7|M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z",
+  folder: "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z",
+  pin: "M9 4h6|M10 4v5l-2.5 3h9L14 9V4|M12 12v8",
+  trash: "M3 6h18|M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2|M10 11v6|M14 11v6",
+};
+
+// 「设备码」：由设备身份(=证书指纹)派生的短码，用于人工核对、识破同名冒充。
+// 同名但不同证书的设备此码必然不同；两台设备各看一眼、核对一致即为同一台真设备。
+function deviceCode(fp: string | undefined): string {
+  const hex = (fp || "").replace(/[^0-9a-fA-F]/g, "").toUpperCase().slice(0, 12);
+  if (hex.length < 12) return hex || "—";
+  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}`;
+}
+
 function fmtTime(ts: number): string {
   const d = new Date(ts);
   const now = new Date();
@@ -401,6 +438,8 @@ export default function LanShare() {
   // 修改备注弹框
   const [remarkEdit, setRemarkEdit] = useState<{ fp: string; value: string } | null>(null);
   useEscToClose(!!remarkEdit, () => setRemarkEdit(null));
+  const [infoView, setInfoView] = useState<string | null>(null); // 设备信息弹框（存 fingerprint）
+  useEscToClose(!!infoView, () => setInfoView(null));
   const saveRemark = () => {
     if (remarkEdit) setRemark(remarkEdit.fp, remarkEdit.value);
     setRemarkEdit(null);
@@ -1010,10 +1049,21 @@ export default function LanShare() {
                 <button
                   className="tab-menu-item"
                   onClick={() => {
+                    setInfoView(peerMenu.fp);
+                    setPeerMenu(null);
+                  }}
+                >
+                  <MenuIcon d={ICON.info} />
+                  设备信息
+                </button>
+                <button
+                  className="tab-menu-item"
+                  onClick={() => {
                     setRemarkEdit({ fp: peerMenu.fp, value: p?.remark ?? "" });
                     setPeerMenu(null);
                   }}
                 >
+                  <MenuIcon d={ICON.edit} />
                   修改备注
                 </button>
                 {p?.online !== false && (p?.shares ?? 0) > 0 && (
@@ -1024,6 +1074,7 @@ export default function LanShare() {
                       setPeerMenu(null);
                     }}
                   >
+                    <MenuIcon d={ICON.folder} />
                     查看共享文件
                   </button>
                 )}
@@ -1034,6 +1085,7 @@ export default function LanShare() {
                     setPeerMenu(null);
                   }}
                 >
+                  <MenuIcon d={ICON.pin} />
                   {p?.pinned ? "取消置顶" : "置顶"}
                 </button>
                 <button
@@ -1043,6 +1095,7 @@ export default function LanShare() {
                     setPeerMenu(null);
                   }}
                 >
+                  <MenuIcon d={ICON.trash} />
                   清空聊天记录
                 </button>
               </div>
@@ -1147,6 +1200,50 @@ export default function LanShare() {
           document.body
         )}
 
+      {infoView &&
+        createPortal(
+          (() => {
+            const p = peers.find((x) => x.fingerprint === infoView);
+            return (
+              <div className="modal-overlay" onClick={() => setInfoView(null)}>
+                <div className="modal" style={{ width: "min(420px, 92%)" }} onClick={(e) => e.stopPropagation()}>
+                  <div className="modal-head">
+                    <h3>设备信息</h3>
+                    <button className="modal-close" onClick={() => setInfoView(null)}>×</button>
+                  </div>
+                  <div className="dev-info">
+                    <div className="dev-info-row">
+                      <span className="dim">名称</span>
+                      <span>{p?.remark || p?.alias || "未知设备"}</span>
+                    </div>
+                    <div className="dev-info-row">
+                      <span className="dim">状态</span>
+                      <span>{p?.online === false ? "离线" : "在线"}</span>
+                    </div>
+                    <div className="dev-info-row">
+                      <span className="dim">地址</span>
+                      <span className="mono">{p ? `${p.ip}:${p.port}` : "—"}</span>
+                    </div>
+                    <div className="dev-info-row">
+                      <span className="dim">设备码</span>
+                      <code className="device-code">{deviceCode(infoView)}</code>
+                    </div>
+                  </div>
+                  <div className="dim" style={{ fontSize: 12, marginTop: 12, lineHeight: 1.6 }}>
+                    设备码由对方证书派生、无法伪造。和对方核对「设备码」一致，即为同一台真设备，可识破“同名冒充”。
+                    本机设备码见「设置 → 基本」。
+                  </div>
+                  <div className="modal-actions">
+                    <button className="btn btn-ghost" onClick={() => copyMsg(infoView)}>复制完整指纹</button>
+                    <button className="btn btn-primary" onClick={() => setInfoView(null)}>关闭</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })(),
+          document.body
+        )}
+
       {setOpen && (
         <div className="modal-overlay">
           <div className="modal">
@@ -1167,6 +1264,12 @@ export default function LanShare() {
                   onBlur={() => aliasDraft.trim() && aliasDraft.trim() !== me?.alias && setAlias(aliasDraft)}
                   onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
                 />
+              </div>
+              <div className="settings-field">
+                <span title="本机身份码（由本机证书派生）。让对方核对：对方看到的「你的设备码」与此一致，才是真的你，可防同名冒充。">
+                  本机设备码
+                </span>
+                <code className="device-code">{deviceCode(me?.fingerprint)}</code>
               </div>
               <div className="settings-field">
                 <span>兼容 LocalSend（可与手机/电脑上的 LocalSend 互传）</span>
@@ -1206,7 +1309,9 @@ export default function LanShare() {
                         {s.locked ? (
                           <span className="share-lock" title="已设密码">🔒</span>
                         ) : (
-                          <span className="dim" style={{ fontSize: 11 }}>无密码</span>
+                          <span className="share-nopw" title="未设密码的共享不会对外提供（任何网络下都不安全），请点「改密码」设置后才会被共享">
+                            ⚠ 未设密码 · 不会被共享
+                          </span>
                         )}
                         <button
                           className="btn btn-ghost btn-sm"

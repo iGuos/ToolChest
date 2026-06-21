@@ -354,7 +354,7 @@ impl Default for Inner {
 }
 
 // ── 配置持久化（别名/指纹/兼容/接收目录）─────────────────────
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct LanConfig {
     alias: Option<String>,
@@ -385,11 +385,121 @@ fn config_path() -> Option<PathBuf> {
     }
 }
 
+/// TLS 证书文件路径（与 lan.json 同目录）：(cert.pem, key.pem, cert.fp)。
+fn cert_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let base = config_path()?.parent()?.to_path_buf();
+    Some((base.join("cert.pem"), base.join("key.pem"), base.join("cert.fp")))
+}
+
+/// 读取本机自签证书；不存在则用 rcgen 生成并持久化。返回 (cert_pem, key_pem, cert_fp)。
+/// cert_fp = sha256(证书 DER) 十六进制——对端只按这个指纹固定，不走链校验，故 SAN/CA 都无所谓。
+fn load_or_create_cert() -> Result<(String, String, String), String> {
+    let gen = || -> Result<(String, String, String), String> {
+        let params = rcgen::CertificateParams::new(vec!["baibao.local".to_string()])
+            .map_err(|e| format!("生成证书失败：{e}"))?;
+        let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("生成密钥失败：{e}"))?;
+        let cert = params.self_signed(&key_pair).map_err(|e| format!("自签失败：{e}"))?;
+        let fp = sha256_hex_bytes(cert.der().as_ref());
+        Ok((cert.pem(), key_pair.serialize_pem(), fp))
+    };
+    let Some((cp, kp, fpp)) = cert_paths() else {
+        return gen(); // 拿不到配置目录 → 临时证书（本次运行有效）
+    };
+    if let (Ok(c), Ok(k), Ok(f)) = (
+        std::fs::read_to_string(&cp),
+        std::fs::read_to_string(&kp),
+        std::fs::read_to_string(&fpp),
+    ) {
+        if !c.trim().is_empty() && !k.trim().is_empty() && !f.trim().is_empty() {
+            return Ok((c, k, f.trim().to_string()));
+        }
+    }
+    let (cert_pem, key_pem, fp) = gen()?;
+    if let Some(dir) = cp.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&cp, &cert_pem);
+    let _ = std::fs::write(&kp, &key_pem);
+    let _ = std::fs::write(&fpp, &fp);
+    Ok((cert_pem, key_pem, fp))
+}
+
+// ── 共享密码静态加密 ────────────────────────────────────────
+// lan.json 里不存明文密码：内存里仍是明文（显示/鉴权/自动生成都照常），
+// 仅在「写文件时加密、读文件时解密」。密钥从机器标识派生、不写进任何文件，
+// 因此把 lan.json 拷到别的机器/备份泄露都解不开。
+const PW_ENC_PREFIX: &str = "enc1:";
+
+/// 派生共享密码加密密钥：sha256("域分隔" || machine_id)。machine_id 取不到时退回固定串
+/// （此时等价于轻度混淆——仍非明文，但安全性下降；正常 mac/win 都能取到 machine_id）。
+fn share_pw_key() -> [u8; 32] {
+    let seed = machine_id().unwrap_or_else(|| "baibao-fallback-seed".to_string());
+    let mut h = Sha256::new();
+    h.update(b"baibao-share-pw-key-v1\0");
+    h.update(seed.as_bytes());
+    h.finalize().into()
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// 加密明文密码 → "enc1:hex(nonce):hex(密文)"。
+fn encrypt_pw(plain: &str) -> String {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let key = share_pw_key();
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let mut nonce = [0u8; 12];
+    let _ = getrandom::getrandom(&mut nonce);
+    match cipher.encrypt(Nonce::from_slice(&nonce), plain.as_bytes()) {
+        Ok(ct) => format!("{PW_ENC_PREFIX}{}:{}", hex_encode(&nonce), hex_encode(&ct)),
+        Err(_) => plain.to_string(), // 加密失败极罕见；退回原值以免丢密码
+    }
+}
+
+/// 解密；非本格式（老的明文）原样返回。解不开（换机器/损坏）返回 None。
+fn decrypt_pw(stored: &str) -> Option<String> {
+    let Some(rest) = stored.strip_prefix(PW_ENC_PREFIX) else {
+        return Some(stored.to_string()); // 老明文：原样当作密码（下次保存会自动加密）
+    };
+    let (nh, ch) = rest.split_once(':')?;
+    let (nonce, ct) = (hex_decode(nh)?, hex_decode(ch)?);
+    if nonce.len() != 12 {
+        return None;
+    }
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let cipher = ChaCha20Poly1305::new((&share_pw_key()).into());
+    cipher
+        .decrypt(Nonce::from_slice(&nonce), ct.as_slice())
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+}
+
 fn load_config() -> LanConfig {
-    config_path()
+    let mut cfg: LanConfig = config_path()
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 解密共享密码：解不开的（换了机器/损坏）丢弃密码 → 该共享变"无密码"故不对外服务，安全失败
+    if let Some(shares) = cfg.shares.as_mut() {
+        for s in shares.iter_mut() {
+            if let Some(stored) = s.password.take() {
+                s.password = decrypt_pw(&stored);
+            }
+        }
+    }
+    cfg
 }
 
 fn save_config(cfg: &LanConfig) {
@@ -397,7 +507,16 @@ fn save_config(cfg: &LanConfig) {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(s) = serde_json::to_vec_pretty(cfg) {
+        // 加密共享密码后再落盘（lan.json 不含明文）
+        let mut cfg = cfg.clone();
+        if let Some(shares) = cfg.shares.as_mut() {
+            for s in shares.iter_mut() {
+                if let Some(pw) = s.password.as_ref() {
+                    s.password = Some(encrypt_pw(pw));
+                }
+            }
+        }
+        if let Ok(s) = serde_json::to_vec_pretty(&cfg) {
             let _ = std::fs::write(p, s);
         }
     }
@@ -458,7 +577,7 @@ impl LanState {
             device_type: Some("desktop".into()),
             fingerprint: g.fingerprint.clone(),
             port: Some(PORT),
-            protocol: Some("http".into()),
+            protocol: Some("https".into()),
             download: Some(false),
             announce,
             app: Some("baibao".into()),
@@ -517,7 +636,7 @@ fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String)
             fingerprint: info.fingerprint.clone(),
             ip,
             port: info.port.unwrap_or(PORT),
-            protocol: info.protocol.clone().unwrap_or_else(|| "http".into()),
+            protocol: info.protocol.clone().unwrap_or_else(|| "https".into()),
             device_type: info.device_type.clone(),
             is_baibao: info.app.as_deref() == Some("baibao"),
             last_seen_ms: now_ms(),
@@ -554,7 +673,7 @@ fn upsert_peer_minimal(app: &AppHandle, state: &LanState, alias: &str, fingerpri
                         fingerprint: fingerprint.to_string(),
                         ip,
                         port: PORT,
-                        protocol: "http".into(),
+                        protocol: "https".into(),
                         device_type: None,
                         is_baibao: true,
                         last_seen_ms: now,
@@ -581,8 +700,28 @@ pub async fn lan_start(app: AppHandle, state: State<'_, LanState>) -> Result<ser
         g.started = true;
     }
 
-    // 1) HTTP 收件服务
-    let server = tiny_http::Server::http(("0.0.0.0", PORT)).map_err(|e| {
+    // 0) 准备本机自签 TLS 证书（生成/复用并持久化），全程 HTTPS。
+    //    设备身份(fingerprint) = 证书指纹：身份与证书绑定，别人无法用别的证书冒充本设备。
+    let (cert_pem, key_pem, cert_fp) = match load_or_create_cert() {
+        Ok(v) => v,
+        Err(e) => {
+            state.0.lock().unwrap().started = false;
+            return Err(e);
+        }
+    };
+    {
+        let mut g = state.0.lock().unwrap();
+        g.fingerprint = cert_fp;
+        // 启动即落盘一次：把可能残留的明文共享密码重新加密写回（迁移旧 lan.json）
+        persist(&g);
+    }
+
+    // 1) HTTPS 收件服务（自签证书；对端通过发现广播拿到本证书并「固定」）
+    let ssl = tiny_http::SslConfig {
+        certificate: cert_pem.into_bytes(),
+        private_key: key_pem.into_bytes(),
+    };
+    let server = tiny_http::Server::https(("0.0.0.0", PORT), ssl).map_err(|e| {
         // 端口被占用时 started 已置 true，回滚，让用户可以重试启动
         state.0.lock().unwrap().started = false;
         format!("端口 {PORT} 被占用，局域网服务无法启动（可能已有一个百宝箱在运行）。请关闭占用该端口的程序后点「重试」。详情：{e}")
@@ -1066,6 +1205,14 @@ fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 通道绑定鉴权令牌：把「密码哈希」与「对方 TLS 证书指纹」绑定。
+/// auth_sha256 = sha256(密码) 的十六进制（前端算好传来 / 服务端用密码现算）；
+/// cert_fp = sha256(对方证书 PEM)。两端只有连到「同一张证书」时算出的令牌才一致，
+/// 中间人用自己的证书终止 TLS → 指纹不同 → 拿到的令牌对真服务端无效（且无密码算不出）。
+fn bind_auth(auth_sha256: &str, cert_fp: &str) -> String {
+    sha256_hex(&format!("{auth_sha256}:{cert_fp}"))
+}
+
 fn header_value(req: &tiny_http::Request, name: &str) -> Option<String> {
     req.headers()
         .iter()
@@ -1090,21 +1237,23 @@ fn resolve_share_path(root: &str, rel: &str) -> Option<PathBuf> {
 }
 
 enum ShareAuth {
-    Open(String),   // 无密码，直接放行
-    Ok(String),     // 有密码且正确
-    Denied,         // 有密码但缺失/错误
+    Ok(String),     // 有密码且令牌正确
+    Denied,         // 密码缺失/错误，或共享未设密码（未设密码一律拒绝对外服务）
     NotFound,
 }
 
-/// 校验某共享：无密码 → Open；有密码且 X-Share-Auth == sha256(密码) → Ok；否则 Denied。
+/// 校验某共享：未设密码 → 一律拒绝（安全基线，见阶段 3）；
+/// 有密码且 X-Share-Auth == bind_auth(sha256(密码), 本机证书指纹) → Ok；否则 Denied。
 fn authorize_share(g: &Inner, id: &str, auth: Option<&str>) -> ShareAuth {
     let Some(share) = g.shares.iter().find(|s| s.id == id) else {
         return ShareAuth::NotFound;
     };
     match &share.password {
-        None => ShareAuth::Open(share.path.clone()),
+        None => ShareAuth::Denied, // 未设密码：任何网络下都不对外服务（阶段 3）
         Some(pw) => {
-            let expected = sha256_hex(pw);
+            // 通道绑定：令牌必须 = bind_auth(sha256(密码), 本机身份)。本机身份=本机证书指纹，
+            // 对端连进来用的就是这个指纹固定的，所以两端算出的令牌一致；中间人证书不同 → 不一致。
+            let expected = bind_auth(&sha256_hex(pw), &g.fingerprint);
             if auth.map(|a| a.eq_ignore_ascii_case(&expected)).unwrap_or(false) {
                 ShareAuth::Ok(share.path.clone())
             } else {
@@ -1148,7 +1297,6 @@ fn auth_record_success(g: &mut Inner, ip: &str) {
 /// 成功返回根路径；失败返回应答用的 HTTP 状态码（404 / 401 / 429）。
 fn authorize_with_throttle(g: &mut Inner, id: &str, auth: Option<&str>, ip: &str) -> Result<String, u16> {
     match authorize_share(g, id, auth) {
-        ShareAuth::Open(p) => Ok(p),
         ShareAuth::NotFound => Err(404),
         ShareAuth::Ok(p) => {
             if auth_is_locked(g, ip) {
@@ -1171,7 +1319,8 @@ fn authorize_with_throttle(g: &mut Inner, id: &str, auth: Option<&str>, ip: &str
     }
 }
 
-/// GET /api/baibao/v1/shares —— 列出共享根（仅元数据：id/名称/是否加锁，无需认证）。
+/// GET /api/baibao/v1/shares —— 列出共享根（仅元数据：id/名称/是否加锁）。
+/// 阶段 3：只对外暴露「已设密码」的共享；未设密码的共享一律不对外服务、也不出现在列表里。
 fn handle_share_roots(state: &LanState, request: tiny_http::Request) {
     let list: Vec<serde_json::Value> = state
         .0
@@ -1179,9 +1328,10 @@ fn handle_share_roots(state: &LanState, request: tiny_http::Request) {
         .unwrap()
         .shares
         .iter()
+        .filter(|s| s.password.is_some())
         .map(|s| {
             serde_json::json!({
-                "id": s.id, "name": s.name, "locked": s.password.is_some(),
+                "id": s.id, "name": s.name, "locked": true,
                 "canCreate": s.can_create, "canModify": s.can_modify, "canDelete": s.can_delete,
             })
         })
@@ -2125,12 +2275,16 @@ pub async fn lan_add_peer(
     let port = port.unwrap_or(PORT);
     let ip2 = ip.clone();
     let info: DeviceInfo = tauri::async_runtime::spawn_blocking(move || {
+        // 手动按 IP 添加：此刻还没有对方证书，只能先以「接受任意证书」探一次 /info
+        // （TOFU）拿到对方证书；之后真正的传输都用从 /info 学到的证书做固定。
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5))
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
             .build()
             .map_err(|e| e.to_string())?;
         let resp = client
-            .get(format!("http://{ip2}:{port}/api/localsend/v2/info"))
+            .get(format!("https://{ip2}:{port}/api/localsend/v2/info"))
             .send()
             .map_err(|e| format!("连不上 {ip2}:{port}：{e}"))?;
         if !resp.status().is_success() {
@@ -2273,12 +2427,103 @@ pub fn lan_set_share_password(
 
 // ── 命令：共享磁盘（客户端：浏览「对方」共享的目录，走 HTTP 经隧道也可达）──
 
-/// 与对端共享相关的 HTTP 客户端：固定较短超时，避免界面卡住。
-fn share_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())
+fn sha256_hex_bytes(b: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(b);
+    h.finalize().iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// 自定义 TLS 校验器：只认「证书指纹」(sha256(DER))，不走 webpki 链校验、不校验主机名。
+/// 这样自签证书也能稳定固定；同时仍校验握手签名（确认对方持有该证书私钥，防冒充）。
+#[derive(Debug)]
+struct PinnedFp {
+    expected: String, // 期望的 sha256(对方证书 DER) 十六进制
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+impl rustls::client::danger::ServerCertVerifier for PinnedFp {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if sha256_hex_bytes(end_entity.as_ref()).eq_ignore_ascii_case(&self.expected) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("证书指纹不匹配（可能存在中间人）".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// 构造一个「只固定指定证书指纹」的 HTTPS 客户端。
+fn build_pinned_client(
+    expected_fp: &str,
+    overall_timeout: Option<Duration>,
+) -> Result<reqwest::blocking::Client, String> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let algs = provider.signature_verification_algorithms;
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS 配置失败：{e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedFp {
+            expected: expected_fp.to_string(),
+            algs,
+        }))
+        .with_no_client_auth();
+    let mut b = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .use_preconfigured_tls(config);
+    if let Some(t) = overall_timeout {
+        b = b.timeout(t);
+    }
+    b.build().map_err(|e| e.to_string())
+}
+
+/// 取连接某对端所需的参数（**不**构造客户端）：返回 (base_url, 本机别名, 对方身份指纹)。
+/// 注意：reqwest::blocking::Client 必须在 `spawn_blocking` 内部用 `build_pinned_client` 构造并使用——
+/// blocking client 析构时会关闭其内部 runtime，若在异步(tokio)上下文里 drop 会 panic
+/// （Cannot drop a runtime in a context where blocking is not allowed）。
+/// 对方身份指纹（=证书指纹）既用于 TLS 固定，也用于通道绑定鉴权(bind_auth)。
+fn peer_conn(state: &LanState, fingerprint: &str) -> Result<(String, String, String), String> {
+    let (base, my_alias, is_https) = {
+        let g = state.0.lock().unwrap();
+        let p = g.peers.get(fingerprint).ok_or("设备不在线或已离开")?;
+        (
+            format!("{}://{}:{}", p.protocol, p.ip, p.port),
+            g.alias.clone(),
+            p.protocol == "https",
+        )
+    };
+    // 全 TLS：只允许 HTTPS 对端，拒绝任何明文回退（旧版/不支持加密的设备一律不连）
+    if !is_https {
+        return Err("对方不支持加密连接，请让对方更新到最新版".into());
+    }
+    if fingerprint.trim().is_empty() {
+        return Err("对方身份未知，请稍候重试（等待设备广播）".into());
+    }
+    Ok((base, my_alias, fingerprint.to_string()))
 }
 
 /// 列出对端的共享根。
@@ -2288,9 +2533,9 @@ pub async fn lan_share_roots(
     fingerprint: String,
 ) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
-    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let (base, _, peer_fp) = peer_conn(&state, &fingerprint)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let client = share_client()?;
+        let client = build_pinned_client(&peer_fp, Some(Duration::from_secs(15)))?;
         let resp = client
             .get(format!("{base}/api/baibao/v1/shares"))
             .send()
@@ -2314,14 +2559,14 @@ pub async fn lan_share_list(
     auth: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
-    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let (base, _, peer_fp) = peer_conn(&state, &fingerprint)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let client = share_client()?;
+        let client = build_pinned_client(&peer_fp, Some(Duration::from_secs(15)))?;
         let mut req = client
             .get(format!("{base}/api/baibao/v1/share/list"))
             .query(&[("id", id.as_str()), ("path", path.as_str())]);
         if let Some(a) = auth {
-            req = req.header("X-Share-Auth", a);
+            req = req.header("X-Share-Auth", bind_auth(&a, &peer_fp));
         }
         let resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
         match resp.status().as_u16() {
@@ -2347,7 +2592,7 @@ pub async fn lan_share_download(
     is_dir: bool,
 ) -> Result<String, String> {
     let state = state.inner().clone();
-    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let (base, _, peer_fp) = peer_conn(&state, &fingerprint)?;
     let dir = state.0.lock().unwrap().download_dir.clone();
     let name = path
         .rsplit(['/', '\\'])
@@ -2356,14 +2601,14 @@ pub async fn lan_share_download(
         .unwrap_or("file")
         .to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let client = share_client()?;
+        let client = build_pinned_client(&peer_fp, None)?; // 下载可能很大，不设整体超时
         let _ = std::fs::create_dir_all(&dir);
         let endpoint = if is_dir { "share/zip" } else { "share/download" };
         let mut req = client
             .get(format!("{base}/api/baibao/v1/{endpoint}"))
             .query(&[("id", id.as_str()), ("path", path.as_str())]);
         if let Some(a) = auth {
-            req = req.header("X-Share-Auth", a);
+            req = req.header("X-Share-Auth", bind_auth(&a, &peer_fp));
         }
         let mut resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
         match resp.status().as_u16() {
@@ -2445,12 +2690,13 @@ fn probe_upload_offset(
     id: &str,
     token: &str,
     auth: Option<&String>,
+    peer_fp: &str,
 ) -> OffsetProbe {
     let mut r = client
         .get(format!("{base}/api/baibao/v1/share/upload-offset"))
         .query(&[("id", id), ("token", token)]);
     if let Some(a) = auth {
-        r = r.header("X-Share-Auth", a.clone());
+        r = r.header("X-Share-Auth", bind_auth(a, peer_fp));
     }
     match r.send() {
         Ok(resp) if resp.status().is_success() => resp
@@ -2505,7 +2751,7 @@ pub async fn lan_share_upload(
     auth: Option<String>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let (base, _, peer_fp) = peer_conn(&state, &fingerprint)?;
     let name = local_path
         .trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
@@ -2520,10 +2766,7 @@ pub async fn lan_share_upload(
     let (capp, ctid, cname) = (app.clone(), task_id.clone(), name.clone());
     let res = tauri::async_runtime::spawn_blocking(move || {
         use std::sync::atomic::Ordering::Relaxed;
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(8))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = build_pinned_client(&peer_fp, None)?; // 上传可能很大，不设整体超时
         let lp = std::path::Path::new(&local_path);
         let is_dir = lp.is_dir();
         // 续传 token：用任务 id（服务端据此累积已收字节）。
@@ -2608,7 +2851,7 @@ pub async fn lan_share_upload(
                 break Err("cancelled".to_string());
             }
             // 1) 探测对方已收字节，作为本次断点 + 进展基准
-            let before: u64 = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
+            let before: u64 = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref(), &peer_fp) {
                 OffsetProbe::Bytes(n) => n.min(size),
                 OffsetProbe::Rejected => break Err("上传已停止：对方拒绝接收。".to_string()),
                 OffsetProbe::Unreachable => {
@@ -2660,7 +2903,7 @@ pub async fn lan_share_upload(
                 ])
                 .body(body);
             if let Some(a) = &auth {
-                req = req.header("X-Share-Auth", a.clone());
+                req = req.header("X-Share-Auth", bind_auth(a, &peer_fp));
             }
 
             // 3) 成功（HTTP 拿到响应）→ 按状态码定结果
@@ -2672,7 +2915,7 @@ pub async fn lan_share_upload(
             }
 
             // 4) 失败：再探测，判断本次相比开始时是否「有新数据送达」+ 分类
-            let (made_progress, fail_msg) = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
+            let (made_progress, fail_msg) = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref(), &peer_fp) {
                 OffsetProbe::Rejected => break Err("上传中断：对方拒绝接收。".to_string()),
                 OffsetProbe::Unsupported => {
                     break Err("上传中断：对方版本过旧、不保存已收数据，不支持断点续传，请让对方更新到最新版后重试。".to_string())
@@ -2789,9 +3032,9 @@ pub async fn lan_share_op(
     auth: Option<String>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let (base, _, peer_fp) = peer_conn(&state, &fingerprint)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let client = share_client()?;
+        let client = build_pinned_client(&peer_fp, Some(Duration::from_secs(15)))?;
         let mut query: Vec<(&str, &str)> = vec![("id", id.as_str()), ("path", path.as_str())];
         if let Some(t) = &to {
             query.push(("to", t.as_str()));
@@ -2800,7 +3043,7 @@ pub async fn lan_share_op(
             .post(format!("{base}/api/baibao/v1/share/{op}"))
             .query(&query);
         if let Some(a) = auth {
-            req = req.header("X-Share-Auth", a);
+            req = req.header("X-Share-Auth", bind_auth(&a, &peer_fp));
         }
         let resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
         share_op_result(resp.status().as_u16())
@@ -2893,15 +3136,6 @@ pub async fn lan_reveal(app: AppHandle, path: String) -> Result<(), String> {
 
 // ── 命令：发送 ───────────────────────────────────────────────
 
-fn peer_base_url(state: &LanState, fingerprint: &str) -> Result<(String, String), String> {
-    let g = state.0.lock().unwrap();
-    let p = g.peers.get(fingerprint).ok_or("设备不在线或已离开")?;
-    Ok((
-        format!("{}://{}:{}", p.protocol, p.ip, p.port),
-        g.alias.clone(),
-    ))
-}
-
 #[tauri::command]
 pub async fn lan_send_message(
     state: State<'_, LanState>,
@@ -2910,13 +3144,10 @@ pub async fn lan_send_message(
     msg_id: Option<String>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    let (base, my_alias) = peer_base_url(&state, &fingerprint)?;
+    let (base, my_alias, peer_fp) = peer_conn(&state, &fingerprint)?;
     let my_fp = state.0.lock().unwrap().fingerprint.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = build_pinned_client(&peer_fp, Some(Duration::from_secs(10)))?;
         let body = serde_json::json!({ "alias": my_alias, "fingerprint": my_fp, "text": text, "msgId": msg_id });
         let resp = client
             .post(format!("{base}/api/baibao/v1/message"))
@@ -2941,13 +3172,10 @@ pub async fn lan_recall_message(
     msg_id: String,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    let (base, _my_alias) = peer_base_url(&state, &fingerprint)?;
+    let (base, _my_alias, peer_fp) = peer_conn(&state, &fingerprint)?;
     let my_fp = state.0.lock().unwrap().fingerprint.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = build_pinned_client(&peer_fp, Some(Duration::from_secs(10)))?;
         let body = serde_json::json!({ "fingerprint": my_fp, "msgId": msg_id });
         let resp = client
             .post(format!("{base}/api/baibao/v1/recall"))
@@ -3031,7 +3259,7 @@ pub async fn lan_send_files(
     paths: Vec<String>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    let (base, my_alias) = peer_base_url(&state, &fingerprint)?;
+    let (base, my_alias, peer_fp) = peer_conn(&state, &fingerprint)?;
     let info = state.device_info(None);
     if paths.is_empty() {
         return Err("没有要发送的文件".into());
@@ -3040,10 +3268,7 @@ pub async fn lan_send_files(
     tauri::async_runtime::spawn_blocking(move || {
         let _ = my_alias;
         // 不设总超时（大文件可能传很久），仅限制建连耗时；中断由断点续传重试兜底
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(8))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = build_pinned_client(&peer_fp, None)?;
 
         // 每个文件各自作为一个独立会话、并发发送：接收方可逐个确认/拒绝，互不影响。
         // 并发是关键——prepare-upload 会阻塞等对方做决定，串行会导致后面的文件迟迟发不出、
