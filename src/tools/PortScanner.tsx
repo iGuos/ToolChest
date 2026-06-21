@@ -130,7 +130,7 @@ export default function PortScanner() {
             <div>{filter || onlyListen ? "无匹配结果" : "暂无数据，点击刷新"}</div>
           </div>
         ) : (
-          <table>
+          <table className="port-table">
             <thead>
               <tr>
                 <th>协议</th>

@@ -19,6 +19,7 @@ pub fn run() {
             tools::http::http_send,
             tools::trust_app::pick_app,
             tools::trust_app::trust_app,
+            tools::deepseek::open_deepseek,
             tools::lan::lan_start,
             tools::lan::lan_my_info,
             tools::lan::lan_peers,

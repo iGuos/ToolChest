@@ -6,8 +6,8 @@ import TrustApp from "./tools/TrustApp";
 import TodoList from "./tools/TodoList";
 import LanShare from "./tools/LanShare";
 import LanIncomingModal from "./tools/LanIncomingModal";
+import DeepSeek from "./tools/DeepSeekTab";
 import { useLan } from "./tools/lanContext";
-import { openDeepSeek } from "./tools/deepseek";
 import { useEscToClose, useDragReorder } from "./hooks";
 import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
 
@@ -119,6 +119,8 @@ function renderTool(
       return <TodoList />;
     case "lan-share":
       return <LanShare />;
+    case "deepseek":
+      return <DeepSeek />;
     default:
       return null;
   }
@@ -231,12 +233,8 @@ export default function App() {
   }, []);
 
   // 打开一个工具：已开则只切换，未开则追加到末尾。
-  // DeepSeek 例外——它走独立窗口，点一下只开/前置窗口，不占用 tab。
+  // DeepSeek 现在先开 tab（tab 内是官网式二选一入口），点卡片再开对应站点窗口。
   const openTool = (id: string) => {
-    if (id === "deepseek") {
-      openDeepSeek();
-      return;
-    }
     setOpenTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
     setActiveTab(id);
   };

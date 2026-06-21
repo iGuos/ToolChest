@@ -1796,32 +1796,82 @@ select { cursor: pointer; }
   padding: 0 2px;
 }
 
-/* ── DeepSeek 网页端（原生子 webview 覆盖在 .ds-host 上）── */
-.ds-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg2);
-  flex-shrink: 0;
-}
-.ds-title {
-  font-size: 13px;
-  font-weight: 600;
-}
-.ds-host {
+/* ── DeepSeek 工具页：模拟官网首页的二选一入口 ── */
+.ds-landing {
   flex: 1;
   min-height: 0;
-  position: relative;
-  /* 占位文案在 webview 摆好之前可见，之后被原生 webview 盖住 */
+  overflow: auto;
   display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+  color: var(--text);
+  --ds-slogan: clamp(20px, 2.6vw, 30px); /* 标语字号，供卡片间距复用 */
+}
+/* 主体（logo+标语+卡片）占满空间并垂直居中 */
+.ds-main {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  padding: 24px 0;
 }
-.ds-placeholder {
-  color: var(--text-dim, #888);
-  font-size: 13px;
+.ds-hero {
+  text-align: center;
+}
+.ds-logo {
+  font-size: clamp(52px, 8vw, 92px);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  color: var(--accent);
+}
+.ds-slogan {
+  margin-top: 14px;
+  font-size: var(--ds-slogan);
+  font-weight: 700;
+  color: var(--text);
+}
+.ds-cards {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 20px;
+  width: 100%;
+  max-width: 880px;
+  padding: 0 24px 40px;
+  /* 在原间距基础上再加一个标语文字高度 */
+  margin-top: calc(36px + var(--ds-slogan));
+}
+.ds-card {
+  flex: 1 1 320px;
+  max-width: 420px;
+  text-align: left;
+  padding: 24px 26px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.ds-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--accent);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.2);
+}
+.ds-card-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+.ds-card-desc {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-dim);
 }
 
 .tool-header {
@@ -1960,6 +2010,25 @@ td {
 }
 
 tr:hover td { background: #28282c; }
+
+/* 端口表随窗口自适配：只让「本地地址(2)/远程(4)」这两列长地址折行，
+   表格便不会被撑出一个"最小宽度"、把右侧「操作」列挤出窗口。 */
+.port-table { table-layout: auto; }
+.port-table td:nth-child(2),
+.port-table td:nth-child(4) {
+  overflow-wrap: anywhere;
+}
+/* 协议(1)/端口(3)/状态(5)/PID(7)：不换行 + 最小宽度，避免被挤窄或折行 */
+.port-table th:nth-child(1), .port-table td:nth-child(1),
+.port-table th:nth-child(3), .port-table td:nth-child(3),
+.port-table th:nth-child(5), .port-table td:nth-child(5),
+.port-table th:nth-child(7), .port-table td:nth-child(7) {
+  white-space: nowrap;
+}
+.port-table th:nth-child(1) { min-width: 60px; }  /* 协议 */
+.port-table th:nth-child(3) { min-width: 60px; }  /* 端口 */
+.port-table th:nth-child(5) { min-width: 120px; } /* 状态（ESTABLISHED） */
+.port-table th:nth-child(7) { min-width: 70px; }  /* PID */
 
 /* ── Badges ── */
 .badge {

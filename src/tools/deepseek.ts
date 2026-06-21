@@ -1,56 +1,68 @@
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-// DeepSeek 网页端走独立原生窗口（避免 macOS 上子 webview 叠加导致的光标闪烁）。
-// 点侧栏/首页的 DeepSeek 即调用此函数，不占用 tab：
-//   - 窗口已存在 → 显示并前置；
-//   - 不存在 → 新建，并居中到「当前应用窗口」的中心（而非整个屏幕）。
+// DeepSeek 各页面走独立原生窗口（避免 macOS 上子 webview 叠加导致的光标闪烁）。
+// 实际建窗在 Rust 端（open_deepseek 命令）：先隐藏 + 设主题背景色，页面加载完再显示，
+// 以消除远程页面渲染前的白屏闪烁。这里负责算好「居中到当前窗口」的坐标和主题背景色。
 // cookie 持久化，登录态会保留。
-const DS_URL = "https://chat.deepseek.com";
-const LABEL = "deepseek";
+export type DeepSeekTarget = "chat" | "api";
+const TARGETS: Record<DeepSeekTarget, { url: string; label: string; title: string }> = {
+  chat: { url: "https://chat.deepseek.com", label: "deepseek", title: "DeepSeek 对话" },
+  api: { url: "https://platform.deepseek.com", label: "deepseek-api", title: "DeepSeek API 开放平台" },
+};
 const W = 1040;
 const H = 780;
 
-export async function openDeepSeek() {
+// 连点拦截：同一个站点窗口正在打开时，忽略后续点击。
+// 否则首次建窗尚未注册（get_webview_window 仍查不到），第二次点击会再建一个同名 label
+// 的窗口而冲突报错。按 label 记录"正在打开"状态即可。
+const opening = new Set<string>();
+
+// 取当前主题背景色，作为新窗口的初始背景，避免远程页面渲染前先闪一下白底。
+function currentBg(): string {
   try {
-    const existing = await WebviewWindow.getByLabel(LABEL);
-    if (existing) {
-      await existing.show();
-      await existing.unminimize();
-      await existing.setFocus();
-      return;
-    }
+    const v = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+    return v || "#1e1e1e";
+  } catch {
+    return "#1e1e1e";
+  }
+}
 
-    // 居中到当前窗口的中心：取当前窗口外框位置/尺寸（物理像素），除以缩放比换算成
-    // 逻辑像素（窗口选项的 x/y/width/height 都用逻辑像素）。取不到时退回屏幕居中。
-    let pos: { x: number; y: number } | undefined;
-    try {
-      const cur = getCurrentWindow();
-      const [p, s, scale] = await Promise.all([
-        cur.outerPosition(),
-        cur.outerSize(),
-        cur.scaleFactor(),
-      ]);
-      const winX = p.x / scale;
-      const winY = p.y / scale;
-      const winW = s.width / scale;
-      const winH = s.height / scale;
-      pos = {
-        x: Math.round(winX + (winW - W) / 2),
-        y: Math.round(winY + (winH - H) / 2),
-      };
-    } catch {
-      /* 取不到当前窗口几何 → 用屏幕居中兜底 */
-    }
+export async function openDeepSeek(target: DeepSeekTarget = "chat") {
+  const { url, label, title } = TARGETS[target];
+  if (opening.has(label)) return; // 连点拦截：该窗口正在打开，忽略本次
+  opening.add(label);
 
-    new WebviewWindow(LABEL, {
-      url: DS_URL,
-      title: "DeepSeek",
+  // 居中到当前窗口中心：取当前窗口外框位置/尺寸（物理像素）/缩放比换算成逻辑像素。
+  let x: number | undefined;
+  let y: number | undefined;
+  try {
+    const cur = getCurrentWindow();
+    const [p, s, scale] = await Promise.all([cur.outerPosition(), cur.outerSize(), cur.scaleFactor()]);
+    const winX = p.x / scale;
+    const winY = p.y / scale;
+    const winW = s.width / scale;
+    const winH = s.height / scale;
+    x = Math.round(winX + (winW - W) / 2);
+    y = Math.round(winY + (winH - H) / 2);
+  } catch {
+    /* 取不到当前窗口几何 → Rust 端退回屏幕居中 */
+  }
+
+  try {
+    await invoke("open_deepseek", {
+      label,
+      url,
+      title,
       width: W,
       height: H,
-      ...(pos ? { x: pos.x, y: pos.y } : { center: true }),
+      x,
+      y,
+      bg: currentBg(),
     });
   } catch (e) {
     console.error("打开 DeepSeek 窗口失败", e);
+  } finally {
+    opening.delete(label);
   }
 }

@@ -1,3 +1,4 @@
+pub mod deepseek;
 pub mod hosts;
 pub mod http;
 pub mod lan;
