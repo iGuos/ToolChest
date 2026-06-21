@@ -214,8 +214,10 @@ export default function LanShare() {
     setSelected, setError, refreshPeers, sendMessage, resendMessage, recallMessage, deleteItem, sendFiles,
     cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
     setRemark, clearChat, togglePin, reorderPins,
+    uploadTasks, cancelUpload, dismissUpload,
   } = useLan();
   const [retrying, setRetrying] = useState(false);
+  const [uploadsMin, setUploadsMin] = useState(false); // 上传任务面板是否最小化
 
   const [draft, setDraft] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -671,6 +673,66 @@ export default function LanShare() {
           <div className="lan-toast">
             ⚠ {error}
             <button className="lan-toast-x" onClick={() => setError(null)}>×</button>
+          </div>,
+          document.body
+        )}
+
+      {/* 全局上传任务面板：关闭共享浏览弹框后仍可见,可看进度/中断,可最小化 */}
+      {Object.keys(uploadTasks).length > 0 &&
+        uploadsMin &&
+        createPortal(
+          <button className="upload-tasks-pill" onClick={() => setUploadsMin(false)}>
+            上传任务 {Object.keys(uploadTasks).length} ▴
+          </button>,
+          document.body
+        )}
+      {Object.keys(uploadTasks).length > 0 &&
+        !uploadsMin &&
+        createPortal(
+          <div className="upload-tasks">
+            <div className="upload-tasks-head">
+              <span className="upload-tasks-title dim">上传任务</span>
+              <button className="lan-toast-x" title="最小化" onClick={() => setUploadsMin(true)}>—</button>
+            </div>
+            {Object.values(uploadTasks).map((t) => {
+              const zipping = t.phase === "zip" || (t.phase === "upload" && t.size === 0);
+              const pct = t.size ? Math.min(100, (t.transferred / t.size) * 100) : 0;
+              const active = t.phase === "upload" || t.phase === "zip";
+              const statusText =
+                t.phase === "zip"
+                  ? "打包中…"
+                  : t.phase === "done"
+                  ? "已完成"
+                  : t.phase === "cancelled"
+                  ? "已取消"
+                  : t.phase === "error"
+                  ? "失败"
+                  : t.size
+                  ? `${fmtBytes(t.transferred)} / ${fmtBytes(t.size)} · ${Math.round(pct)}%`
+                  : "准备中…";
+              return (
+                <div key={t.id} className="upload-task">
+                  <div className="upload-task-row">
+                    <span className="upload-task-name" title={t.name}>{t.name}</span>
+                    {active ? (
+                      <button className="lan-toast-x" title="中断" onClick={() => cancelUpload(t.id)}>×</button>
+                    ) : (
+                      <button className="lan-toast-x" title="移除" onClick={() => dismissUpload(t.id)}>×</button>
+                    )}
+                  </div>
+                  <span className="upload-task-bar">
+                    <span
+                      className={zipping ? "indet" : ""}
+                      style={{
+                        width: zipping ? "100%" : `${pct}%`,
+                        background: t.phase === "error" ? "var(--red-h, #ff6b6b)" : undefined,
+                      }}
+                    />
+                  </span>
+                  <span className="dim upload-task-text">{statusText}</span>
+                </div>
+              );
+            })}
           </div>,
           document.body
         )}

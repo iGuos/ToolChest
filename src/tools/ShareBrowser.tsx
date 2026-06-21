@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useEscToClose } from "../hooks";
+import { useLan } from "./lanContext";
 
 // 类访达/资源管理器的共享文件管理器：进目录浏览 + 下载（文件夹自动 zip→解压）+
 // 按对方授予的权限做新增（上传/新建文件夹，支持把本地文件拖进窗口上传）/修改（重命名）/删除。
@@ -54,6 +55,7 @@ export default function ShareBrowser({
   onClose: () => void;
 }) {
   useEscToClose(true, onClose);
+  const { beginUpload } = useLan();
   const [roots, setRoots] = useState<ShareRoot[] | null>(null);
   const [share, setShare] = useState<ShareRoot | null>(null);
   const [path, setPath] = useState<string[]>([]);
@@ -74,10 +76,8 @@ export default function ShareBrowser({
   const lastIdxRef = useRef<number>(-1);
   // 文件右键菜单
   const [entryMenu, setEntryMenu] = useState<{ x: number; y: number; entry: ShareEntry } | null>(null);
-  // 上传进度：name -> {transferred,size}
-  const [progress, setProgress] = useState<Record<string, { transferred: number; size: number }>>({});
   // 上传覆盖二次确认
-  const [overwrite, setOverwrite] = useState<{ names: string[]; locals: string[] } | null>(null);
+  const [uploadConfirm, setUploadConfirm] = useState<{ locals: string[]; folders: string[]; collisions: string[] } | null>(null);
 
   const getAuth = (sh: ShareRoot) =>
     sh.locked ? localStorage.getItem(credKey(fingerprint, sh.id)) ?? undefined : undefined;
@@ -133,20 +133,23 @@ export default function ShareBrowser({
   const ctxRef = useRef({ share, path, entries });
   ctxRef.current = { share, path, entries };
 
-  // 实际执行上传（带进度，覆盖同名）
+  // 实际执行上传（进度/中断由全局上传任务面板呈现，关闭弹框也能看到）
   const doUpload = useCallback(
     async (localPaths: string[]) => {
       const { share: sh, path: segs } = ctxRef.current;
       if (!sh || !sh.canCreate || localPaths.length === 0) return;
       setBusy(true);
       setErr(null);
-      setProgress({});
       setRevealPath(null);
       try {
-        for (const lp of localPaths) {
+        for (let i = 0; i < localPaths.length; i++) {
+          const lp = localPaths[i];
+          const taskId = `up-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`;
+          beginUpload(taskId, lp.split(/[/\\]/).pop() || "file");
           await invoke("lan_share_upload", {
             fingerprint,
             id: sh.id,
+            taskId,
             destDir: segs.join("/"),
             localPath: lp,
             auth: getAuth(sh) ?? null,
@@ -155,24 +158,38 @@ export default function ShareBrowser({
         setNotice(`已上传 ${localPaths.length} 项`);
         await load(sh, segs);
       } catch (e) {
-        setErr(String(e) === "auth" ? "需要密码，请重新进入该共享" : String(e));
+        if (String(e) === "cancelled") {
+          setNotice("已取消上传");
+          await load(sh, segs); // 刷新（部分文件可能已传完）
+        } else {
+          setErr(String(e) === "auth" ? "需要密码，请重新进入该共享" : String(e));
+        }
       } finally {
         setBusy(false);
-        setProgress({});
       }
     },
-    [fingerprint, load]
+    [fingerprint, load, beginUpload]
   );
 
-  // 上传入口：先检测同名冲突，有则二次确认覆盖，否则直接传
+  // 上传入口：文件夹一律二次确认（防点错），有同名也确认（会覆盖）；纯文件且无同名直接传
+  const baseName = (p: string) => p.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || "file";
   const startUpload = useCallback(
-    (localPaths: string[]) => {
+    async (localPaths: string[]) => {
       const { share: sh, entries: cur } = ctxRef.current;
       if (!sh || !sh.canCreate || localPaths.length === 0) return;
-      const names = localPaths.map((lp) => lp.split(/[/\\]/).pop() || "file");
-      const collisions = names.filter((n) => cur.some((e) => e.name === n));
-      if (collisions.length) setOverwrite({ names: collisions, locals: localPaths });
-      else doUpload(localPaths);
+      let flags: boolean[] = [];
+      try {
+        flags = await invoke<boolean[]>("lan_dir_flags", { paths: localPaths });
+      } catch {
+        flags = localPaths.map(() => false);
+      }
+      const folders = localPaths.filter((_, i) => flags[i]).map(baseName);
+      const collisions = localPaths.map(baseName).filter((n) => cur.some((e) => e.name === n));
+      if (folders.length || collisions.length) {
+        setUploadConfirm({ locals: localPaths, folders, collisions });
+      } else {
+        doUpload(localPaths);
+      }
     },
     [doUpload]
   );
@@ -194,22 +211,6 @@ export default function ShareBrowser({
       un?.();
     };
   }, [startUpload]);
-
-  // 上传进度事件
-  useEffect(() => {
-    let un: (() => void) | undefined;
-    let alive = true;
-    import("@tauri-apps/api/event").then(({ listen }) =>
-      listen<{ name: string; transferred: number; size: number }>("lan://share-upload", (e) => {
-        const { name, transferred, size } = e.payload;
-        setProgress((p) => ({ ...p, [name]: { transferred, size } }));
-      }).then((u) => (alive ? (un = u) : u()))
-    );
-    return () => {
-      alive = false;
-      un?.();
-    };
-  }, []);
 
   // 关闭文件右键菜单
   useEffect(() => {
@@ -359,7 +360,7 @@ export default function ShareBrowser({
     if (!share) return;
     const onKey = (ev: KeyboardEvent) => {
       if (document.activeElement instanceof HTMLInputElement) return;
-      if (pwOpen || namePrompt || delConfirm || overwrite || entries.length === 0) return;
+      if (pwOpen || namePrompt || delConfirm || uploadConfirm || entries.length === 0) return;
       if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
         ev.preventDefault();
         const cur = lastIdxRef.current;
@@ -383,7 +384,7 @@ export default function ShareBrowser({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [share, entries, selected, pwOpen, namePrompt, delConfirm, overwrite]);
+  }, [share, entries, selected, pwOpen, namePrompt, delConfirm, uploadConfirm]);
 
   return createPortal(
     <div className="modal-overlay">
@@ -393,7 +394,12 @@ export default function ShareBrowser({
           <button className="modal-close" onClick={onClose}>×</button>
         </div>
 
-        {err && <div className="error-banner" style={{ margin: 0 }}>⚠ {err}</div>}
+        {err && (
+          <div className="error-banner share-notice" style={{ margin: 0 }}>
+            <span>⚠ {err}</span>
+            <button className="share-banner-x" title="关闭" onClick={() => setErr(null)}>×</button>
+          </div>
+        )}
         {notice && (
           <div className="notice-banner share-notice" style={{ margin: 0 }}>
             <span>✓ {notice}</span>
@@ -405,6 +411,16 @@ export default function ShareBrowser({
                 打开目录
               </button>
             )}
+            <button
+              className="share-banner-x"
+              title="关闭"
+              onClick={() => {
+                setNotice(null);
+                setRevealPath(null);
+              }}
+            >
+              ×
+            </button>
           </div>
         )}
 
@@ -522,35 +538,7 @@ export default function ShareBrowser({
           </div>
         )}
 
-        {/* 上传进度（带动态文字描述） */}
-        {(busy || Object.keys(progress).length > 0) && (
-          <div className="share-progress">
-            <div className="share-prog-title dim">正在上传…</div>
-            {Object.keys(progress).length === 0 && (
-              <div className="dim" style={{ fontSize: 12 }}>准备中…</div>
-            )}
-            {Object.entries(progress).map(([name, p]) => {
-              const zipping = p.size === 0; // size=0 → 打包阶段
-              const pct = p.size ? Math.min(100, (p.transferred / p.size) * 100) : 0;
-              const done = p.size > 0 && p.transferred >= p.size;
-              return (
-                <div key={name} className="share-prog-item">
-                  <span className="share-prog-name" title={name}>{name}</span>
-                  <span className="share-prog-bar">
-                    <span className={zipping ? "indet" : ""} style={{ width: zipping ? "100%" : `${pct}%` }} />
-                  </span>
-                  <span className="dim share-prog-text">
-                    {zipping
-                      ? "打包中…"
-                      : done
-                      ? "已完成"
-                      : `${fmtBytes(p.transferred)} / ${fmtBytes(p.size)} · ${Math.round(pct)}%`}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
+        {/* 上传进度/中断已移到全局「上传任务」面板（关闭弹框也能看到） */}
 
         {/* 密码框 */}
         {pwOpen && (
@@ -622,24 +610,34 @@ export default function ShareBrowser({
           </div>
         )}
 
-        {/* 上传覆盖二次确认 */}
-        {overwrite && (
+        {/* 上传二次确认：文件夹一律确认；有同名提示覆盖 */}
+        {uploadConfirm && (
           <div className="modal-overlay">
             <div className="modal share-subdialog" onClick={(e) => e.stopPropagation()}>
-              <div style={{ fontSize: 13 }}>
-                已存在同名项：{overwrite.names.join("、")}，继续上传将<b>覆盖</b>它们。
+              <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+                {uploadConfirm.folders.length > 0 && (
+                  <div>
+                    将上传文件夹：<b>{uploadConfirm.folders.join("、")}</b>（会打包整个目录上传）
+                  </div>
+                )}
+                {uploadConfirm.collisions.length > 0 && (
+                  <div>
+                    已存在同名项：{uploadConfirm.collisions.join("、")}，将<b>覆盖</b>。
+                  </div>
+                )}
+                <div>确认上传？</div>
               </div>
               <div className="modal-actions">
-                <button className="btn btn-ghost" onClick={() => setOverwrite(null)}>取消</button>
+                <button className="btn btn-ghost" onClick={() => setUploadConfirm(null)}>取消</button>
                 <button
-                  className="btn btn-danger"
+                  className={uploadConfirm.collisions.length > 0 ? "btn btn-danger" : "btn btn-primary"}
                   onClick={() => {
-                    const locals = overwrite.locals;
-                    setOverwrite(null);
+                    const locals = uploadConfirm.locals;
+                    setUploadConfirm(null);
                     doUpload(locals);
                   }}
                 >
-                  覆盖上传
+                  {uploadConfirm.collisions.length > 0 ? "覆盖上传" : "确认上传"}
                 </button>
               </div>
             </div>

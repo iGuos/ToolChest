@@ -233,6 +233,7 @@ struct Inner {
     sessions: HashMap<String, Session>, // sessionId -> 会话
     cancelled: HashSet<String>,         // 已取消的 sessionId（收发双向）
     cancelled_sends: HashSet<String>,   // 发送方取消的 fileId（对方还没接受前就撤销发送）
+    share_uploads: HashMap<String, Arc<std::sync::atomic::AtomicBool>>, // taskId -> 中断标志（打包/传输都会检查）
     socket: Option<Arc<UdpSocket>>,
 }
 
@@ -339,6 +340,7 @@ impl Default for Inner {
             sessions: HashMap::new(),
             cancelled: HashSet::new(),
             cancelled_sends: HashSet::new(),
+            share_uploads: HashMap::new(),
             socket: None,
         };
         // 落盘一次，确保（尤其是随机指纹）下次启动可复用
@@ -581,6 +583,8 @@ pub async fn lan_start(app: AppHandle, state: State<'_, LanState>) -> Result<ser
         state.0.lock().unwrap().started = false;
         format!("端口 {PORT} 被占用，局域网服务无法启动（可能已有一个百宝箱在运行）。请关闭占用该端口的程序后点「重试」。详情：{e}")
     })?;
+    // 绑定成功（确认是本机唯一实例）后，清理上次崩溃可能残留的临时 zip
+    cleanup_stale_zips(&state.0.lock().unwrap().download_dir.clone());
     {
         let app = app.clone();
         let state = state.clone();
@@ -1533,20 +1537,35 @@ fn zip_add_dir(
     base: &std::path::Path,
     dir: &std::path::Path,
     opts: zip::write::SimpleFileOptions,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        }
         let entry = entry?;
         let path = entry.path();
         let rel = path.strip_prefix(base).unwrap_or(&path);
         let name = rel.to_string_lossy().replace('\\', "/");
         if path.is_dir() {
             let _ = zw.add_directory(format!("{name}/"), opts);
-            zip_add_dir(zw, base, &path, opts)?;
+            zip_add_dir(zw, base, &path, opts, cancel)?;
         } else {
             zw.start_file(name, opts)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             let mut f = File::open(&path)?;
-            std::io::copy(&mut f, zw)?;
+            // 分块拷贝，每块检查一次中断 —— 否则拷大文件时点「中断」要等整文件拷完才生效
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+                }
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                zw.write_all(&buf[..n])?;
+            }
         }
     }
     Ok(())
@@ -1582,7 +1601,8 @@ fn handle_share_zip(state: &LanState, request: tiny_http::Request, query: &str) 
         if let Some(top) = dir.file_name().and_then(|n| n.to_str()) {
             let _ = zw.add_directory(format!("{top}/"), opts);
         }
-        zip_add_dir(&mut zw, base, &dir, opts)?;
+        let no_cancel = std::sync::atomic::AtomicBool::new(false);
+        zip_add_dir(&mut zw, base, &dir, opts, &no_cancel)?;
         zw.finish()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(())
@@ -2240,13 +2260,18 @@ pub async fn lan_share_download(
 struct ShareUploadReader {
     inner: File,
     app: AppHandle,
+    task_id: String,
     name: String,
     sent: u64,
     size: u64,
     last_emit: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Read for ShareUploadReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        }
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.sent += n as u64;
@@ -2254,7 +2279,7 @@ impl Read for ShareUploadReader {
                 self.last_emit = self.sent;
                 let _ = self.app.emit(
                     "lan://share-upload",
-                    serde_json::json!({ "name": self.name, "transferred": self.sent, "size": self.size }),
+                    serde_json::json!({ "taskId": self.task_id, "name": self.name, "transferred": self.sent, "size": self.size, "phase": "upload" }),
                 );
             }
         }
@@ -2270,6 +2295,7 @@ pub async fn lan_share_upload(
     state: State<'_, LanState>,
     fingerprint: String,
     id: String,
+    task_id: String,
     dest_dir: String,
     local_path: String,
     auth: Option<String>,
@@ -2283,19 +2309,23 @@ pub async fn lan_share_upload(
         .filter(|s| !s.is_empty())
         .unwrap_or("file")
         .to_string();
-    tauri::async_runtime::spawn_blocking(move || {
+    // 注册该任务的中断标志
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.0.lock().unwrap().share_uploads.insert(task_id.clone(), cancel.clone());
+
+    let (capp, ctid, cname) = (app.clone(), task_id.clone(), name.clone());
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        use std::sync::atomic::Ordering::Relaxed;
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(8))
             .build()
             .map_err(|e| e.to_string())?;
         let lp = std::path::Path::new(&local_path);
-        // 上传源：文件夹 → 本地打成 zip；文件 → 直接传
         let is_dir = lp.is_dir();
         let (send_path, endpoint, query_path, cleanup_zip): (PathBuf, &str, String, bool) = if is_dir {
-            // 先发一条「打包中」信号（size=0），前端据此显示压缩阶段提示
-            let _ = app.emit(
+            let _ = capp.emit(
                 "lan://share-upload",
-                serde_json::json!({ "name": name, "transferred": 0u64, "size": 0u64, "phase": "zip" }),
+                serde_json::json!({ "taskId": ctid, "name": cname, "transferred": 0u64, "size": 0u64, "phase": "zip" }),
             );
             let tmp = std::env::temp_dir().join(format!("baibao_send_{}.zip", rand_hex(8)));
             let base_dir = lp.parent().unwrap_or(lp);
@@ -2304,38 +2334,40 @@ pub async fn lan_share_upload(
                 let mut zw = zip::ZipWriter::new(file);
                 let opts = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated);
-                let _ = zw.add_directory(format!("{name}/"), opts);
-                zip_add_dir(&mut zw, base_dir, lp, opts)?;
+                let _ = zw.add_directory(format!("{cname}/"), opts);
+                zip_add_dir(&mut zw, base_dir, lp, opts, &cancel)?;
                 zw.finish()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 Ok(())
             })();
             if build.is_err() {
                 let _ = std::fs::remove_file(&tmp);
+                if cancel.load(Relaxed) {
+                    return Err("cancelled".to_string());
+                }
                 return Err("打包文件夹失败".to_string());
             }
             (tmp, "share/upload-zip", dest_dir.clone(), true)
         } else {
-            // 文件：目标路径 = dest_dir/name（dest_dir 为空则就是 name）
             let qp = if dest_dir.is_empty() {
-                name.clone()
+                cname.clone()
             } else {
-                format!("{dest_dir}/{name}")
+                format!("{dest_dir}/{cname}")
             };
             (lp.to_path_buf(), "share/upload", qp, false)
         };
 
-        let size = std::fs::metadata(&send_path)
-            .map_err(|e| format!("读取失败：{e}"))?
-            .len();
+        let size = std::fs::metadata(&send_path).map_err(|e| format!("读取失败：{e}"))?.len();
         let f = File::open(&send_path).map_err(|e| format!("打开失败：{e}"))?;
         let reader = ShareUploadReader {
             inner: f,
-            app: app.clone(),
-            name: name.clone(),
+            app: capp.clone(),
+            task_id: ctid.clone(),
+            name: cname.clone(),
             sent: 0,
             size,
             last_emit: 0,
+            cancel: cancel.clone(),
         };
         let body = reqwest::blocking::Body::sized(reader, size);
         let mut req = client
@@ -2349,15 +2381,49 @@ pub async fn lan_share_upload(
         if cleanup_zip {
             let _ = std::fs::remove_file(&send_path);
         }
-        let resp = result.map_err(|e| format!("连接失败：{e}"))?;
-        let _ = app.emit(
-            "lan://share-upload",
-            serde_json::json!({ "name": name, "transferred": size, "size": size }),
-        );
+        let resp = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if cancel.load(Relaxed) {
+                    return Err("cancelled".to_string());
+                }
+                return Err(format!("连接失败：{e}"));
+            }
+        };
         share_op_result(resp.status().as_u16())
     })
     .await
-    .map_err(|e| format!("任务调度失败：{e}"))?
+    .map_err(|e| format!("任务调度失败：{e}"))?;
+
+    // 注销中断标志 + 广播终态（done/cancelled/error），让常驻任务面板更新
+    state.0.lock().unwrap().share_uploads.remove(&task_id);
+    let phase = match &res {
+        Ok(_) => "done",
+        Err(e) if e == "cancelled" => "cancelled",
+        Err(_) => "error",
+    };
+    let _ = app.emit(
+        "lan://share-upload",
+        serde_json::json!({ "taskId": task_id, "name": name, "phase": phase }),
+    );
+    res
+}
+
+/// 判断一批本地路径里哪些是目录（前端用于「上传文件夹需二次确认」）。
+#[tauri::command]
+pub fn lan_dir_flags(paths: Vec<String>) -> Vec<bool> {
+    paths
+        .iter()
+        .map(|p| std::path::Path::new(p).is_dir())
+        .collect()
+}
+
+/// 中断指定共享上传任务（打包/传输都会在下一次检查时停止）。
+#[tauri::command]
+pub fn lan_share_upload_cancel(state: State<'_, LanState>, task_id: String) {
+    if let Some(c) = state.0.lock().unwrap().share_uploads.get(&task_id) {
+        c.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// 共享写操作（mkdir/rename/delete）的统一 POST 客户端。
@@ -2933,6 +2999,31 @@ fn parse_query(q: &str) -> HashMap<String, String> {
             Some((k, v))
         })
         .collect()
+}
+
+/// 清理上次运行（含崩溃）残留的临时 zip：系统临时目录里的打包/收发临时包，
+/// 以及接收目录里下载用的 `.baibao_dl_*.zip`。启动时调用一次，best-effort。
+fn cleanup_stale_zips(download_dir: &std::path::Path) {
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.ends_with(".zip")
+                && (n.starts_with("baibao_send_")
+                    || n.starts_with("baibao_share_")
+                    || n.starts_with("baibao_recv_"))
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(download_dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(".baibao_dl_") && n.ends_with(".zip") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 /// 目标目录里取一个不冲突的文件名：foo.txt → foo (1).txt …

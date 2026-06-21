@@ -85,6 +85,15 @@ export interface FileMsg {
 }
 export type ChatItem = TextMsg | FileMsg;
 
+export type UploadPhase = "zip" | "upload" | "done" | "cancelled" | "error";
+export interface UploadTask {
+  id: string;
+  name: string;
+  transferred: number;
+  size: number;
+  phase: UploadPhase;
+}
+
 interface LanCtxValue {
   me: MyInfo | null;
   peers: Peer[];
@@ -99,6 +108,10 @@ interface LanCtxValue {
   setError: (e: string | null) => void;
   serviceError: string | null; // 服务启动失败（如端口被占用）；null=正常
   startService: () => Promise<boolean>; // 重试启动服务
+  uploadTasks: Record<string, UploadTask>; // 共享上传任务（全局）
+  beginUpload: (id: string, name: string) => void;
+  cancelUpload: (id: string) => void;
+  dismissUpload: (id: string) => void;
   refreshPeers: () => Promise<void>;
   requestConfirm: (sessionId: string) => void;
   dismissConfirm: () => void;
@@ -188,6 +201,8 @@ function loadKnownPeers(): Record<string, Peer> {
 export function LanProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<MyInfo | null>(null);
   const [serviceError, setServiceError] = useState<string | null>(null); // 服务启动失败原因（如端口被占用）
+  // 共享上传任务（全局，关闭浏览弹框也能看到）：taskId -> 进度/状态
+  const [uploadTasks, setUploadTasks] = useState<Record<string, UploadTask>>({});
   const [livePeers, setLivePeers] = useState<Peer[]>([]); // 当前在线发现到的设备
   const [knownPeers, setKnownPeers] = useState<Record<string, Peer>>(loadKnownPeers); // 历史已知设备（持久化）
   const [items, setItems] = useState<ChatItem[]>(loadItems);
@@ -363,6 +378,21 @@ export function LanProvider({ children }: { children: ReactNode }) {
     if (fp) setUnread((u) => (u[fp] ? { ...u, [fp]: 0 } : u));
   }, []);
 
+  // 上传任务：开始时占位（保证立即可见）、取消、清除
+  const beginUpload = useCallback((id: string, name: string) => {
+    setUploadTasks((m) => ({ ...m, [id]: { id, name, transferred: 0, size: 0, phase: "upload" } }));
+  }, []);
+  const cancelUpload = useCallback((id: string) => {
+    invoke("lan_share_upload_cancel", { taskId: id }).catch(() => {});
+  }, []);
+  const dismissUpload = useCallback((id: string) => {
+    setUploadTasks((m) => {
+      const n = { ...m };
+      delete n[id];
+      return n;
+    });
+  }, []);
+
   useEffect(() => {
     let alive = true;
     const unsubs: UnlistenFn[] = [];
@@ -372,6 +402,39 @@ export function LanProvider({ children }: { children: ReactNode }) {
       if (alive) await startService();
 
       track(await listen<Peer[]>("lan://peers", (e) => setLivePeers(e.payload)));
+      // 共享上传进度/终态（全局跟踪，不依赖浏览弹框是否打开）
+      track(
+        await listen<{ taskId?: string; name?: string; transferred?: number; size?: number; phase?: UploadPhase }>(
+          "lan://share-upload",
+          (e) => {
+            const { taskId, name, transferred, size, phase } = e.payload;
+            if (!taskId) return;
+            setUploadTasks((m) => {
+              const prev = m[taskId] ?? { id: taskId, name: name ?? "", transferred: 0, size: 0, phase: "upload" as UploadPhase };
+              return {
+                ...m,
+                [taskId]: {
+                  id: taskId,
+                  name: name ?? prev.name,
+                  transferred: typeof transferred === "number" ? transferred : prev.transferred,
+                  size: typeof size === "number" ? size : prev.size,
+                  phase: phase ?? prev.phase,
+                },
+              };
+            });
+            // 完成/取消的任务过几秒自动消失；失败保留待用户手动关闭
+            if (phase === "done" || phase === "cancelled") {
+              setTimeout(() => {
+                setUploadTasks((m) => {
+                  const n = { ...m };
+                  delete n[taskId];
+                  return n;
+                });
+              }, 4000);
+            }
+          }
+        )
+      );
       track(
         await listen<Incoming>("lan://incoming", (e) => {
           // 不立即弹窗：登记请求 + 在对话里放「待接收」文件气泡
@@ -871,6 +934,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
     serviceError, startService,
+    uploadTasks, beginUpload, cancelUpload, dismissUpload,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
     sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend,

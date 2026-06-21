@@ -326,6 +326,88 @@ select { cursor: pointer; }
 .lan-netiface-tag.overlay {
   background: var(--accent, #1f6feb);
 }
+/* 全局上传任务面板（右下角浮层，关闭共享弹框后仍可见） */
+.upload-tasks {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2500;
+  width: 300px;
+  max-height: 50vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.upload-tasks-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.upload-tasks-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+.upload-tasks-pill {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2500;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+.upload-tasks-pill:hover {
+  border-color: var(--accent);
+}
+.upload-task {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.upload-task-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.upload-task-name {
+  flex: 1;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-task-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.upload-task-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent, #1f6feb);
+  transition: width 0.15s;
+}
+.upload-task-bar > span.indet {
+  background: linear-gradient(90deg, transparent, var(--accent, #1f6feb), transparent);
+  animation: share-indet 1s linear infinite;
+}
+.upload-task-text {
+  font-size: 11px;
+}
+
 /* 局域网服务启动失败（端口占用等）的常驻提示条 */
 .lan-service-error {
   display: flex;
@@ -515,6 +597,20 @@ select { cursor: pointer; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.share-banner-x {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.share-banner-x:hover {
+  opacity: 1;
+}
 /* 选中批量操作条 */
 .share-selbar {
   display: flex;
@@ -608,6 +704,12 @@ select { cursor: pointer; }
   0% { opacity: 0.35; }
   50% { opacity: 1; }
   100% { opacity: 0.35; }
+}
+.share-prog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 .share-prog-title {
   font-size: 11px;
