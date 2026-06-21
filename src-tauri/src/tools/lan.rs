@@ -237,15 +237,78 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 读取操作系统的稳定机器标识（不直接对外暴露，仅用于派生设备 ID）。
+#[cfg(target_os = "macos")]
+fn machine_id() -> Option<String> {
+    let out = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if line.contains("IOPlatformUUID") {
+            if let Some(eq) = line.find('=') {
+                let v = line[eq + 1..].trim().trim_matches('"').to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn machine_id() -> Option<String> {
+    let out = std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
+            "/v",
+            "MachineGuid",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if line.contains("MachineGuid") {
+            if let Some(v) = line.split_whitespace().last() {
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn machine_id() -> Option<String> {
+    std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 由机器标识派生稳定的设备指纹：sha256 后取前 32 位十六进制（不直接暴露原始机器 UUID）。
+fn machine_fingerprint() -> Option<String> {
+    let id = machine_id()?;
+    Some(sha256_hex(id.trim()).chars().take(32).collect())
+}
+
 impl Default for Inner {
     fn default() -> Self {
         let home = home_dir();
         // 从配置文件读回别名/指纹/兼容/接收目录，保证重启后稳定
         let cfg = load_config();
         let alias = cfg.alias.filter(|s| !s.is_empty()).unwrap_or_else(default_alias);
+        // 设备唯一 ID（指纹）：优先用已持久化的；否则用「机器稳定标识」派生（跨重启/换 IP/重装都不变，
+        // 避免同一台设备被识别成多个）；都拿不到才退回随机串。
         let fingerprint = cfg
             .fingerprint
             .filter(|s| !s.is_empty())
+            .or_else(machine_fingerprint)
             .unwrap_or_else(|| rand_hex(16));
         let compat = cfg.compat.unwrap_or(false);
         let invisible = cfg.invisible.unwrap_or(false);
@@ -859,12 +922,6 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
 
-    // WebDAV：把共享目录映射成系统磁盘（macOS 访达 / Windows 盘符）走这里，路径前缀 /webdav
-    if path == "/webdav" || path.starts_with("/webdav/") {
-        handle_webdav(&state, request, &method, &path);
-        return;
-    }
-
     let result: Result<(), ()> = match (method.as_str(), path.as_str()) {
         ("GET", "/api/localsend/v2/info") => {
             let info = state.device_info(None);
@@ -1019,6 +1076,10 @@ fn auth_is_locked(g: &Inner, ip: &str) -> bool {
 /// 记一次失败：滑动窗口内累计；达到上限则进入锁定期。
 fn auth_record_fail(g: &mut Inner, ip: &str) {
     let now = now_ms();
+    // 顺手清理过期条目（既未锁定、窗口也早已过期），避免 auth_fails 随 IP 数无限增长。
+    g.auth_fails.retain(|_, f| {
+        f.locked_until_ms > now || now.saturating_sub(f.window_start_ms) <= AUTH_WINDOW_MS
+    });
     let f = g.auth_fails.entry(ip.to_string()).or_default();
     if now.saturating_sub(f.window_start_ms) > AUTH_WINDOW_MS {
         f.window_start_ms = now;
@@ -1178,239 +1239,6 @@ fn handle_share_download(state: &LanState, request: tiny_http::Request, query: &
             let _ = request.respond(resp);
         }
         Err(_) => respond_text(request, 500, "open failed"),
-    }
-}
-
-// ── 共享磁盘：只读 WebDAV（供系统挂载成盘符/访达卷）──────────────
-// 复用上面的共享配置/鉴权/路径防护；只实现挂载只读卷所需的 OPTIONS/PROPFIND/GET/HEAD。
-
-fn dav_hdr(name: &str, value: &str) -> Option<tiny_http::Header> {
-    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).ok()
-}
-
-fn url_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let hexv = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hexv(b[i + 1]), hexv(b[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// 百分号编码路径（保留 `/` 与 unreserved 字符），用于 PROPFIND 的 href。
-fn url_encode_path(s: &str) -> String {
-    let mut out = String::new();
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// 校验 HTTP Basic 认证：取出密码部分，与共享的明文密码比对。
-fn check_basic_auth(req: &tiny_http::Request, expected: &str) -> bool {
-    use base64::Engine as _;
-    let Some(h) = header_value(req, "Authorization") else {
-        return false;
-    };
-    let Some(b64) = h.strip_prefix("Basic ").or_else(|| h.strip_prefix("basic ")) else {
-        return false;
-    };
-    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
-        return false;
-    };
-    let s = String::from_utf8_lossy(&raw);
-    let pass = s.splitn(2, ':').nth(1).unwrap_or("");
-    pass == expected
-}
-
-fn dav_entry(href: &str, name: &str, meta: &std::fs::Metadata) -> String {
-    let modified = meta.modified().map(httpdate::fmt_http_date).unwrap_or_default();
-    let mut s = String::from("<D:response>");
-    s.push_str(&format!("<D:href>{}</D:href>", xml_escape(href)));
-    s.push_str("<D:propstat><D:prop>");
-    s.push_str(&format!("<D:displayname>{}</D:displayname>", xml_escape(name)));
-    if meta.is_dir() {
-        s.push_str("<D:resourcetype><D:collection/></D:resourcetype>");
-    } else {
-        s.push_str("<D:resourcetype/>");
-        s.push_str(&format!("<D:getcontentlength>{}</D:getcontentlength>", meta.len()));
-    }
-    if !modified.is_empty() {
-        s.push_str(&format!("<D:getlastmodified>{modified}</D:getlastmodified>"));
-    }
-    s.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>");
-    s
-}
-
-fn webdav_propfind(request: tiny_http::Request, fspath: &std::path::Path, req_path: &str, root_name: &str) {
-    let depth = header_value(&request, "Depth").unwrap_or_else(|| "1".into());
-    let Ok(meta) = std::fs::metadata(fspath) else {
-        return respond_text(request, 404, "not found");
-    };
-    let self_name = fspath
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root_name.to_string());
-    let mut body = String::from(r#"<?xml version="1.0" encoding="utf-8"?>"#);
-    body.push_str(r#"<D:multistatus xmlns:D="DAV:">"#);
-    body.push_str(&dav_entry(req_path, &self_name, &meta));
-    if meta.is_dir() && depth != "0" {
-        let base = if req_path.ends_with('/') {
-            req_path.to_string()
-        } else {
-            format!("{req_path}/")
-        };
-        if let Ok(rd) = std::fs::read_dir(fspath) {
-            for e in rd.flatten() {
-                let Ok(cm) = e.metadata() else { continue };
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let mut href = format!("{base}{}", url_encode_path(&name));
-                if cm.is_dir() {
-                    href.push('/');
-                }
-                body.push_str(&dav_entry(&href, &name, &cm));
-            }
-        }
-    }
-    body.push_str("</D:multistatus>");
-    let mut resp = tiny_http::Response::from_string(body).with_status_code(207);
-    if let Some(h) = dav_hdr("Content-Type", "application/xml; charset=utf-8") {
-        resp.add_header(h);
-    }
-    let _ = request.respond(resp);
-}
-
-fn webdav_get(request: tiny_http::Request, fspath: &std::path::Path, head: bool) {
-    if !fspath.is_file() {
-        return respond_text(request, 405, "not a file");
-    }
-    let name = fspath.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let ctype = ext_mime(name);
-    if head {
-        let len = std::fs::metadata(fspath).map(|m| m.len()).unwrap_or(0);
-        let mut resp = tiny_http::Response::empty(200);
-        if let Some(h) = dav_hdr("Content-Type", &ctype) {
-            resp.add_header(h);
-        }
-        if let Some(h) = dav_hdr("Content-Length", &len.to_string()) {
-            resp.add_header(h);
-        }
-        let _ = request.respond(resp);
-        return;
-    }
-    match File::open(fspath) {
-        Ok(f) => {
-            let mut resp = tiny_http::Response::from_file(f);
-            if let Some(h) = dav_hdr("Content-Type", &ctype) {
-                resp.add_header(h);
-            }
-            let _ = request.respond(resp);
-        }
-        Err(_) => respond_text(request, 500, "open failed"),
-    }
-}
-
-fn handle_webdav(state: &LanState, request: tiny_http::Request, method: &str, path: &str) {
-    // OPTIONS：宣告 DAV 能力，挂载客户端据此识别这是 WebDAV
-    if method == "OPTIONS" {
-        let mut resp = tiny_http::Response::empty(200);
-        for (k, v) in [
-            ("DAV", "1,2"),
-            ("Allow", "OPTIONS, GET, HEAD, PROPFIND"),
-            ("MS-Author-Via", "DAV"),
-            ("Content-Length", "0"),
-        ] {
-            if let Some(h) = dav_hdr(k, v) {
-                resp.add_header(h);
-            }
-        }
-        let _ = request.respond(resp);
-        return;
-    }
-
-    let rest = path.strip_prefix("/webdav").unwrap_or("").trim_start_matches('/');
-    let segs: Vec<String> = rest.split('/').filter(|s| !s.is_empty()).map(url_decode).collect();
-    let Some(share_id) = segs.first().cloned() else {
-        return respond_text(request, 404, "no share");
-    };
-    let rel = segs[1..].join("/");
-    let (root, password, share_name) = {
-        let g = state.0.lock().unwrap();
-        match g.shares.iter().find(|s| s.id == share_id) {
-            Some(s) => (s.path.clone(), s.password.clone(), s.name.clone()),
-            None => return respond_text(request, 404, "no share"),
-        }
-    };
-    if let Some(pw) = &password {
-        let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-        let ok = check_basic_auth(&request, pw);
-        // 同一套防暴力破解限流（按来源 IP）
-        let deny: Option<u16> = {
-            let mut g = state.0.lock().unwrap();
-            if auth_is_locked(&g, &ip) {
-                Some(429)
-            } else if ok {
-                auth_record_success(&mut g, &ip);
-                None
-            } else {
-                auth_record_fail(&mut g, &ip);
-                Some(if auth_is_locked(&g, &ip) { 429 } else { 401 })
-            }
-        };
-        if let Some(code) = deny {
-            let resp = if code == 429 {
-                tiny_http::Response::from_string("尝试过多，请稍后再试").with_status_code(429)
-            } else {
-                let realm = share_name.replace('"', "");
-                let mut r = tiny_http::Response::from_string("Unauthorized").with_status_code(401);
-                if let Some(h) = dav_hdr("WWW-Authenticate", &format!("Basic realm=\"{realm}\"")) {
-                    r.add_header(h);
-                }
-                r
-            };
-            let _ = request.respond(resp);
-            return;
-        }
-    }
-    let Some(fspath) = resolve_share_path(&root, &rel) else {
-        return respond_text(request, 403, "bad path");
-    };
-    match method {
-        "PROPFIND" => webdav_propfind(request, &fspath, path, &share_name),
-        "GET" | "HEAD" => webdav_get(request, &fspath, method == "HEAD"),
-        _ => respond_text(request, 405, "method not allowed"),
     }
 }
 
@@ -1994,56 +1822,6 @@ pub async fn lan_share_download(
         let mut f = File::create(&dest).map_err(|e| format!("无法写入：{e}"))?;
         resp.copy_to(&mut f).map_err(|e| format!("下载中断：{e}"))?;
         Ok(dest.to_string_lossy().to_string())
-    })
-    .await
-    .map_err(|e| format!("任务调度失败：{e}"))?
-}
-
-/// 把对端某共享映射成系统磁盘：macOS 走访达(osascript mount volume)，Windows 走 `net use` 盘符。
-/// 加锁的共享由系统在挂载时弹出账号密码框并存入钥匙串/凭据(即「保存签名」)。
-#[tauri::command]
-pub async fn lan_mount_share(
-    state: State<'_, LanState>,
-    fingerprint: String,
-    share_id: String,
-) -> Result<String, String> {
-    let state = state.inner().clone();
-    let (base, _) = peer_base_url(&state, &fingerprint)?;
-    let url = format!("{base}/webdav/{share_id}/");
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
-        {
-            // 访达挂载：加锁时弹凭据框，挂载后出现在访达「位置」里
-            let script = format!("mount volume \"{url}\"");
-            let out = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(&script)
-                .output()
-                .map_err(|e| format!("挂载失败：{e}"))?;
-            if out.status.success() {
-                Ok("已在访达中挂载该共享".to_string())
-            } else {
-                Err(format!("挂载失败：{}", String::from_utf8_lossy(&out.stderr).trim()))
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            // 映射一个空闲盘符；加锁时系统会提示输入账号密码
-            let out = std::process::Command::new("net")
-                .args(["use", "*", &url, "/persistent:no"])
-                .output()
-                .map_err(|e| format!("映射失败：{e}"))?;
-            if out.status.success() {
-                Ok("已在资源管理器中映射为磁盘盘符".to_string())
-            } else {
-                Err(format!("映射失败：{}", String::from_utf8_lossy(&out.stderr).trim()))
-            }
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let _ = url;
-            Err("当前系统不支持磁盘映射".to_string())
-        }
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))?

@@ -38,7 +38,6 @@ pub fn run() {
             tools::lan::lan_share_roots,
             tools::lan::lan_share_list,
             tools::lan::lan_share_download,
-            tools::lan::lan_mount_share,
             tools::lan::lan_respond,
             tools::lan::lan_pick_files,
             tools::lan::lan_pick_dir,

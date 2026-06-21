@@ -856,7 +856,7 @@ export default function LanShare() {
                 >
                   修改备注
                 </button>
-                {(p?.shares ?? 0) > 0 && p?.online !== false && (
+                {p?.online !== false && (
                   <button
                     className="tab-menu-item"
                     onClick={() => {

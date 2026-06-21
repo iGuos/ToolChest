@@ -51,20 +51,6 @@ export default function ShareBrowser({
   const [pw, setPw] = useState(""); // 密码输入（弹框打开时）
   const [pwOpen, setPwOpen] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
-  const [mounting, setMounting] = useState<string | null>(null);
-
-  const mountShare = async (sh: ShareRoot) => {
-    setMounting(sh.id);
-    setErr(null);
-    try {
-      const msg = await invoke<string>("lan_mount_share", { fingerprint, shareId: sh.id });
-      setNotice(msg);
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setMounting(null);
-    }
-  };
 
   useEffect(() => {
     setLoading(true);
@@ -189,22 +175,11 @@ export default function ShareBrowser({
             <>
               {roots && roots.length === 0 && <div className="dim">对方没有共享目录</div>}
               {roots?.map((r) => (
-                <div key={r.id} className="share-item isdir" onClick={() => load(r, [])}>
+                <button key={r.id} className="share-item isdir" onClick={() => load(r, [])}>
                   <span className="share-ic">📁</span>
                   <span className="share-name">{r.name}</span>
                   {r.locked && <span className="share-lock" title="需要密码">🔒</span>}
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    title="映射成系统磁盘（macOS 访达 / Windows 盘符）"
-                    onClick={(ev) => {
-                      ev.stopPropagation();
-                      mountShare(r);
-                    }}
-                    disabled={mounting === r.id}
-                  >
-                    {mounting === r.id ? "映射中…" : "映射磁盘"}
-                  </button>
-                </div>
+                </button>
               ))}
             </>
           ) : (
