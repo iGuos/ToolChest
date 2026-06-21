@@ -322,9 +322,20 @@ export default function LanShare() {
 
   // 查看对方共享文件的浏览器弹框
   const [shareView, setShareView] = useState<{ fp: string; name: string } | null>(null);
+  const shareOpenRef = useRef(false);
+  shareOpenRef.current = !!shareView;
 
   // 我自己的共享目录（设置面板内管理）
-  interface ShareView { id: string; name: string; path: string; locked: boolean; password?: string | null }
+  interface ShareView {
+    id: string;
+    name: string;
+    path: string;
+    locked: boolean;
+    password?: string | null;
+    canCreate: boolean;
+    canModify: boolean;
+    canDelete: boolean;
+  }
   const [myShares, setMyShares] = useState<ShareView[]>([]);
   useEffect(() => {
     if (!setOpen) return;
@@ -349,6 +360,21 @@ export default function LanShare() {
   const setSharePassword = async (id: string, password: string | null) => {
     try {
       setMyShares(await invoke<ShareView[]>("lan_set_share_password", { id, password }));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const setSharePerms = async (s: ShareView, patch: Partial<Pick<ShareView, "canCreate" | "canModify" | "canDelete">>) => {
+    try {
+      const next = { canCreate: s.canCreate, canModify: s.canModify, canDelete: s.canDelete, ...patch };
+      setMyShares(
+        await invoke<ShareView[]>("lan_set_share_perms", {
+          id: s.id,
+          canCreate: next.canCreate,
+          canModify: next.canModify,
+          canDelete: next.canDelete,
+        })
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -464,6 +490,7 @@ export default function LanShare() {
       .onDragDropEvent((e) => {
         const visible = bodyRef.current && bodyRef.current.offsetParent !== null;
         if (!visible) return;
+        if (shareOpenRef.current) return; // 共享浏览器打开时，拖入交给它做上传，不在这里发送
         const p = e.payload;
         if (p.type === "over") setDragOver(!!selectedRef.current);
         else if (p.type === "drop") {
@@ -712,12 +739,7 @@ export default function LanShare() {
               {p.pinned && <span className="lan-peer-corner" title="已置顶" />}
               <span className="lan-peer-icon"><DeviceIcon peer={p} /></span>
               <span className="lan-peer-info">
-                <span className="lan-peer-alias">
-                  {p.remark || p.alias}
-                  {p.online !== false && (p.shares ?? 0) > 0 && (
-                    <span className="lan-share-tag" title="有共享目录">共享</span>
-                  )}
-                </span>
+                <span className="lan-peer-alias">{p.remark || p.alias}</span>
                 <span className="lan-peer-sub dim">
                   {p.remark
                     ? p.alias
@@ -726,11 +748,10 @@ export default function LanShare() {
                     : `${p.ip} ${p.isBaibao ? "· 百宝箱" : "· LocalSend"}`}
                 </span>
               </span>
+              {p.online !== false && (p.shares ?? 0) > 0 && (
+                <span className="lan-share-tag" title="有共享目录">共享</span>
+              )}
               {unread[p.fingerprint] > 0 && <span className="lan-badge">{unread[p.fingerprint]}</span>}
-              <span
-                className={`lan-peer-dot${p.online === false ? "" : " on"}`}
-                title={p.online === false ? "离线" : "在线"}
-              />
             </button>
           ))}
         </div>
@@ -856,7 +877,7 @@ export default function LanShare() {
                 >
                   修改备注
                 </button>
-                {p?.online !== false && (
+                {p?.online !== false && (p?.shares ?? 0) > 0 && (
                   <button
                     className="tab-menu-item"
                     onClick={() => {
@@ -994,32 +1015,36 @@ export default function LanShare() {
               <h3>局域网互传设置</h3>
               <button className="modal-close" onClick={() => setSetOpen(false)}>×</button>
             </div>
-            <div className="settings-field">
-              <span>设备名</span>
-              <input
-                className="kv-input"
-                style={{ width: 200 }}
-                value={aliasDraft}
-                onChange={(e) => setAliasDraft(e.target.value)}
-                onBlur={() => aliasDraft.trim() && aliasDraft.trim() !== me?.alias && setAlias(aliasDraft)}
-                onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-              />
-            </div>
-            <div className="settings-field">
-              <span>兼容 LocalSend（可与手机/电脑上的 LocalSend 互传）</span>
-              <label className="switch">
+
+            <div className="settings-section">
+              <div className="settings-section-title">基本</div>
+              <div className="settings-field">
+                <span>设备名</span>
                 <input
-                  type="checkbox"
-                  checked={!!me?.compat}
-                  onChange={(e) => setCompat(e.target.checked)}
+                  className="kv-input"
+                  style={{ width: 200 }}
+                  value={aliasDraft}
+                  onChange={(e) => setAliasDraft(e.target.value)}
+                  onBlur={() => aliasDraft.trim() && aliasDraft.trim() !== me?.alias && setAlias(aliasDraft)}
+                  onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
                 />
-                <span className="switch-slider" />
-              </label>
-            </div>
-            <div className="settings-field">
-              <span>接收目录</span>
-              <span className="settings-field-val dim" title={me?.downloadDir}>{me?.downloadDir}</span>
-              <button className="btn btn-ghost btn-sm" onClick={pickDir}>更改</button>
+              </div>
+              <div className="settings-field">
+                <span>兼容 LocalSend（可与手机/电脑上的 LocalSend 互传）</span>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={!!me?.compat}
+                    onChange={(e) => setCompat(e.target.checked)}
+                  />
+                  <span className="switch-slider" />
+                </label>
+              </div>
+              <div className="settings-field">
+                <span>接收目录</span>
+                <span className="settings-field-val dim" title={me?.downloadDir}>{me?.downloadDir}</span>
+                <button className="btn btn-ghost btn-sm" onClick={pickDir}>更改</button>
+              </div>
             </div>
 
             <div className="lan-shares">
@@ -1036,20 +1061,37 @@ export default function LanShare() {
                 <ul className="lan-share-mgr">
                   {myShares.map((s) => (
                     <li key={s.id} className="lan-share-mgr-item">
-                      <span className="lan-share-mgr-name">{s.name}</span>
-                      <span className="lan-share-mgr-path dim" title={s.path}>{s.path}</span>
-                      {s.locked ? (
-                        <span className="share-lock" title="已设密码">🔒</span>
-                      ) : (
-                        <span className="dim" style={{ fontSize: 11 }}>无密码</span>
-                      )}
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        onClick={() => setPwEdit({ id: s.id, name: s.name, value: s.password ?? "" })}
-                      >
-                        改密码
-                      </button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => removeShare(s.id)}>移除</button>
+                      <div className="lan-share-mgr-row">
+                        <span className="lan-share-mgr-name">{s.name}</span>
+                        <span className="lan-share-mgr-path dim" title={s.path}>{s.path}</span>
+                        {s.locked ? (
+                          <span className="share-lock" title="已设密码">🔒</span>
+                        ) : (
+                          <span className="dim" style={{ fontSize: 11 }}>无密码</span>
+                        )}
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => setPwEdit({ id: s.id, name: s.name, value: s.password ?? "" })}
+                        >
+                          改密码
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => removeShare(s.id)}>移除</button>
+                      </div>
+                      <div className="lan-share-perms dim">
+                        <span>授予权限:</span>
+                        <label>
+                          <input type="checkbox" checked={s.canCreate} onChange={(e) => setSharePerms(s, { canCreate: e.target.checked })} />
+                          新增
+                        </label>
+                        <label>
+                          <input type="checkbox" checked={s.canModify} onChange={(e) => setSharePerms(s, { canModify: e.target.checked })} />
+                          修改
+                        </label>
+                        <label>
+                          <input type="checkbox" checked={s.canDelete} onChange={(e) => setSharePerms(s, { canDelete: e.target.checked })} />
+                          删除
+                        </label>
+                      </div>
                     </li>
                   ))}
                 </ul>

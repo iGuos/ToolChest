@@ -202,6 +202,13 @@ struct ShareCfg {
     path: String,
     #[serde(default, alias = "passwordHash")]
     password: Option<String>,
+    // 授予访问方的写权限（读取默认开放）。
+    #[serde(default)]
+    can_create: bool,
+    #[serde(default)]
+    can_modify: bool,
+    #[serde(default)]
+    can_delete: bool,
 }
 
 /// 某来源 IP 的共享密码失败记录（防暴力破解）。
@@ -1000,6 +1007,26 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             handle_share_download(&state, request, &query);
             Ok(())
         }
+        ("GET", "/api/baibao/v1/share/zip") => {
+            handle_share_zip(&state, request, &query);
+            Ok(())
+        }
+        ("POST", "/api/baibao/v1/share/upload") => {
+            handle_share_upload(&state, request, &query);
+            Ok(())
+        }
+        ("POST", "/api/baibao/v1/share/mkdir") => {
+            handle_share_mkdir(&state, request, &query);
+            Ok(())
+        }
+        ("POST", "/api/baibao/v1/share/rename") => {
+            handle_share_rename(&state, request, &query);
+            Ok(())
+        }
+        ("POST", "/api/baibao/v1/share/delete") => {
+            handle_share_delete(&state, request, &query);
+            Ok(())
+        }
         ("POST", "/api/localsend/v2/cancel") => {
             respond_text(request, 200, "ok");
             Ok(())
@@ -1134,7 +1161,10 @@ fn handle_share_roots(state: &LanState, request: tiny_http::Request) {
         .shares
         .iter()
         .map(|s| {
-            serde_json::json!({ "id": s.id, "name": s.name, "locked": s.password.is_some() })
+            serde_json::json!({
+                "id": s.id, "name": s.name, "locked": s.password.is_some(),
+                "canCreate": s.can_create, "canModify": s.can_modify, "canDelete": s.can_delete,
+            })
         })
         .collect();
     respond_json(request, 200, &serde_json::Value::Array(list));
@@ -1164,28 +1194,28 @@ fn handle_share_list(state: &LanState, request: tiny_http::Request, query: &str)
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return respond_text(request, 404, "not a directory");
     };
-    // (是否目录, 名称, 大小, 修改时间ms)
-    let mut rows: Vec<(bool, String, u64, u128)> = Vec::new();
+    let ms = |t: std::io::Result<std::time::SystemTime>| -> u128 {
+        t.ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    };
+    // (是否目录, 名称, 大小, 修改时间ms, 创建时间ms)
+    let mut rows: Vec<(bool, String, u64, u128, u128)> = Vec::new();
     for e in rd.flatten() {
         let Ok(meta) = e.metadata() else { continue };
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue; // 跳过隐藏文件
         }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        rows.push((meta.is_dir(), name, meta.len(), mtime));
+        rows.push((meta.is_dir(), name, meta.len(), ms(meta.modified()), ms(meta.created())));
     }
     // 目录在前，再按名称（不区分大小写）排序
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
     let entries: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(dir, name, size, mtime)| {
-            serde_json::json!({ "name": name, "dir": dir, "size": size, "mtime": mtime })
+        .map(|(dir, name, size, mtime, ctime)| {
+            serde_json::json!({ "name": name, "dir": dir, "size": size, "mtime": mtime, "ctime": ctime })
         })
         .collect();
     respond_json(request, 200, &serde_json::json!({ "entries": entries }));
@@ -1240,6 +1270,266 @@ fn handle_share_download(state: &LanState, request: tiny_http::Request, query: &
         }
         Err(_) => respond_text(request, 500, "open failed"),
     }
+}
+
+// ── 共享磁盘：写操作（新增/修改/删除）+ 文件夹打包下载 ───────────
+
+/// 取某共享授予的写权限 (新增, 修改, 删除)。
+fn share_perms(g: &Inner, id: &str) -> (bool, bool, bool) {
+    g.shares
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| (s.can_create, s.can_modify, s.can_delete))
+        .unwrap_or((false, false, false))
+}
+
+/// 统一鉴权（密码+限流）并返回 (共享根, 权限)；失败返回状态码。
+fn share_authorize(
+    state: &LanState,
+    id: &str,
+    auth: Option<&str>,
+    ip: &str,
+) -> Result<(String, (bool, bool, bool)), u16> {
+    let mut g = state.0.lock().unwrap();
+    let root = authorize_with_throttle(&mut g, id, auth, ip)?;
+    let perms = share_perms(&g, id);
+    Ok((root, perms))
+}
+
+/// 把状态码转成应答（401/403/404/429）并返回 true 表示已处理（出错）。
+fn share_err_respond(request: tiny_http::Request, code: u16) {
+    let msg = match code {
+        401 => "auth required",
+        403 => "无权限",
+        429 => "尝试过多，请稍后再试",
+        _ => "not found",
+    };
+    respond_text(request, code, msg);
+}
+
+/// 「新建」类操作的安全路径解析：拒绝 `..`/绝对路径；父目录必须存在且 canonicalize 后在共享根内。
+/// 返回最终目标路径（父目录在根内 + 末段名）。
+fn resolve_create_path(root: &str, rel: &str) -> Option<PathBuf> {
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
+    for c in std::path::Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(p) => comps.push(p.to_os_string()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let name = comps.pop()?;
+    let root_pb = PathBuf::from(root);
+    let mut parent = root_pb.clone();
+    for c in &comps {
+        parent.push(c);
+    }
+    let parent_canon = parent.canonicalize().ok()?;
+    let root_canon = root_pb.canonicalize().ok()?;
+    if !parent_canon.starts_with(&root_canon) {
+        return None;
+    }
+    Some(parent_canon.join(name))
+}
+
+/// 上传文件到共享目录（新增）。path = 目标相对路径（含文件名）；同名直接覆盖（客户端已二次确认）。
+fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
+        return respond_text(request, 400, "missing params");
+    };
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (root, perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    if !perms.0 {
+        return respond_text(request, 403, "无新增权限");
+    }
+    let Some(dest) = resolve_create_path(&root, rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    // 覆盖已存在的同名文件（覆盖确认在客户端做）；但拒绝把已存在的「目录」当文件覆盖
+    if dest.is_dir() {
+        return respond_text(request, 409, "同名目录已存在");
+    }
+    let mut f = match File::create(&dest) {
+        Ok(f) => f,
+        Err(e) => return respond_text(request, 500, &format!("写入失败：{e}")),
+    };
+    let res = std::io::copy(&mut request.as_reader(), &mut f);
+    match res {
+        Ok(_) => respond_text(request, 200, "ok"),
+        Err(_) => {
+            let _ = std::fs::remove_file(&dest);
+            respond_text(request, 500, "写入中断")
+        }
+    }
+}
+
+/// 新建文件夹（新增）。
+fn handle_share_mkdir(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
+        return respond_text(request, 400, "missing params");
+    };
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (root, perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    if !perms.0 {
+        return respond_text(request, 403, "无新增权限");
+    }
+    let Some(dest) = resolve_create_path(&root, rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    match std::fs::create_dir(&dest) {
+        Ok(_) => respond_text(request, 200, "ok"),
+        Err(e) => respond_text(request, 500, &format!("创建失败：{e}")),
+    }
+}
+
+/// 重命名（修改）。path = 源相对路径；to = 新名称（不含路径分隔符）。
+fn handle_share_rename(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(id), Some(rel), Some(to)) = (q.get("id"), q.get("path"), q.get("to")) else {
+        return respond_text(request, 400, "missing params");
+    };
+    if to.contains('/') || to.contains('\\') || to.contains("..") || to.is_empty() {
+        return respond_text(request, 400, "非法名称");
+    }
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (root, perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    if !perms.1 {
+        return respond_text(request, 403, "无修改权限");
+    }
+    let Some(src) = resolve_share_path(&root, rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    let dest = match src.parent() {
+        Some(p) => p.join(to),
+        None => return respond_text(request, 400, "bad path"),
+    };
+    if dest.exists() {
+        return respond_text(request, 409, "目标已存在");
+    }
+    match std::fs::rename(&src, &dest) {
+        Ok(_) => respond_text(request, 200, "ok"),
+        Err(e) => respond_text(request, 500, &format!("重命名失败：{e}")),
+    }
+}
+
+/// 删除文件/文件夹（删除）。
+fn handle_share_delete(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
+        return respond_text(request, 400, "missing params");
+    };
+    if rel.is_empty() {
+        return respond_text(request, 400, "不能删除共享根"); // 防止误删整个共享根
+    }
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (root, perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    if !perms.2 {
+        return respond_text(request, 403, "无删除权限");
+    }
+    let Some(target) = resolve_share_path(&root, rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    let res = if target.is_dir() {
+        std::fs::remove_dir_all(&target)
+    } else {
+        std::fs::remove_file(&target)
+    };
+    match res {
+        Ok(_) => respond_text(request, 200, "ok"),
+        Err(e) => respond_text(request, 500, &format!("删除失败：{e}")),
+    }
+}
+
+/// 递归把目录 src 写入 zip，条目路径相对 base（base = src 的父目录，使压缩包内含顶层文件夹名）。
+fn zip_add_dir(
+    zw: &mut zip::ZipWriter<File>,
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    opts: zip::write::SimpleFileOptions,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(base).unwrap_or(&path);
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if path.is_dir() {
+            let _ = zw.add_directory(format!("{name}/"), opts);
+            zip_add_dir(zw, base, &path, opts)?;
+        } else {
+            zw.start_file(name, opts)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let mut f = File::open(&path)?;
+            std::io::copy(&mut f, zw)?;
+        }
+    }
+    Ok(())
+}
+
+/// GET /share/zip?id=&path= —— 把某文件夹打包成 zip 流式返回（文件夹获取，读取权限即可）。
+fn handle_share_zip(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let Some(id) = q.get("id") else {
+        return respond_text(request, 400, "missing id");
+    };
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (root, _perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    let Some(dir) = resolve_share_path(&root, &rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    if !dir.is_dir() {
+        return respond_text(request, 400, "不是文件夹");
+    }
+    let base = dir.parent().unwrap_or(&dir);
+    let tmp = std::env::temp_dir().join(format!("baibao_share_{}.zip", rand_hex(8)));
+    let build = (|| -> std::io::Result<()> {
+        let file = File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        // 先显式加入顶层文件夹条目，保证空文件夹也能被还原
+        if let Some(top) = dir.file_name().and_then(|n| n.to_str()) {
+            let _ = zw.add_directory(format!("{top}/"), opts);
+        }
+        zip_add_dir(&mut zw, base, &dir, opts)?;
+        zw.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    })();
+    if build.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return respond_text(request, 500, "打包失败");
+    }
+    match File::open(&tmp) {
+        Ok(f) => {
+            let resp = tiny_http::Response::from_file(f);
+            let _ = request.respond(resp);
+        }
+        Err(_) => respond_text(request, 500, "打包读取失败"),
+    }
+    let _ = std::fs::remove_file(&tmp);
 }
 
 fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Request) {
@@ -1641,6 +1931,9 @@ pub struct ShareView {
     path: String,
     locked: bool,
     password: Option<String>, // 明文，供主机端展示/复制告知对端
+    can_create: bool,
+    can_modify: bool,
+    can_delete: bool,
 }
 
 fn share_views(g: &Inner) -> Vec<ShareView> {
@@ -1652,6 +1945,9 @@ fn share_views(g: &Inner) -> Vec<ShareView> {
             path: s.path.clone(),
             locked: s.password.is_some(),
             password: s.password.clone(),
+            can_create: s.can_create,
+            can_modify: s.can_modify,
+            can_delete: s.can_delete,
         })
         .collect()
 }
@@ -1692,9 +1988,32 @@ pub fn lan_add_share(
         name: nm,
         path,
         password: Some(pw),
+        // 默认只读，写权限由用户在配置里勾选授予
+        can_create: false,
+        can_modify: false,
+        can_delete: false,
     });
     persist(&g);
     Ok(share_views(&g))
+}
+
+/// 设置某共享授予访问方的写权限（新增/修改/删除）。
+#[tauri::command]
+pub fn lan_set_share_perms(
+    state: State<'_, LanState>,
+    id: String,
+    can_create: bool,
+    can_modify: bool,
+    can_delete: bool,
+) -> Vec<ShareView> {
+    let mut g = state.0.lock().unwrap();
+    if let Some(s) = g.shares.iter_mut().find(|s| s.id == id) {
+        s.can_create = can_create;
+        s.can_modify = can_modify;
+        s.can_delete = can_delete;
+    }
+    persist(&g);
+    share_views(&g)
 }
 
 #[tauri::command]
@@ -1777,6 +2096,7 @@ pub async fn lan_share_list(
             200 => resp.json::<serde_json::Value>().map_err(|e| format!("解析失败：{e}")),
             401 => Err("auth".into()),
             429 => Err("密码错误次数过多，请稍后再试".into()),
+            403 => Err("路径无效或无权限（对方百宝箱可能需更新到最新版）".into()),
             c => Err(format!("对方返回 {c}")),
         }
     })
@@ -1792,11 +2112,12 @@ pub async fn lan_share_download(
     id: String,
     path: String,
     auth: Option<String>,
+    is_dir: bool,
 ) -> Result<String, String> {
     let state = state.inner().clone();
     let (base, _) = peer_base_url(&state, &fingerprint)?;
     let dir = state.0.lock().unwrap().download_dir.clone();
-    let file_name = path
+    let name = path
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
@@ -1804,8 +2125,10 @@ pub async fn lan_share_download(
         .to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let client = share_client()?;
+        let _ = std::fs::create_dir_all(&dir);
+        let endpoint = if is_dir { "share/zip" } else { "share/download" };
         let mut req = client
-            .get(format!("{base}/api/baibao/v1/share/download"))
+            .get(format!("{base}/api/baibao/v1/{endpoint}"))
             .query(&[("id", id.as_str()), ("path", path.as_str())]);
         if let Some(a) = auth {
             req = req.header("X-Share-Auth", a);
@@ -1815,16 +2138,160 @@ pub async fn lan_share_download(
             200 => {}
             401 => return Err("auth".into()),
             429 => return Err("密码错误次数过多，请稍后再试".into()),
+            403 => return Err("路径无效或无权限（对方百宝箱可能需更新到最新版）".into()),
             c => return Err(format!("对方返回 {c}")),
         }
-        let _ = std::fs::create_dir_all(&dir);
-        let dest = unique_path(&dir, &file_name);
-        let mut f = File::create(&dest).map_err(|e| format!("无法写入：{e}"))?;
-        resp.copy_to(&mut f).map_err(|e| format!("下载中断：{e}"))?;
-        Ok(dest.to_string_lossy().to_string())
+        if is_dir {
+            // 文件夹：下载 zip → 解压到接收目录 → 删除 zip（对用户无感知）
+            let zip_path = dir.join(format!(".baibao_dl_{}.zip", rand_hex(6)));
+            {
+                let mut f = File::create(&zip_path).map_err(|e| format!("无法写入：{e}"))?;
+                resp.copy_to(&mut f).map_err(|e| format!("下载中断：{e}"))?;
+            }
+            let extract = (|| -> Result<(), String> {
+                let zf = File::open(&zip_path).map_err(|e| e.to_string())?;
+                let mut ar = zip::ZipArchive::new(zf).map_err(|e| e.to_string())?;
+                ar.extract(&dir).map_err(|e| e.to_string())
+            })();
+            let _ = std::fs::remove_file(&zip_path);
+            extract.map_err(|e| format!("解压失败：{e}"))?;
+            Ok(dir.join(&name).to_string_lossy().to_string())
+        } else {
+            let dest = unique_path(&dir, &name);
+            let mut f = File::create(&dest).map_err(|e| format!("无法写入：{e}"))?;
+            resp.copy_to(&mut f).map_err(|e| format!("下载中断：{e}"))?;
+            Ok(dest.to_string_lossy().to_string())
+        }
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 上传时按字节上报进度的读取包装：每读一段就 emit 一次「lan://share-upload」。
+struct ShareUploadReader {
+    inner: File,
+    app: AppHandle,
+    name: String,
+    sent: u64,
+    size: u64,
+    last_emit: u64,
+}
+impl Read for ShareUploadReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.sent += n as u64;
+            if self.sent - self.last_emit > 256 * 1024 || self.sent >= self.size {
+                self.last_emit = self.sent;
+                let _ = self.app.emit(
+                    "lan://share-upload",
+                    serde_json::json!({ "name": self.name, "transferred": self.sent, "size": self.size }),
+                );
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// 上传本地文件到对端共享目录（新增）。dest_path = 目标相对路径（含文件名）。带进度上报。
+#[tauri::command]
+pub async fn lan_share_upload(
+    app: AppHandle,
+    state: State<'_, LanState>,
+    fingerprint: String,
+    id: String,
+    dest_path: String,
+    local_path: String,
+    auth: Option<String>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    let name = dest_path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("file")
+        .to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 不设总超时（大文件可能传很久），仅限制建连
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let size = std::fs::metadata(&local_path)
+            .map_err(|e| format!("读取本地文件失败：{e}"))?
+            .len();
+        let f = File::open(&local_path).map_err(|e| format!("打开本地文件失败：{e}"))?;
+        let reader = ShareUploadReader {
+            inner: f,
+            app: app.clone(),
+            name: name.clone(),
+            sent: 0,
+            size,
+            last_emit: 0,
+        };
+        let body = reqwest::blocking::Body::sized(reader, size);
+        let mut req = client
+            .post(format!("{base}/api/baibao/v1/share/upload"))
+            .query(&[("id", id.as_str()), ("path", dest_path.as_str())])
+            .body(body);
+        if let Some(a) = auth {
+            req = req.header("X-Share-Auth", a);
+        }
+        let resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
+        // 收尾：补一条 100% 进度，确保前端进度条收满
+        let _ = app.emit(
+            "lan://share-upload",
+            serde_json::json!({ "name": name, "transferred": size, "size": size }),
+        );
+        share_op_result(resp.status().as_u16())
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 共享写操作（mkdir/rename/delete）的统一 POST 客户端。
+#[tauri::command]
+pub async fn lan_share_op(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    id: String,
+    op: String, // "mkdir" | "rename" | "delete"
+    path: String,
+    to: Option<String>,
+    auth: Option<String>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let (base, _) = peer_base_url(&state, &fingerprint)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = share_client()?;
+        let mut query: Vec<(&str, &str)> = vec![("id", id.as_str()), ("path", path.as_str())];
+        if let Some(t) = &to {
+            query.push(("to", t.as_str()));
+        }
+        let mut req = client
+            .post(format!("{base}/api/baibao/v1/share/{op}"))
+            .query(&query);
+        if let Some(a) = auth {
+            req = req.header("X-Share-Auth", a);
+        }
+        let resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
+        share_op_result(resp.status().as_u16())
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 把共享写操作的 HTTP 状态码翻译成统一结果（401→auth 让前端弹密码框）。
+fn share_op_result(code: u16) -> Result<(), String> {
+    match code {
+        200 => Ok(()),
+        401 => Err("auth".into()),
+        403 => Err("对方未授予该权限".into()),
+        429 => Err("密码错误次数过多，请稍后再试".into()),
+        409 => Err("目标已存在".into()),
+        c => Err(format!("操作失败（{c}）")),
+    }
 }
 
 /// 接收方对一次文件请求作出决定。
@@ -2314,11 +2781,45 @@ fn respond_text(req: tiny_http::Request, code: u16, body: &str) {
     let _ = req.respond(resp);
 }
 
+/// 解码 URL 查询值：`+`→空格、`%XX`→字节（application/x-www-form-urlencoded，reqwest .query() 用的就是它）。
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hexv = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hexv(b[i + 1]), hexv(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn parse_query(q: &str) -> HashMap<String, String> {
     q.split('&')
         .filter_map(|pair| {
             let mut it = pair.splitn(2, '=');
-            Some((it.next()?.to_string(), it.next().unwrap_or("").to_string()))
+            // 必须解码：reqwest 会把 path 里的 `/`、空格、中文等编码，不解码会导致目录/文件找不到
+            let k = url_decode(it.next()?);
+            let v = url_decode(it.next().unwrap_or(""));
+            Some((k, v))
         })
         .collect()
 }

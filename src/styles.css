@@ -275,6 +275,7 @@ select { cursor: pointer; }
 /* 当前网段（局域网互传设置内的诊断列表） */
 .lan-netifaces {
   padding: 10px 2px 4px;
+  border-top: 1px solid var(--border); /* 与「共享目录」分区分隔 */
 }
 .lan-netifaces-head {
   display: flex;
@@ -328,14 +329,14 @@ select { cursor: pointer; }
 /* ===== 共享磁盘 ===== */
 /* 设备列表「共享」小标签 */
 .lan-share-tag {
-  margin-left: 6px;
+  flex-shrink: 0;
   font-size: 10px;
   font-weight: 700;
-  padding: 0 5px;
+  padding: 1px 6px;
   border-radius: 999px;
   color: #fff;
   background: #2ca06a;
-  vertical-align: middle;
+  line-height: 1.6;
 }
 .lan-peer.active .lan-share-tag {
   background: rgba(255, 255, 255, 0.28);
@@ -357,12 +358,29 @@ select { cursor: pointer; }
 }
 .lan-share-mgr-item {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
   border-radius: 6px;
   background: var(--bg-elev, rgba(127, 127, 127, 0.08));
   font-size: 12px;
+}
+.lan-share-mgr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.lan-share-perms {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+}
+.lan-share-perms label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
 }
 .lan-share-mgr-name {
   flex-shrink: 0;
@@ -387,6 +405,23 @@ select { cursor: pointer; }
 /* 网上邻居式共享浏览器 */
 .share-modal {
   width: min(560px, 92%);
+}
+.share-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.share-tools {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.share-actions {
+  display: inline-flex;
+  gap: 4px;
+  flex-shrink: 0;
 }
 .share-crumb {
   display: flex;
@@ -430,15 +465,41 @@ select { cursor: pointer; }
   border-radius: 6px;
   font-size: 13px;
 }
-.share-item.isdir {
-  cursor: pointer;
+.share-item {
+  cursor: default;
+  user-select: none;
 }
-.share-item.isdir:hover {
+.share-item:hover {
   background: var(--bg2);
+}
+.share-item.selected {
+  background: var(--accent, #1f6feb);
+  color: #fff;
+}
+.share-item.selected .dim,
+.share-item.selected .share-col-time,
+.share-item.selected .share-col-size {
+  color: rgba(255, 255, 255, 0.82);
+}
+.share-item.busy {
+  opacity: 0.6;
+}
+/* 选中批量操作条 */
+.share-selbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  font-size: 12px;
+}
+.share-selbar > span {
+  margin-right: auto;
 }
 .share-ic {
   flex-shrink: 0;
   font-size: 16px;
+  width: 18px;
+  text-align: center;
 }
 .share-name {
   flex: 1;
@@ -449,6 +510,64 @@ select { cursor: pointer; }
 .share-size {
   flex-shrink: 0;
   font-size: 11px;
+}
+/* 类资源管理器的列：修改时间 / 创建时间 / 大小 */
+.share-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 8px 4px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--border);
+}
+.share-head .share-col-name {
+  flex: 1;
+  padding-left: 28px; /* 让出图标列宽度，与下面各行名称对齐 */
+}
+.share-col-time {
+  flex-shrink: 0;
+  width: 124px;
+  text-align: right;
+  font-size: 11px;
+}
+.share-col-size {
+  flex-shrink: 0;
+  width: 72px;
+  text-align: right;
+  font-size: 11px;
+}
+/* 上传进度 */
+.share-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 2px;
+}
+.share-prog-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.share-prog-name {
+  flex-shrink: 0;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.share-prog-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.share-prog-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent, #1f6feb);
+  transition: width 0.15s;
 }
 .share-lock {
   font-size: 11px;
@@ -862,7 +981,8 @@ select { cursor: pointer; }
 .lan-peer-info {
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  flex: 1;
+  min-width: 0; /* 允许名字省略号截断，给「共享」标签让出空间 */
 }
 .lan-peer-alias {
   font-size: 13px;
