@@ -97,6 +97,8 @@ interface LanCtxValue {
   error: string | null;
   setSelected: (fp: string | null) => void;
   setError: (e: string | null) => void;
+  serviceError: string | null; // 服务启动失败（如端口被占用）；null=正常
+  startService: () => Promise<boolean>; // 重试启动服务
   refreshPeers: () => Promise<void>;
   requestConfirm: (sessionId: string) => void;
   dismissConfirm: () => void;
@@ -185,6 +187,7 @@ function loadKnownPeers(): Record<string, Peer> {
 
 export function LanProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<MyInfo | null>(null);
+  const [serviceError, setServiceError] = useState<string | null>(null); // 服务启动失败原因（如端口被占用）
   const [livePeers, setLivePeers] = useState<Peer[]>([]); // 当前在线发现到的设备
   const [knownPeers, setKnownPeers] = useState<Record<string, Peer>>(loadKnownPeers); // 历史已知设备（持久化）
   const [items, setItems] = useState<ChatItem[]>(loadItems);
@@ -341,6 +344,20 @@ export function LanProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // 启动（或重试启动）局域网服务；失败（如端口被占用）记录到 serviceError 供界面常驻提示。
+  const startService = useCallback(async () => {
+    try {
+      const info = await invoke<MyInfo>("lan_start");
+      setMe(info);
+      setServiceError(null);
+      await refreshPeers();
+      return true;
+    } catch (e) {
+      setServiceError(String(e));
+      return false;
+    }
+  }, [refreshPeers]);
+
   const setSelected = useCallback((fp: string | null) => {
     setSelectedRaw(fp);
     if (fp) setUnread((u) => (u[fp] ? { ...u, [fp]: 0 } : u));
@@ -352,13 +369,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
     const track = (u: UnlistenFn) => (alive ? unsubs.push(u) : u());
 
     (async () => {
-      try {
-        const info = await invoke<MyInfo>("lan_start");
-        if (alive) setMe(info);
-        await refreshPeers();
-      } catch (e) {
-        if (alive) setError(String(e));
-      }
+      if (alive) await startService();
 
       track(await listen<Peer[]>("lan://peers", (e) => setLivePeers(e.payload)));
       track(
@@ -859,6 +870,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
 
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
+    serviceError, startService,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
     sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend,

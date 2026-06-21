@@ -576,8 +576,11 @@ pub async fn lan_start(app: AppHandle, state: State<'_, LanState>) -> Result<ser
     }
 
     // 1) HTTP 收件服务
-    let server = tiny_http::Server::http(("0.0.0.0", PORT))
-        .map_err(|e| format!("端口 {PORT} 监听失败（可能已被占用）：{e}"))?;
+    let server = tiny_http::Server::http(("0.0.0.0", PORT)).map_err(|e| {
+        // 端口被占用时 started 已置 true，回滚，让用户可以重试启动
+        state.0.lock().unwrap().started = false;
+        format!("端口 {PORT} 被占用，局域网服务无法启动（可能已有一个百宝箱在运行）。请关闭占用该端口的程序后点「重试」。详情：{e}")
+    })?;
     {
         let app = app.clone();
         let state = state.clone();
@@ -1015,6 +1018,10 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             handle_share_upload(&state, request, &query);
             Ok(())
         }
+        ("POST", "/api/baibao/v1/share/upload-zip") => {
+            handle_share_upload_zip(&state, request, &query);
+            Ok(())
+        }
         ("POST", "/api/baibao/v1/share/mkdir") => {
             handle_share_mkdir(&state, request, &query);
             Ok(())
@@ -1365,6 +1372,68 @@ fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query:
             let _ = std::fs::remove_file(&dest);
             respond_text(request, 500, "写入中断")
         }
+    }
+}
+
+/// 上传文件夹（新增）：接收一个 zip（内含顶层文件夹）并解压到目标目录 path（rel，空=共享根）。
+fn handle_share_upload_zip(state: &LanState, mut request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
+        return respond_text(request, 400, "missing params");
+    };
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (root, perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    if !perms.0 {
+        return respond_text(request, 403, "无新增权限");
+    }
+    let Some(target) = resolve_share_path(&root, rel) else {
+        return respond_text(request, 403, "bad path");
+    };
+    if !target.is_dir() {
+        return respond_text(request, 400, "目标不是目录");
+    }
+    let tmp = std::env::temp_dir().join(format!("baibao_recv_{}.zip", rand_hex(8)));
+    {
+        let mut f = match File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) => return respond_text(request, 500, &format!("写入失败：{e}")),
+        };
+        if std::io::copy(&mut request.as_reader(), &mut f).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return respond_text(request, 500, "接收中断");
+        }
+    }
+    // 解压：用 enclosed_name 防 zip-slip 穿越，逐条解到 target 下
+    let res = (|| -> std::io::Result<()> {
+        let zf = File::open(&tmp)?;
+        let mut ar = zip::ZipArchive::new(zf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        for i in 0..ar.len() {
+            let mut entry = ar
+                .by_index(i)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let Some(safe) = entry.enclosed_name() else { continue }; // 跳过越权条目
+            let out = target.join(safe);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out)?;
+            } else {
+                if let Some(p) = out.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                let mut of = File::create(&out)?;
+                std::io::copy(&mut entry, &mut of)?;
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    match res {
+        Ok(_) => respond_text(request, 200, "ok"),
+        Err(_) => respond_text(request, 500, "解压失败"),
     }
 }
 
@@ -2193,35 +2262,73 @@ impl Read for ShareUploadReader {
     }
 }
 
-/// 上传本地文件到对端共享目录（新增）。dest_path = 目标相对路径（含文件名）。带进度上报。
+/// 上传本地文件或文件夹到对端共享目录（新增）。dest_dir = 目标目录相对路径（空=共享根）。
+/// 文件夹会在本地打包成 zip 上传、对端解压（支持任意层级）。带进度上报。
 #[tauri::command]
 pub async fn lan_share_upload(
     app: AppHandle,
     state: State<'_, LanState>,
     fingerprint: String,
     id: String,
-    dest_path: String,
+    dest_dir: String,
     local_path: String,
     auth: Option<String>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
     let (base, _) = peer_base_url(&state, &fingerprint)?;
-    let name = dest_path
+    let name = local_path
+        .trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("file")
         .to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        // 不设总超时（大文件可能传很久），仅限制建连
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(8))
             .build()
             .map_err(|e| e.to_string())?;
-        let size = std::fs::metadata(&local_path)
-            .map_err(|e| format!("读取本地文件失败：{e}"))?
+        let lp = std::path::Path::new(&local_path);
+        // 上传源：文件夹 → 本地打成 zip；文件 → 直接传
+        let is_dir = lp.is_dir();
+        let (send_path, endpoint, query_path, cleanup_zip): (PathBuf, &str, String, bool) = if is_dir {
+            // 先发一条「打包中」信号（size=0），前端据此显示压缩阶段提示
+            let _ = app.emit(
+                "lan://share-upload",
+                serde_json::json!({ "name": name, "transferred": 0u64, "size": 0u64, "phase": "zip" }),
+            );
+            let tmp = std::env::temp_dir().join(format!("baibao_send_{}.zip", rand_hex(8)));
+            let base_dir = lp.parent().unwrap_or(lp);
+            let build = (|| -> std::io::Result<()> {
+                let file = File::create(&tmp)?;
+                let mut zw = zip::ZipWriter::new(file);
+                let opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                let _ = zw.add_directory(format!("{name}/"), opts);
+                zip_add_dir(&mut zw, base_dir, lp, opts)?;
+                zw.finish()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                Ok(())
+            })();
+            if build.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err("打包文件夹失败".to_string());
+            }
+            (tmp, "share/upload-zip", dest_dir.clone(), true)
+        } else {
+            // 文件：目标路径 = dest_dir/name（dest_dir 为空则就是 name）
+            let qp = if dest_dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{dest_dir}/{name}")
+            };
+            (lp.to_path_buf(), "share/upload", qp, false)
+        };
+
+        let size = std::fs::metadata(&send_path)
+            .map_err(|e| format!("读取失败：{e}"))?
             .len();
-        let f = File::open(&local_path).map_err(|e| format!("打开本地文件失败：{e}"))?;
+        let f = File::open(&send_path).map_err(|e| format!("打开失败：{e}"))?;
         let reader = ShareUploadReader {
             inner: f,
             app: app.clone(),
@@ -2232,14 +2339,17 @@ pub async fn lan_share_upload(
         };
         let body = reqwest::blocking::Body::sized(reader, size);
         let mut req = client
-            .post(format!("{base}/api/baibao/v1/share/upload"))
-            .query(&[("id", id.as_str()), ("path", dest_path.as_str())])
+            .post(format!("{base}/api/baibao/v1/{endpoint}"))
+            .query(&[("id", id.as_str()), ("path", query_path.as_str())])
             .body(body);
         if let Some(a) = auth {
             req = req.header("X-Share-Auth", a);
         }
-        let resp = req.send().map_err(|e| format!("连接失败：{e}"))?;
-        // 收尾：补一条 100% 进度，确保前端进度条收满
+        let result = req.send();
+        if cleanup_zip {
+            let _ = std::fs::remove_file(&send_path);
+        }
+        let resp = result.map_err(|e| format!("连接失败：{e}"))?;
         let _ = app.emit(
             "lan://share-upload",
             serde_json::json!({ "name": name, "transferred": size, "size": size }),
@@ -2290,6 +2400,7 @@ fn share_op_result(code: u16) -> Result<(), String> {
         403 => Err("对方未授予该权限".into()),
         429 => Err("密码错误次数过多，请稍后再试".into()),
         409 => Err("目标已存在".into()),
+        404 => Err("对方不支持该操作（百宝箱版本过旧，请更新到最新版）".into()),
         c => Err(format!("操作失败（{c}）")),
     }
 }

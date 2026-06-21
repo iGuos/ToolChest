@@ -326,6 +326,24 @@ select { cursor: pointer; }
 .lan-netiface-tag.overlay {
   background: var(--accent, #1f6feb);
 }
+/* 局域网服务启动失败（端口占用等）的常驻提示条 */
+.lan-service-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(244, 71, 71, 0.45);
+  background: rgba(244, 71, 71, 0.12);
+  color: var(--red-h, #ff6b6b);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.lan-service-error > span {
+  flex: 1;
+}
+
 /* ===== 共享磁盘 ===== */
 /* 设备列表「共享」小标签 */
 .lan-share-tag {
@@ -405,6 +423,7 @@ select { cursor: pointer; }
 /* 网上邻居式共享浏览器 */
 .share-modal {
   width: min(560px, 92%);
+  height: min(640px, 82vh); /* 固定高度，文件少时也不缩成一小条 */
 }
 .share-bar {
   display: flex;
@@ -446,7 +465,8 @@ select { cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 50vh;
+  flex: 1; /* 填满弹窗剩余高度（弹窗已固定高度） */
+  min-height: 0;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -483,6 +503,17 @@ select { cursor: pointer; }
 }
 .share-item.busy {
   opacity: 0.6;
+}
+.share-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.share-notice > span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* 选中批量操作条 */
 .share-selbar {
@@ -569,16 +600,30 @@ select { cursor: pointer; }
   background: var(--accent, #1f6feb);
   transition: width 0.15s;
 }
+.share-prog-bar > span.indet {
+  background: linear-gradient(90deg, transparent, var(--accent, #1f6feb), transparent);
+  animation: share-indet 1s linear infinite;
+}
+@keyframes share-indet {
+  0% { opacity: 0.35; }
+  50% { opacity: 1; }
+  100% { opacity: 0.35; }
+}
+.share-prog-title {
+  font-size: 11px;
+}
+.share-prog-text {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .share-lock {
   font-size: 11px;
 }
-.share-pw {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+/* 共享浏览器内的居中弹框（密码/命名/删除/覆盖确认） */
+.share-subdialog {
+  width: min(420px, 90%);
+  height: auto;
+  gap: 10px;
 }
 
 /* 补充展示：经隧道可达的组网/覆盖网地址 */

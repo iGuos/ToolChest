@@ -210,11 +210,12 @@ const PAGE_SIZE = 20; // 聊天记录每页条数：默认显示最近 20 条，
 
 export default function LanShare() {
   const {
-    me, peers, items, unread, selected, error,
+    me, peers, items, unread, selected, error, serviceError, startService,
     setSelected, setError, refreshPeers, sendMessage, resendMessage, recallMessage, deleteItem, sendFiles,
     cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
     setRemark, clearChat, togglePin, reorderPins,
   } = useLan();
+  const [retrying, setRetrying] = useState(false);
 
   const [draft, setDraft] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -673,6 +674,26 @@ export default function LanShare() {
           </div>,
           document.body
         )}
+
+      {serviceError && (
+        <div className="lan-service-error">
+          <span>⚠ {serviceError}</span>
+          <button
+            className="btn btn-primary btn-sm"
+            disabled={retrying}
+            onClick={async () => {
+              setRetrying(true);
+              try {
+                await startService();
+              } finally {
+                setRetrying(false);
+              }
+            }}
+          >
+            {retrying ? "重试中…" : "重试"}
+          </button>
+        </div>
+      )}
 
       <div className="lan-body" ref={bodyRef}>
         <div className="lan-peers">

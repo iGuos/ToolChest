@@ -62,6 +62,7 @@ export default function ShareBrowser({
   const [busy, setBusy] = useState(false); // 上传/操作进行中
   const [err, setErr] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [revealPath, setRevealPath] = useState<string | null>(null); // 下载完成后可「打开目录」的路径
   const [pw, setPw] = useState("");
   const [pwOpen, setPwOpen] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
@@ -140,18 +141,18 @@ export default function ShareBrowser({
       setBusy(true);
       setErr(null);
       setProgress({});
+      setRevealPath(null);
       try {
         for (const lp of localPaths) {
-          const base = lp.split(/[/\\]/).pop() || "file";
           await invoke("lan_share_upload", {
             fingerprint,
             id: sh.id,
-            destPath: [...segs, base].join("/"),
+            destDir: segs.join("/"),
             localPath: lp,
             auth: getAuth(sh) ?? null,
           });
         }
-        setNotice(`已上传 ${localPaths.length} 个文件`);
+        setNotice(`已上传 ${localPaths.length} 项`);
         await load(sh, segs);
       } catch (e) {
         setErr(String(e) === "auth" ? "需要密码，请重新进入该共享" : String(e));
@@ -264,6 +265,7 @@ export default function ShareBrowser({
         isDir: entry.dir,
       });
       setNotice(`已下载到 ${saved}`);
+      setRevealPath(saved);
     } catch (e) {
       setErr(String(e) === "auth" ? "需要密码，请重新进入该共享" : String(e));
     } finally {
@@ -329,6 +331,14 @@ export default function ShareBrowser({
       setErr(String(e));
     }
   };
+  const pickUploadFolder = async () => {
+    try {
+      const dir = await invoke<string | null>("lan_pick_dir");
+      if (dir) startUpload([dir]);
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
 
   const submitName = async () => {
     if (!namePrompt || !share) return;
@@ -384,7 +394,19 @@ export default function ShareBrowser({
         </div>
 
         {err && <div className="error-banner" style={{ margin: 0 }}>⚠ {err}</div>}
-        {notice && <div className="notice-banner" style={{ margin: 0 }}>✓ {notice}</div>}
+        {notice && (
+          <div className="notice-banner share-notice" style={{ margin: 0 }}>
+            <span>✓ {notice}</span>
+            {revealPath && (
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => invoke("lan_reveal", { path: revealPath }).catch((e) => setErr(String(e)))}
+              >
+                打开目录
+              </button>
+            )}
+          </div>
+        )}
 
         {/* 面包屑 + 工具栏 */}
         <div className="share-bar">
@@ -407,7 +429,8 @@ export default function ShareBrowser({
             <div className="share-tools">
               {share.canCreate && (
                 <>
-                  <button className="btn btn-ghost btn-sm" onClick={pickUpload} disabled={busy}>上传</button>
+                  <button className="btn btn-ghost btn-sm" onClick={pickUpload} disabled={busy}>上传文件</button>
+                  <button className="btn btn-ghost btn-sm" onClick={pickUploadFolder} disabled={busy}>上传文件夹</button>
                   <button
                     className="btn btn-ghost btn-sm"
                     onClick={() => setNamePrompt({ kind: "mkdir", value: "" })}
@@ -499,18 +522,30 @@ export default function ShareBrowser({
           </div>
         )}
 
-        {/* 上传进度 */}
-        {Object.keys(progress).length > 0 && (
+        {/* 上传进度（带动态文字描述） */}
+        {(busy || Object.keys(progress).length > 0) && (
           <div className="share-progress">
+            <div className="share-prog-title dim">正在上传…</div>
+            {Object.keys(progress).length === 0 && (
+              <div className="dim" style={{ fontSize: 12 }}>准备中…</div>
+            )}
             {Object.entries(progress).map(([name, p]) => {
+              const zipping = p.size === 0; // size=0 → 打包阶段
               const pct = p.size ? Math.min(100, (p.transferred / p.size) * 100) : 0;
+              const done = p.size > 0 && p.transferred >= p.size;
               return (
                 <div key={name} className="share-prog-item">
                   <span className="share-prog-name" title={name}>{name}</span>
                   <span className="share-prog-bar">
-                    <span style={{ width: `${pct}%` }} />
+                    <span className={zipping ? "indet" : ""} style={{ width: zipping ? "100%" : `${pct}%` }} />
                   </span>
-                  <span className="dim">{Math.round(pct)}%</span>
+                  <span className="dim share-prog-text">
+                    {zipping
+                      ? "打包中…"
+                      : done
+                      ? "已完成"
+                      : `${fmtBytes(p.transferred)} / ${fmtBytes(p.size)} · ${Math.round(pct)}%`}
+                  </span>
                 </div>
               );
             })}
@@ -519,86 +554,94 @@ export default function ShareBrowser({
 
         {/* 密码框 */}
         {pwOpen && (
-          <div className="share-pw">
-            <div className="dim" style={{ fontSize: 12 }}>该共享需要密码：</div>
-            <input
-              className="kv-input"
-              type="password"
-              autoFocus
-              value={pw}
-              placeholder="访问密码"
-              onChange={(e) => setPw(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && submitPw()}
-            />
-            <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => { setPwOpen(false); goRoots(); }}>取消</button>
-              <button className="btn btn-primary" onClick={submitPw} disabled={!pw}>进入</button>
+          <div className="modal-overlay">
+            <div className="modal share-subdialog" onClick={(e) => e.stopPropagation()}>
+              <div className="dim" style={{ fontSize: 12 }}>该共享需要密码：</div>
+              <input
+                className="kv-input"
+                type="password"
+                autoFocus
+                value={pw}
+                placeholder="访问密码"
+                onChange={(e) => setPw(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitPw()}
+              />
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={() => { setPwOpen(false); goRoots(); }}>取消</button>
+                <button className="btn btn-primary" onClick={submitPw} disabled={!pw}>进入</button>
+              </div>
             </div>
           </div>
         )}
 
         {/* 名称输入（新建文件夹 / 重命名） */}
         {namePrompt && (
-          <div className="share-pw">
-            <div className="dim" style={{ fontSize: 12 }}>
-              {namePrompt.kind === "mkdir" ? "新文件夹名称：" : "重命名为："}
-            </div>
-            <input
-              className="kv-input"
-              autoFocus
-              value={namePrompt.value}
-              onChange={(e) => setNamePrompt((p) => (p ? { ...p, value: e.target.value } : p))}
-              onKeyDown={(e) => e.key === "Enter" && submitName()}
-            />
-            <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => setNamePrompt(null)}>取消</button>
-              <button className="btn btn-primary" onClick={submitName} disabled={!namePrompt.value.trim() || busy}>确定</button>
+          <div className="modal-overlay">
+            <div className="modal share-subdialog" onClick={(e) => e.stopPropagation()}>
+              <div className="dim" style={{ fontSize: 12 }}>
+                {namePrompt.kind === "mkdir" ? "新文件夹名称：" : "重命名为："}
+              </div>
+              <input
+                className="kv-input"
+                autoFocus
+                value={namePrompt.value}
+                onChange={(e) => setNamePrompt((p) => (p ? { ...p, value: e.target.value } : p))}
+                onKeyDown={(e) => e.key === "Enter" && submitName()}
+              />
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={() => setNamePrompt(null)}>取消</button>
+                <button className="btn btn-primary" onClick={submitName} disabled={!namePrompt.value.trim() || busy}>确定</button>
+              </div>
             </div>
           </div>
         )}
 
         {/* 删除确认（支持批量） */}
         {delConfirm && delConfirm.length > 0 && (
-          <div className="share-pw">
-            <div style={{ fontSize: 13 }}>
-              确认删除{delConfirm.length > 1 ? ` ${delConfirm.length} 项` : `「${delConfirm[0]}」`}？文件夹会连同内容一起删除,此操作不可撤销。
-            </div>
-            <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => setDelConfirm(null)}>取消</button>
-              <button
-                className="btn btn-danger"
-                disabled={busy}
-                onClick={async () => {
-                  const names = delConfirm;
-                  setDelConfirm(null);
-                  for (const n of names) await runOp("delete", [...path, n].join("/"));
-                  setSelected(new Set());
-                }}
-              >
-                删除
-              </button>
+          <div className="modal-overlay">
+            <div className="modal share-subdialog" onClick={(e) => e.stopPropagation()}>
+              <div style={{ fontSize: 13 }}>
+                确认删除{delConfirm.length > 1 ? ` ${delConfirm.length} 项` : `「${delConfirm[0]}」`}？文件夹会连同内容一起删除,此操作不可撤销。
+              </div>
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={() => setDelConfirm(null)}>取消</button>
+                <button
+                  className="btn btn-danger"
+                  disabled={busy}
+                  onClick={async () => {
+                    const names = delConfirm;
+                    setDelConfirm(null);
+                    for (const n of names) await runOp("delete", [...path, n].join("/"));
+                    setSelected(new Set());
+                  }}
+                >
+                  删除
+                </button>
+              </div>
             </div>
           </div>
         )}
 
         {/* 上传覆盖二次确认 */}
         {overwrite && (
-          <div className="share-pw">
-            <div style={{ fontSize: 13 }}>
-              已存在同名文件：{overwrite.names.join("、")}，继续上传将<b>覆盖</b>它们。
-            </div>
-            <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => setOverwrite(null)}>取消</button>
-              <button
-                className="btn btn-danger"
-                onClick={() => {
-                  const locals = overwrite.locals;
-                  setOverwrite(null);
-                  doUpload(locals);
-                }}
-              >
-                覆盖上传
-              </button>
+          <div className="modal-overlay">
+            <div className="modal share-subdialog" onClick={(e) => e.stopPropagation()}>
+              <div style={{ fontSize: 13 }}>
+                已存在同名项：{overwrite.names.join("、")}，继续上传将<b>覆盖</b>它们。
+              </div>
+              <div className="modal-actions">
+                <button className="btn btn-ghost" onClick={() => setOverwrite(null)}>取消</button>
+                <button
+                  className="btn btn-danger"
+                  onClick={() => {
+                    const locals = overwrite.locals;
+                    setOverwrite(null);
+                    doUpload(locals);
+                  }}
+                >
+                  覆盖上传
+                </button>
+              </div>
             </div>
           </div>
         )}
