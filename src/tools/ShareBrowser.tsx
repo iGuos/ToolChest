@@ -55,7 +55,7 @@ export default function ShareBrowser({
   onClose: () => void;
 }) {
   useEscToClose(true, onClose);
-  const { beginUpload } = useLan();
+  const { startShareUpload } = useLan();
   const [roots, setRoots] = useState<ShareRoot[] | null>(null);
   const [share, setShare] = useState<ShareRoot | null>(null);
   const [path, setPath] = useState<string[]>([]);
@@ -145,11 +145,9 @@ export default function ShareBrowser({
         for (let i = 0; i < localPaths.length; i++) {
           const lp = localPaths[i];
           const taskId = `up-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`;
-          beginUpload(taskId, lp.split(/[/\\]/).pop() || "file");
-          await invoke("lan_share_upload", {
+          await startShareUpload(taskId, lp.split(/[/\\]/).pop() || "file", {
             fingerprint,
             id: sh.id,
-            taskId,
             destDir: segs.join("/"),
             localPath: lp,
             auth: getAuth(sh) ?? null,
@@ -168,7 +166,7 @@ export default function ShareBrowser({
         setBusy(false);
       }
     },
-    [fingerprint, load, beginUpload]
+    [fingerprint, load, startShareUpload]
   );
 
   // 上传入口：文件夹一律二次确认（防点错），有同名也确认（会覆盖）；纯文件且无同名直接传

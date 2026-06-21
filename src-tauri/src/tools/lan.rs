@@ -1026,6 +1026,10 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             handle_share_upload_zip(&state, request, &query);
             Ok(())
         }
+        ("GET", "/api/baibao/v1/share/upload-offset") => {
+            handle_share_upload_offset(&state, request, &query);
+            Ok(())
+        }
         ("POST", "/api/baibao/v1/share/mkdir") => {
             handle_share_mkdir(&state, request, &query);
             Ok(())
@@ -1315,7 +1319,8 @@ fn share_err_respond(request: tiny_http::Request, code: u16) {
         429 => "尝试过多，请稍后再试",
         _ => "not found",
     };
-    respond_text(request, code, msg);
+    // 排空可能存在的请求体（上传类 POST），避免提前响应导致对方发送阶段被重置。
+    respond_text_drained(request, code, msg);
 }
 
 /// 「新建」类操作的安全路径解析：拒绝 `..`/绝对路径；父目录必须存在且 canonicalize 后在共享根内。
@@ -1347,7 +1352,7 @@ fn resolve_create_path(root: &str, rel: &str) -> Option<PathBuf> {
 fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query: &str) {
     let q = parse_query(query);
     let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
-        return respond_text(request, 400, "missing params");
+        return respond_text_drained(request, 400, "missing params");
     };
     let auth = header_value(&request, "X-Share-Auth");
     let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
@@ -1356,15 +1361,40 @@ fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query:
         Err(c) => return share_err_respond(request, c),
     };
     if !perms.0 {
-        return respond_text(request, 403, "无新增权限");
+        return respond_text_drained(request, 403, "无新增权限");
     }
     let Some(dest) = resolve_create_path(&root, rel) else {
-        return respond_text(request, 403, "bad path");
+        return respond_text_drained(request, 403, "bad path");
     };
     // 覆盖已存在的同名文件（覆盖确认在客户端做）；但拒绝把已存在的「目录」当文件覆盖
     if dest.is_dir() {
-        return respond_text(request, 409, "同名目录已存在");
+        return respond_text_drained(request, 409, "同名目录已存在");
     }
+
+    // 断点续传：带 token 时累积到临时文件、按 offset 续写、集齐 total 再落地。
+    if let Some(token) = q.get("token").map(|t| sanitize_token(t)).filter(|t| !t.is_empty()) {
+        let offset = q.get("offset").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let total = q.get("total").and_then(|s| s.parse::<u64>().ok());
+        let part = upload_part_path(&token, false);
+        let cur = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if offset > cur {
+            // 客户端 offset 超前于服务端已收字节，无法续写，让其重新查询
+            return respond_text_drained(request, 409, &cur.to_string());
+        }
+        let now = match append_upload_body(&mut request, &part, offset) {
+            Ok(n) => n,
+            Err(_) => return respond_text(request, 500, "接收中断"), // 保留 part 供续传
+        };
+        return match total {
+            Some(t) if now < t => respond_text(request, 200, "incomplete"), // 还没传完，保留 part
+            _ => match finalize_part_to(&part, &dest) {
+                Ok(_) => respond_text(request, 200, "ok"),
+                Err(e) => respond_text(request, 500, &format!("写入失败：{e}")),
+            },
+        };
+    }
+
+    // 旧客户端（无 token）：直接覆盖写入。
     let mut f = match File::create(&dest) {
         Ok(f) => f,
         Err(e) => return respond_text(request, 500, &format!("写入失败：{e}")),
@@ -1383,7 +1413,7 @@ fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query:
 fn handle_share_upload_zip(state: &LanState, mut request: tiny_http::Request, query: &str) {
     let q = parse_query(query);
     let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
-        return respond_text(request, 400, "missing params");
+        return respond_text_drained(request, 400, "missing params");
     };
     let auth = header_value(&request, "X-Share-Auth");
     let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
@@ -1392,14 +1422,42 @@ fn handle_share_upload_zip(state: &LanState, mut request: tiny_http::Request, qu
         Err(c) => return share_err_respond(request, c),
     };
     if !perms.0 {
-        return respond_text(request, 403, "无新增权限");
+        return respond_text_drained(request, 403, "无新增权限");
     }
     let Some(target) = resolve_share_path(&root, rel) else {
-        return respond_text(request, 403, "bad path");
+        return respond_text_drained(request, 403, "bad path");
     };
     if !target.is_dir() {
-        return respond_text(request, 400, "目标不是目录");
+        return respond_text_drained(request, 400, "目标不是目录");
     }
+
+    // 断点续传：带 token 时累积到临时 zip、按 offset 续写、集齐 total 再解压。
+    if let Some(token) = q.get("token").map(|t| sanitize_token(t)).filter(|t| !t.is_empty()) {
+        let offset = q.get("offset").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let total = q.get("total").and_then(|s| s.parse::<u64>().ok());
+        let part = upload_part_path(&token, true);
+        let cur = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if offset > cur {
+            return respond_text_drained(request, 409, &cur.to_string());
+        }
+        let now = match append_upload_body(&mut request, &part, offset) {
+            Ok(n) => n,
+            Err(_) => return respond_text(request, 500, "接收中断"), // 保留 part 供续传
+        };
+        if let Some(t) = total {
+            if now < t {
+                return respond_text(request, 200, "incomplete"); // 还没传完，保留 part
+            }
+        }
+        let res = extract_zip_into(&part, &target);
+        let _ = std::fs::remove_file(&part);
+        return match res {
+            Ok(_) => respond_text(request, 200, "ok"),
+            Err(_) => respond_text(request, 500, "解压失败"),
+        };
+    }
+
+    // 旧客户端（无 token）：一次性接收整包再解压。
     let tmp = std::env::temp_dir().join(format!("baibao_recv_{}.zip", rand_hex(8)));
     {
         let mut f = match File::create(&tmp) {
@@ -1411,34 +1469,39 @@ fn handle_share_upload_zip(state: &LanState, mut request: tiny_http::Request, qu
             return respond_text(request, 500, "接收中断");
         }
     }
-    // 解压：用 enclosed_name 防 zip-slip 穿越，逐条解到 target 下
-    let res = (|| -> std::io::Result<()> {
-        let zf = File::open(&tmp)?;
-        let mut ar = zip::ZipArchive::new(zf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        for i in 0..ar.len() {
-            let mut entry = ar
-                .by_index(i)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            let Some(safe) = entry.enclosed_name() else { continue }; // 跳过越权条目
-            let out = target.join(safe);
-            if entry.is_dir() {
-                std::fs::create_dir_all(&out)?;
-            } else {
-                if let Some(p) = out.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                let mut of = File::create(&out)?;
-                std::io::copy(&mut entry, &mut of)?;
-            }
-        }
-        Ok(())
-    })();
+    let res = extract_zip_into(&tmp, &target);
     let _ = std::fs::remove_file(&tmp);
     match res {
         Ok(_) => respond_text(request, 200, "ok"),
         Err(_) => respond_text(request, 500, "解压失败"),
     }
+}
+
+/// 查询某个续传 token 在服务端已收到多少字节（客户端据此从断点继续）。返回纯数字文本。
+fn handle_share_upload_offset(state: &LanState, request: tiny_http::Request, query: &str) {
+    let q = parse_query(query);
+    let (Some(id), Some(token)) = (q.get("id"), q.get("token")) else {
+        return respond_text(request, 400, "missing params");
+    };
+    let auth = header_value(&request, "X-Share-Auth");
+    let ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let (_root, perms) = match share_authorize(state, id, auth.as_deref(), &ip) {
+        Ok(v) => v,
+        Err(c) => return share_err_respond(request, c),
+    };
+    if !perms.0 {
+        return respond_text(request, 403, "无新增权限");
+    }
+    let token = sanitize_token(token);
+    if token.is_empty() {
+        return respond_text(request, 200, "0");
+    }
+    // 单文件 .bin 或文件夹 .zip，取存在的那个
+    let sz = std::fs::metadata(upload_part_path(&token, false))
+        .or_else(|_| std::fs::metadata(upload_part_path(&token, true)))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    respond_text(request, 200, &sz.to_string());
 }
 
 /// 新建文件夹（新增）。
@@ -1531,13 +1594,31 @@ fn handle_share_delete(state: &LanState, request: tiny_http::Request, query: &st
     }
 }
 
+/// 递归统计目录下所有文件的总字节数（仅 metadata，不读取内容），用于打包进度的分母。
+fn dir_total_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                total += dir_total_size(&p);
+            } else if let Ok(m) = e.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
 /// 递归把目录 src 写入 zip，条目路径相对 base（base = src 的父目录，使压缩包内含顶层文件夹名）。
+/// on_bytes 每写入一块就被调用一次（增量字节数），用于上报打包进度。
 fn zip_add_dir(
     zw: &mut zip::ZipWriter<File>,
     base: &std::path::Path,
     dir: &std::path::Path,
     opts: zip::write::SimpleFileOptions,
     cancel: &std::sync::atomic::AtomicBool,
+    on_bytes: &mut dyn FnMut(u64),
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1549,7 +1630,7 @@ fn zip_add_dir(
         let name = rel.to_string_lossy().replace('\\', "/");
         if path.is_dir() {
             let _ = zw.add_directory(format!("{name}/"), opts);
-            zip_add_dir(zw, base, &path, opts, cancel)?;
+            zip_add_dir(zw, base, &path, opts, cancel, on_bytes)?;
         } else {
             zw.start_file(name, opts)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -1565,6 +1646,7 @@ fn zip_add_dir(
                     break;
                 }
                 zw.write_all(&buf[..n])?;
+                on_bytes(n as u64);
             }
         }
     }
@@ -1602,7 +1684,7 @@ fn handle_share_zip(state: &LanState, request: tiny_http::Request, query: &str) 
             let _ = zw.add_directory(format!("{top}/"), opts);
         }
         let no_cancel = std::sync::atomic::AtomicBool::new(false);
-        zip_add_dir(&mut zw, base, &dir, opts, &no_cancel)?;
+        zip_add_dir(&mut zw, base, &dir, opts, &no_cancel, &mut |_n| {})?;
         zw.finish()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(())
@@ -2322,32 +2404,65 @@ pub async fn lan_share_upload(
             .map_err(|e| e.to_string())?;
         let lp = std::path::Path::new(&local_path);
         let is_dir = lp.is_dir();
+        // 续传 token：用任务 id（服务端据此累积已收字节）。
+        let token = sanitize_token(&ctid);
         let (send_path, endpoint, query_path, cleanup_zip): (PathBuf, &str, String, bool) = if is_dir {
-            let _ = capp.emit(
-                "lan://share-upload",
-                serde_json::json!({ "taskId": ctid, "name": cname, "transferred": 0u64, "size": 0u64, "phase": "zip" }),
-            );
-            let tmp = std::env::temp_dir().join(format!("baibao_send_{}.zip", rand_hex(8)));
-            let base_dir = lp.parent().unwrap_or(lp);
-            let build = (|| -> std::io::Result<()> {
-                let file = File::create(&tmp)?;
-                let mut zw = zip::ZipWriter::new(file);
-                let opts = zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
-                let _ = zw.add_directory(format!("{cname}/"), opts);
-                zip_add_dir(&mut zw, base_dir, lp, opts, &cancel)?;
-                zw.finish()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                Ok(())
-            })();
-            if build.is_err() {
-                let _ = std::fs::remove_file(&tmp);
-                if cancel.load(Relaxed) {
-                    return Err("cancelled".to_string());
+            // 文件夹打包成确定路径的 zip；存在即代表上次已构建完成（出错时保留），
+            // 续传时直接复用，保证字节一致（重新打包可能字节不同→续写会损坏）。
+            let zip_final = std::env::temp_dir().join(format!("baibao_send_{token}.zip"));
+            if zip_final.is_file() {
+                let sz = std::fs::metadata(&zip_final).map(|m| m.len()).unwrap_or(0);
+                let _ = capp.emit(
+                    "lan://share-upload",
+                    serde_json::json!({ "taskId": ctid, "name": cname, "transferred": sz, "size": sz, "phase": "zip" }),
+                );
+            } else {
+                // 先统计总字节作为打包进度的分母，并发一条初始「打包中 0%」
+                let total = dir_total_size(lp);
+                let _ = capp.emit(
+                    "lan://share-upload",
+                    serde_json::json!({ "taskId": ctid, "name": cname, "transferred": 0u64, "size": total, "phase": "zip" }),
+                );
+                let building = std::env::temp_dir().join(format!("baibao_send_{token}.building"));
+                let base_dir = lp.parent().unwrap_or(lp);
+                let build = (|| -> std::io::Result<()> {
+                    let file = File::create(&building)?;
+                    let mut zw = zip::ZipWriter::new(file);
+                    let opts = zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated);
+                    let _ = zw.add_directory(format!("{cname}/"), opts);
+                    // 打包进度：每累计 ~512KB 上报一次
+                    let mut packed = 0u64;
+                    let mut last = 0u64;
+                    let mut on_bytes = |n: u64| {
+                        packed += n;
+                        if packed - last > 512 * 1024 || packed >= total {
+                            last = packed;
+                            let _ = capp.emit(
+                                "lan://share-upload",
+                                serde_json::json!({ "taskId": ctid, "name": cname, "transferred": packed, "size": total, "phase": "zip" }),
+                            );
+                        }
+                    };
+                    zip_add_dir(&mut zw, base_dir, lp, opts, &cancel, &mut on_bytes)?;
+                    zw.finish()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    Ok(())
+                })();
+                if build.is_err() {
+                    let _ = std::fs::remove_file(&building);
+                    if cancel.load(Relaxed) {
+                        return Err("cancelled".to_string());
+                    }
+                    return Err("打包文件夹失败".to_string());
                 }
-                return Err("打包文件夹失败".to_string());
+                // 构建完成才落到最终路径——「存在即完整」，续传复用才安全
+                if let Err(e) = std::fs::rename(&building, &zip_final) {
+                    let _ = std::fs::remove_file(&building);
+                    return Err(format!("打包文件夹失败：{e}"));
+                }
             }
-            (tmp, "share/upload-zip", dest_dir.clone(), true)
+            (zip_final, "share/upload-zip", dest_dir.clone(), true)
         } else {
             let qp = if dest_dir.is_empty() {
                 cname.clone()
@@ -2358,39 +2473,87 @@ pub async fn lan_share_upload(
         };
 
         let size = std::fs::metadata(&send_path).map_err(|e| format!("读取失败：{e}"))?.len();
-        let f = File::open(&send_path).map_err(|e| format!("打开失败：{e}"))?;
+
+        // 断点续传：先问服务端已收到多少字节，从断点继续推送。
+        // 旧服务端没有该接口（404）→ 按 0 处理，从头传。
+        let already: u64 = {
+            let mut r = client
+                .get(format!("{base}/api/baibao/v1/share/upload-offset"))
+                .query(&[("id", id.as_str()), ("token", token.as_str())]);
+            if let Some(a) = &auth {
+                r = r.header("X-Share-Auth", a.clone());
+            }
+            match r.send() {
+                Ok(resp) if resp.status().is_success() => resp
+                    .text()
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u64>().ok())
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        }
+        .min(size);
+
+        let mut f = File::open(&send_path).map_err(|e| format!("打开失败：{e}"))?;
+        if already > 0 {
+            use std::io::{Seek, SeekFrom};
+            f.seek(SeekFrom::Start(already)).map_err(|e| format!("定位失败：{e}"))?;
+        }
         let reader = ShareUploadReader {
             inner: f,
             app: capp.clone(),
             task_id: ctid.clone(),
             name: cname.clone(),
-            sent: 0,
+            sent: already,
             size,
-            last_emit: 0,
+            last_emit: already,
             cancel: cancel.clone(),
         };
-        let body = reqwest::blocking::Body::sized(reader, size);
+        let remaining = size - already;
+        let body = reqwest::blocking::Body::sized(reader, remaining);
+        let offset_s = already.to_string();
+        let total_s = size.to_string();
         let mut req = client
             .post(format!("{base}/api/baibao/v1/{endpoint}"))
-            .query(&[("id", id.as_str()), ("path", query_path.as_str())])
+            .query(&[
+                ("id", id.as_str()),
+                ("path", query_path.as_str()),
+                ("token", token.as_str()),
+                ("offset", offset_s.as_str()),
+                ("total", total_s.as_str()),
+            ])
             .body(body);
-        if let Some(a) = auth {
-            req = req.header("X-Share-Auth", a);
+        if let Some(a) = &auth {
+            req = req.header("X-Share-Auth", a.clone());
         }
         let result = req.send();
-        if cleanup_zip {
-            let _ = std::fs::remove_file(&send_path);
-        }
         let resp = match result {
             Ok(r) => r,
             Err(e) => {
                 if cancel.load(Relaxed) {
+                    // 用户主动取消：删除本地 zip（不会再续传此任务）
+                    if cleanup_zip {
+                        let _ = std::fs::remove_file(&send_path);
+                    }
                     return Err("cancelled".to_string());
+                }
+                // 出错时保留本地 zip，「继续」时可复用（字节一致才能续传）。
+                // 发送请求体阶段被对方重置（非连接超时），最常见是对方版本过旧、不认识该接口。
+                if !e.is_connect() && !e.is_timeout() && cleanup_zip {
+                    return Err(
+                        "上传中断：对方未接收。通常是对方百宝箱版本过旧、不支持文件夹上传，请让对方更新到最新版后重试。"
+                            .to_string(),
+                    );
                 }
                 return Err(format!("连接失败：{e}"));
             }
         };
-        share_op_result(resp.status().as_u16())
+        let r = share_op_result(resp.status().as_u16());
+        // 仅成功才清理本地 zip；失败保留以便续传复用
+        if r.is_ok() && cleanup_zip {
+            let _ = std::fs::remove_file(&send_path);
+        }
+        r
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))?;
@@ -2958,6 +3121,93 @@ fn respond_text(req: tiny_http::Request, code: u16, body: &str) {
     let _ = req.respond(resp);
 }
 
+/// 给「带请求体的 POST」回错误前，先把客户端还在推送的 body 读空再响应。
+/// 否则我们提前返回（401/403/404…）会让对方在发送 body 阶段被连接重置，
+/// 客户端只能拿到模糊的 "error sending request"，而不是干净的状态码。
+fn respond_text_drained(mut req: tiny_http::Request, code: u16, body: &str) {
+    let _ = std::io::copy(&mut req.as_reader(), &mut std::io::sink());
+    respond_text(req, code, body);
+}
+
+// ── 断点续传支持 ──────────────────────────────────────────────
+// 客户端用一个 token（=任务 id）标识一次逻辑上传；服务端把已收字节累积到
+// 一个以 token 命名的临时文件，按 offset 续写，集齐 total 字节后再落地/解压。
+
+/// 过滤 token，只留文件名安全字符，防路径穿越。
+fn sanitize_token(t: &str) -> String {
+    t.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect()
+}
+
+/// 续传临时文件路径（.bin=单文件，.zip=文件夹）。
+fn upload_part_path(token: &str, zip: bool) -> PathBuf {
+    let ext = if zip { "zip" } else { "bin" };
+    std::env::temp_dir().join(format!("baibao_part_{token}.{ext}"))
+}
+
+/// 把请求体追加写到续传临时文件的 offset 处，返回写入后的总字节数。
+/// set_len + seek 先把文件对齐到约定 offset（客户端重发时截断多余尾巴）。
+fn append_upload_body(
+    request: &mut tiny_http::Request,
+    part: &std::path::Path,
+    offset: u64,
+) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(part)?;
+    f.set_len(offset)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let n = std::io::copy(&mut request.as_reader(), &mut f)?;
+    Ok(offset + n)
+}
+
+/// 把续传完成的临时文件落地到目标路径（同盘 rename，跨盘退化为 copy）。
+fn finalize_part_to(part: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    if let Some(p) = dest.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest); // 覆盖同名文件
+    }
+    match std::fs::rename(part, dest) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            std::fs::copy(part, dest)?;
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+    }
+}
+
+/// 把一个 zip 解压到 target（用 enclosed_name 防 zip-slip 穿越）。
+fn extract_zip_into(zip_path: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let zf = File::open(zip_path)?;
+    let mut ar =
+        zip::ZipArchive::new(zf).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    for i in 0..ar.len() {
+        let mut entry = ar
+            .by_index(i)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let Some(safe) = entry.enclosed_name() else { continue };
+        let out = target.join(safe);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)?;
+        } else {
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let mut of = File::create(&out)?;
+            std::io::copy(&mut entry, &mut of)?;
+        }
+    }
+    Ok(())
+}
+
 /// 解码 URL 查询值：`+`→空格、`%XX`→字节（application/x-www-form-urlencoded，reqwest .query() 用的就是它）。
 fn url_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -3007,11 +3257,14 @@ fn cleanup_stale_zips(download_dir: &std::path::Path) {
     if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().into_owned();
-            if n.ends_with(".zip")
+            let stale = (n.ends_with(".zip")
                 && (n.starts_with("baibao_send_")
                     || n.starts_with("baibao_share_")
-                    || n.starts_with("baibao_recv_"))
-            {
+                    || n.starts_with("baibao_recv_")))
+                // 断点续传残留：客户端打包中间文件 + 服务端累积分片
+                || (n.starts_with("baibao_send_") && n.ends_with(".building"))
+                || n.starts_with("baibao_part_");
+            if stale {
                 let _ = std::fs::remove_file(e.path());
             }
         }

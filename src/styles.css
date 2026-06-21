@@ -388,6 +388,20 @@ select { cursor: pointer; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.upload-task-resume {
+  flex: none;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--accent, #4a9eff);
+  color: var(--accent, #4a9eff);
+  background: transparent;
+  cursor: pointer;
+}
+.upload-task-resume:hover {
+  background: var(--accent, #4a9eff);
+  color: #fff;
+}
 .upload-task-bar {
   height: 6px;
   border-radius: 3px;

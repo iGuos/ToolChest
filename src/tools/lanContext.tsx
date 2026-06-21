@@ -93,6 +93,14 @@ export interface UploadTask {
   size: number;
   phase: UploadPhase;
 }
+// 一次上传的入参，留存以便失败后「继续」（断点续传）原样重发
+export interface UploadArgs {
+  fingerprint: string;
+  id: string; // shareId
+  destDir: string;
+  localPath: string;
+  auth: string | null;
+}
 
 interface LanCtxValue {
   me: MyInfo | null;
@@ -109,8 +117,9 @@ interface LanCtxValue {
   serviceError: string | null; // 服务启动失败（如端口被占用）；null=正常
   startService: () => Promise<boolean>; // 重试启动服务
   uploadTasks: Record<string, UploadTask>; // 共享上传任务（全局）
-  beginUpload: (id: string, name: string) => void;
+  startShareUpload: (taskId: string, name: string, args: UploadArgs) => Promise<void>;
   cancelUpload: (id: string) => void;
+  resumeUpload: (id: string) => void; // 失败任务断点续传
   dismissUpload: (id: string) => void;
   refreshPeers: () => Promise<void>;
   requestConfirm: (sessionId: string) => void;
@@ -378,14 +387,36 @@ export function LanProvider({ children }: { children: ReactNode }) {
     if (fp) setUnread((u) => (u[fp] ? { ...u, [fp]: 0 } : u));
   }, []);
 
-  // 上传任务：开始时占位（保证立即可见）、取消、清除
-  const beginUpload = useCallback((id: string, name: string) => {
-    setUploadTasks((m) => ({ ...m, [id]: { id, name, transferred: 0, size: 0, phase: "upload" } }));
+  // 上传任务入参留存，供失败后「继续」（断点续传）原样重发
+  const uploadArgs = useRef<Record<string, UploadArgs>>({});
+  const invokeUpload = (taskId: string, a: UploadArgs) =>
+    invoke<void>("lan_share_upload", {
+      fingerprint: a.fingerprint,
+      id: a.id,
+      taskId,
+      destDir: a.destDir,
+      localPath: a.localPath,
+      auth: a.auth,
+    });
+
+  // 开始上传：占位（保证立即可见）+ 记下入参 + 发起。返回 Promise 供前台刷新列表。
+  const startShareUpload = useCallback((taskId: string, name: string, a: UploadArgs) => {
+    uploadArgs.current[taskId] = a;
+    setUploadTasks((m) => ({ ...m, [taskId]: { id: taskId, name, transferred: 0, size: 0, phase: "upload" } }));
+    return invokeUpload(taskId, a);
   }, []);
   const cancelUpload = useCallback((id: string) => {
     invoke("lan_share_upload_cancel", { taskId: id }).catch(() => {});
   }, []);
+  // 断点续传：用留存的入参重发，后端会先查服务端已收字节再从断点继续
+  const resumeUpload = useCallback((id: string) => {
+    const a = uploadArgs.current[id];
+    if (!a) return;
+    setUploadTasks((m) => (m[id] ? { ...m, [id]: { ...m[id], phase: "upload" } } : m));
+    invokeUpload(id, a).catch(() => {}); // 终态由 lan://share-upload 事件驱动
+  }, []);
   const dismissUpload = useCallback((id: string) => {
+    delete uploadArgs.current[id];
     setUploadTasks((m) => {
       const n = { ...m };
       delete n[id];
@@ -934,7 +965,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
     serviceError, startService,
-    uploadTasks, beginUpload, cancelUpload, dismissUpload,
+    uploadTasks, startShareUpload, cancelUpload, resumeUpload, dismissUpload,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
     sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend,
