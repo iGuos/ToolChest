@@ -234,6 +234,8 @@ struct Inner {
     cancelled: HashSet<String>,         // 已取消的 sessionId（收发双向）
     cancelled_sends: HashSet<String>,   // 发送方取消的 fileId（对方还没接受前就撤销发送）
     share_uploads: HashMap<String, Arc<std::sync::atomic::AtomicBool>>, // taskId -> 中断标志（打包/传输都会检查）
+    share_receives: HashMap<String, Arc<std::sync::atomic::AtomicBool>>, // token -> 拒绝标志（接收方点「拒绝」置位）
+    share_rejected: HashSet<String>, // 已被接收方拒绝的 token（发送方据此判定「对方拒绝」并停止）
     socket: Option<Arc<UdpSocket>>,
 }
 
@@ -341,6 +343,8 @@ impl Default for Inner {
             cancelled: HashSet::new(),
             cancelled_sends: HashSet::new(),
             share_uploads: HashMap::new(),
+            share_receives: HashMap::new(),
+            share_rejected: HashSet::new(),
             socket: None,
         };
         // 落盘一次，确保（尤其是随机指纹）下次启动可复用
@@ -1019,11 +1023,11 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             Ok(())
         }
         ("POST", "/api/baibao/v1/share/upload") => {
-            handle_share_upload(&state, request, &query);
+            handle_share_upload(&app, &state, request, &query);
             Ok(())
         }
         ("POST", "/api/baibao/v1/share/upload-zip") => {
-            handle_share_upload_zip(&state, request, &query);
+            handle_share_upload_zip(&app, &state, request, &query);
             Ok(())
         }
         ("GET", "/api/baibao/v1/share/upload-offset") => {
@@ -1349,7 +1353,7 @@ fn resolve_create_path(root: &str, rel: &str) -> Option<PathBuf> {
 }
 
 /// 上传文件到共享目录（新增）。path = 目标相对路径（含文件名）；同名直接覆盖（客户端已二次确认）。
-fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query: &str) {
+fn handle_share_upload(app: &AppHandle, state: &LanState, mut request: tiny_http::Request, query: &str) {
     let q = parse_query(query);
     let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
         return respond_text_drained(request, 400, "missing params");
@@ -1373,24 +1377,53 @@ fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query:
 
     // 断点续传：带 token 时累积到临时文件、按 offset 续写、集齐 total 再落地。
     if let Some(token) = q.get("token").map(|t| sanitize_token(t)).filter(|t| !t.is_empty()) {
+        // 已被本机拒绝过的 token：直接拒收（发送方据此判定「对方拒绝」并停止）
+        if state.0.lock().unwrap().share_rejected.contains(&token) {
+            return respond_text_drained(request, 403, "rejected");
+        }
         let offset = q.get("offset").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         let total = q.get("total").and_then(|s| s.parse::<u64>().ok());
+        let total_emit = total.unwrap_or(0);
+        let name = q.get("name").cloned().unwrap_or_else(|| {
+            dest.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| token.clone())
+        });
         let part = upload_part_path(&token, false);
         let cur = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
         if offset > cur {
             // 客户端 offset 超前于服务端已收字节，无法续写，让其重新查询
             return respond_text_drained(request, 409, &cur.to_string());
         }
-        let now = match append_upload_body(&mut request, &part, offset) {
+        // 注册拒绝标志 + 让接收方的任务面板出现该任务
+        let reject = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.0.lock().unwrap().share_receives.insert(token.clone(), reject.clone());
+        let _ = app.emit(
+            "lan://share-incoming",
+            serde_json::json!({ "token": token, "name": name, "received": offset, "total": total_emit, "phase": "recv" }),
+        );
+        let outcome = recv_append_tracked(&mut request, &part, offset, app, &token, &name, total_emit, &reject);
+        state.0.lock().unwrap().share_receives.remove(&token);
+        let now = match outcome {
             Ok(n) => n,
-            Err(_) => return respond_text(request, 500, "接收中断"), // 保留 part 供续传
+            Err(true) => {
+                // 接收方主动拒绝：删 part + 标记 rejected + 通知面板
+                let _ = std::fs::remove_file(&part);
+                state.0.lock().unwrap().share_rejected.insert(token.clone());
+                let _ = app.emit("lan://share-incoming", serde_json::json!({ "token": token, "name": name, "phase": "rejected" }));
+                return respond_text(request, 403, "rejected");
+            }
+            Err(false) => return respond_text(request, 500, "接收中断"), // 连接断开：保留 part 供续传，不发终态
         };
-        return match total {
-            Some(t) if now < t => respond_text(request, 200, "incomplete"), // 还没传完，保留 part
-            _ => match finalize_part_to(&part, &dest) {
-                Ok(_) => respond_text(request, 200, "ok"),
-                Err(e) => respond_text(request, 500, &format!("写入失败：{e}")),
-            },
+        if let Some(t) = total {
+            if now < t {
+                return respond_text(request, 200, "incomplete"); // 还没传完，保留 part
+            }
+        }
+        return match finalize_part_to(&part, &dest) {
+            Ok(_) => {
+                let _ = app.emit("lan://share-incoming", serde_json::json!({ "token": token, "name": name, "received": now, "total": now, "phase": "done" }));
+                respond_text(request, 200, "ok")
+            }
+            Err(e) => respond_text(request, 500, &format!("写入失败：{e}")),
         };
     }
 
@@ -1410,7 +1443,7 @@ fn handle_share_upload(state: &LanState, mut request: tiny_http::Request, query:
 }
 
 /// 上传文件夹（新增）：接收一个 zip（内含顶层文件夹）并解压到目标目录 path（rel，空=共享根）。
-fn handle_share_upload_zip(state: &LanState, mut request: tiny_http::Request, query: &str) {
+fn handle_share_upload_zip(app: &AppHandle, state: &LanState, mut request: tiny_http::Request, query: &str) {
     let q = parse_query(query);
     let (Some(id), Some(rel)) = (q.get("id"), q.get("path")) else {
         return respond_text_drained(request, 400, "missing params");
@@ -1433,26 +1466,50 @@ fn handle_share_upload_zip(state: &LanState, mut request: tiny_http::Request, qu
 
     // 断点续传：带 token 时累积到临时 zip、按 offset 续写、集齐 total 再解压。
     if let Some(token) = q.get("token").map(|t| sanitize_token(t)).filter(|t| !t.is_empty()) {
+        if state.0.lock().unwrap().share_rejected.contains(&token) {
+            return respond_text_drained(request, 403, "rejected");
+        }
         let offset = q.get("offset").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         let total = q.get("total").and_then(|s| s.parse::<u64>().ok());
+        let total_emit = total.unwrap_or(0);
+        let name = q.get("name").cloned().unwrap_or_else(|| token.clone());
         let part = upload_part_path(&token, true);
         let cur = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
         if offset > cur {
             return respond_text_drained(request, 409, &cur.to_string());
         }
-        let now = match append_upload_body(&mut request, &part, offset) {
+        let reject = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.0.lock().unwrap().share_receives.insert(token.clone(), reject.clone());
+        let _ = app.emit(
+            "lan://share-incoming",
+            serde_json::json!({ "token": token, "name": name, "received": offset, "total": total_emit, "phase": "recv" }),
+        );
+        let outcome = recv_append_tracked(&mut request, &part, offset, app, &token, &name, total_emit, &reject);
+        state.0.lock().unwrap().share_receives.remove(&token);
+        let now = match outcome {
             Ok(n) => n,
-            Err(_) => return respond_text(request, 500, "接收中断"), // 保留 part 供续传
+            Err(true) => {
+                let _ = std::fs::remove_file(&part);
+                state.0.lock().unwrap().share_rejected.insert(token.clone());
+                let _ = app.emit("lan://share-incoming", serde_json::json!({ "token": token, "name": name, "phase": "rejected" }));
+                return respond_text(request, 403, "rejected");
+            }
+            Err(false) => return respond_text(request, 500, "接收中断"), // 连接断开：保留 part 供续传
         };
         if let Some(t) = total {
             if now < t {
                 return respond_text(request, 200, "incomplete"); // 还没传完，保留 part
             }
         }
+        // 解压阶段也通知面板（大文件夹解压可能耗时）
+        let _ = app.emit("lan://share-incoming", serde_json::json!({ "token": token, "name": name, "received": now, "total": now, "phase": "extract" }));
         let res = extract_zip_into(&part, &target);
         let _ = std::fs::remove_file(&part);
         return match res {
-            Ok(_) => respond_text(request, 200, "ok"),
+            Ok(_) => {
+                let _ = app.emit("lan://share-incoming", serde_json::json!({ "token": token, "name": name, "received": now, "total": now, "phase": "done" }));
+                respond_text(request, 200, "ok")
+            }
             Err(_) => respond_text(request, 500, "解压失败"),
         };
     }
@@ -1495,6 +1552,10 @@ fn handle_share_upload_offset(state: &LanState, request: tiny_http::Request, que
     let token = sanitize_token(token);
     if token.is_empty() {
         return respond_text(request, 200, "0");
+    }
+    // 该 token 已被接收方拒绝 → 410，发送方据此停止上传
+    if state.0.lock().unwrap().share_rejected.contains(&token) {
+        return respond_text(request, 410, "rejected");
     }
     // 单文件 .bin 或文件夹 .zip，取存在的那个
     let sz = std::fs::metadata(upload_part_path(&token, false))
@@ -2369,6 +2430,55 @@ impl Read for ShareUploadReader {
     }
 }
 
+/// 向对端查询某 token 已收到多少字节的结果。
+/// 用来「确认对方有没有收到」+ 判断对方是否为支持断点续传的新版本。
+enum OffsetProbe {
+    Bytes(u64),   // 对方已收到的字节数（>0 即确实收到了）
+    Rejected,     // 对方已点「拒绝」（410）
+    Unsupported,  // 对方没有该接口（旧版本，不保存已收数据、不支持续传）
+    Unreachable,  // 连不上对方（网络问题）
+}
+
+fn probe_upload_offset(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    id: &str,
+    token: &str,
+    auth: Option<&String>,
+) -> OffsetProbe {
+    let mut r = client
+        .get(format!("{base}/api/baibao/v1/share/upload-offset"))
+        .query(&[("id", id), ("token", token)]);
+    if let Some(a) = auth {
+        r = r.header("X-Share-Auth", a.clone());
+    }
+    match r.send() {
+        Ok(resp) if resp.status().is_success() => resp
+            .text()
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .map(OffsetProbe::Bytes)
+            .unwrap_or(OffsetProbe::Unsupported),
+        Ok(resp) if resp.status().as_u16() == 410 => OffsetProbe::Rejected,
+        Ok(_) => OffsetProbe::Unsupported, // 404 等：对方没有此接口
+        Err(_) => OffsetProbe::Unreachable,
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    let f = n as f64;
+    if f >= KB * KB * KB {
+        format!("{:.2} GB", f / (KB * KB * KB))
+    } else if f >= KB * KB {
+        format!("{:.1} MB", f / (KB * KB))
+    } else if f >= KB {
+        format!("{:.0} KB", f / KB)
+    } else {
+        format!("{n} B")
+    }
+}
+
 /// 上传本地文件或文件夹到对端共享目录（新增）。dest_dir = 目标目录相对路径（空=共享根）。
 /// 文件夹会在本地打包成 zip 上传、对端解压（支持任意层级）。带进度上报。
 #[tauri::command]
@@ -2473,87 +2583,100 @@ pub async fn lan_share_upload(
         };
 
         let size = std::fs::metadata(&send_path).map_err(|e| format!("读取失败：{e}"))?.len();
-
-        // 断点续传：先问服务端已收到多少字节，从断点继续推送。
-        // 旧服务端没有该接口（404）→ 按 0 处理，从头传。
-        let already: u64 = {
-            let mut r = client
-                .get(format!("{base}/api/baibao/v1/share/upload-offset"))
-                .query(&[("id", id.as_str()), ("token", token.as_str())]);
-            if let Some(a) = &auth {
-                r = r.header("X-Share-Auth", a.clone());
-            }
-            match r.send() {
-                Ok(resp) if resp.status().is_success() => resp
-                    .text()
-                    .ok()
-                    .and_then(|t| t.trim().parse::<u64>().ok())
-                    .unwrap_or(0),
-                _ => 0,
-            }
-        }
-        .min(size);
-
-        let mut f = File::open(&send_path).map_err(|e| format!("打开失败：{e}"))?;
-        if already > 0 {
-            use std::io::{Seek, SeekFrom};
-            f.seek(SeekFrom::Start(already)).map_err(|e| format!("定位失败：{e}"))?;
-        }
-        let reader = ShareUploadReader {
-            inner: f,
-            app: capp.clone(),
-            task_id: ctid.clone(),
-            name: cname.clone(),
-            sent: already,
-            size,
-            last_emit: already,
-            cancel: cancel.clone(),
-        };
-        let remaining = size - already;
-        let body = reqwest::blocking::Body::sized(reader, remaining);
-        let offset_s = already.to_string();
         let total_s = size.to_string();
-        let mut req = client
-            .post(format!("{base}/api/baibao/v1/{endpoint}"))
-            .query(&[
-                ("id", id.as_str()),
-                ("path", query_path.as_str()),
-                ("token", token.as_str()),
-                ("offset", offset_s.as_str()),
-                ("total", total_s.as_str()),
-            ])
-            .body(body);
-        if let Some(a) = &auth {
-            req = req.header("X-Share-Auth", a.clone());
-        }
-        let result = req.send();
-        let resp = match result {
-            Ok(r) => r,
-            Err(e) => {
-                if cancel.load(Relaxed) {
-                    // 用户主动取消：删除本地 zip（不会再续传此任务）
-                    if cleanup_zip {
-                        let _ = std::fs::remove_file(&send_path);
+
+        // 发送（带断点续传）：失败不立即放弃，自动重试 1 次（共 2 次尝试）。
+        // 重试时若探测到对方「拒绝」或「网络不通」，则判定中断、停止重试。
+        let mut attempt = 0u32;
+        let outcome: Result<(), String> = loop {
+            // 每次尝试前先探测对方已收字节，从断点继续（旧版/连不上 → 从 0 开始仍尝试发送）
+            let already: u64 = match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
+                OffsetProbe::Bytes(n) => n.min(size),
+                OffsetProbe::Rejected => break Err("上传已停止：对方拒绝接收。".to_string()),
+                _ => 0,
+            };
+
+            let mut f = match File::open(&send_path) {
+                Ok(f) => f,
+                Err(e) => break Err(format!("打开失败：{e}")),
+            };
+            if already > 0 {
+                use std::io::{Seek, SeekFrom};
+                if let Err(e) = f.seek(SeekFrom::Start(already)) {
+                    break Err(format!("定位失败：{e}"));
+                }
+            }
+            let reader = ShareUploadReader {
+                inner: f,
+                app: capp.clone(),
+                task_id: ctid.clone(),
+                name: cname.clone(),
+                sent: already,
+                size,
+                last_emit: already,
+                cancel: cancel.clone(),
+            };
+            let body = reqwest::blocking::Body::sized(reader, size - already);
+            let offset_s = already.to_string();
+            let mut req = client
+                .post(format!("{base}/api/baibao/v1/{endpoint}"))
+                .query(&[
+                    ("id", id.as_str()),
+                    ("path", query_path.as_str()),
+                    ("token", token.as_str()),
+                    ("offset", offset_s.as_str()),
+                    ("total", total_s.as_str()),
+                    ("name", cname.as_str()), // 让接收方任务面板显示文件名
+                ])
+                .body(body);
+            if let Some(a) = &auth {
+                req = req.header("X-Share-Auth", a.clone());
+            }
+
+            match req.send() {
+                Ok(resp) => break share_op_result(resp.status().as_u16()),
+                Err(_e) => {
+                    if cancel.load(Relaxed) {
+                        break Err("cancelled".to_string());
                     }
-                    return Err("cancelled".to_string());
+                    // 失败：向对方查一次，据此分类 + 决定是否重试
+                    match probe_upload_offset(&client, &base, &id, &token, auth.as_ref()) {
+                        OffsetProbe::Rejected => break Err("上传中断：对方拒绝接收。".to_string()),
+                        OffsetProbe::Unsupported => {
+                            break Err("上传中断：对方版本过旧、不保存已收数据，不支持断点续传，请让对方更新到最新版后重试。".to_string())
+                        }
+                        OffsetProbe::Unreachable => {
+                            if attempt == 0 {
+                                attempt += 1;
+                                continue; // 自动重试 1 次
+                            }
+                            break Err("上传中断：与对方网络连接已断开，请检查网络后点「继续」重试。".to_string());
+                        }
+                        OffsetProbe::Bytes(n) => {
+                            if attempt == 0 {
+                                attempt += 1;
+                                continue; // 自动重试 1 次（从断点续传）
+                            }
+                            break Err(format!(
+                                "上传中断：对方已收到 {} / {}，点「继续」可从断点续传。",
+                                human_bytes(n),
+                                human_bytes(size)
+                            ));
+                        }
+                    }
                 }
-                // 出错时保留本地 zip，「继续」时可复用（字节一致才能续传）。
-                // 发送请求体阶段被对方重置（非连接超时），最常见是对方版本过旧、不认识该接口。
-                if !e.is_connect() && !e.is_timeout() && cleanup_zip {
-                    return Err(
-                        "上传中断：对方未接收。通常是对方百宝箱版本过旧、不支持文件夹上传，请让对方更新到最新版后重试。"
-                            .to_string(),
-                    );
-                }
-                return Err(format!("连接失败：{e}"));
             }
         };
-        let r = share_op_result(resp.status().as_u16());
-        // 仅成功才清理本地 zip；失败保留以便续传复用
-        if r.is_ok() && cleanup_zip {
+
+        if outcome == Err("cancelled".to_string()) && cleanup_zip {
+            // 用户主动取消：删除本地 zip（不会再续传此任务）
             let _ = std::fs::remove_file(&send_path);
         }
-        r
+        // 仅成功才清理本地 zip；失败（非取消）保留以便续传复用
+        if outcome.is_ok() && cleanup_zip {
+            let _ = std::fs::remove_file(&send_path);
+        }
+        outcome
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))?;
@@ -2565,9 +2688,14 @@ pub async fn lan_share_upload(
         Err(e) if e == "cancelled" => "cancelled",
         Err(_) => "error",
     };
+    // 失败时把原因一并带上，让任务面板（不只是浏览弹框）也能显示「对方已收到 X」等
+    let errmsg = match &res {
+        Err(e) if e != "cancelled" => Some(e.clone()),
+        _ => None,
+    };
     let _ = app.emit(
         "lan://share-upload",
-        serde_json::json!({ "taskId": task_id, "name": name, "phase": phase }),
+        serde_json::json!({ "taskId": task_id, "name": name, "phase": phase, "error": errmsg }),
     );
     res
 }
@@ -2587,6 +2715,27 @@ pub fn lan_share_upload_cancel(state: State<'_, LanState>, task_id: String) {
     if let Some(c) = state.0.lock().unwrap().share_uploads.get(&task_id) {
         c.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// 接收方「拒绝」某个上传 token：中断当前接收 + 标记拒绝 + 删除已收分片。
+/// 标记后发送方查询 offset 会得到 410，从而判定「对方拒绝」并停止。
+#[tauri::command]
+pub fn lan_share_receive_reject(app: AppHandle, state: State<'_, LanState>, token: String) {
+    let token = sanitize_token(&token);
+    if token.is_empty() {
+        return;
+    }
+    {
+        let mut g = state.0.lock().unwrap();
+        if let Some(r) = g.share_receives.get(&token) {
+            r.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        g.share_rejected.insert(token.clone());
+    }
+    // 即使当前没有活跃接收（两次续传之间的空档），也删掉分片，阻止后续续传
+    let _ = std::fs::remove_file(upload_part_path(&token, false));
+    let _ = std::fs::remove_file(upload_part_path(&token, true));
+    let _ = app.emit("lan://share-incoming", serde_json::json!({ "token": token, "phase": "rejected" }));
 }
 
 /// 共享写操作（mkdir/rename/delete）的统一 POST 客户端。
@@ -3147,24 +3296,6 @@ fn upload_part_path(token: &str, zip: bool) -> PathBuf {
     std::env::temp_dir().join(format!("baibao_part_{token}.{ext}"))
 }
 
-/// 把请求体追加写到续传临时文件的 offset 处，返回写入后的总字节数。
-/// set_len + seek 先把文件对齐到约定 offset（客户端重发时截断多余尾巴）。
-fn append_upload_body(
-    request: &mut tiny_http::Request,
-    part: &std::path::Path,
-    offset: u64,
-) -> std::io::Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(part)?;
-    f.set_len(offset)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let n = std::io::copy(&mut request.as_reader(), &mut f)?;
-    Ok(offset + n)
-}
 
 /// 把续传完成的临时文件落地到目标路径（同盘 rename，跨盘退化为 copy）。
 fn finalize_part_to(part: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
@@ -3206,6 +3337,55 @@ fn extract_zip_into(zip_path: &std::path::Path, target: &std::path::Path) -> std
         }
     }
     Ok(())
+}
+
+/// 接收方：把请求体按 offset 续写到 part，期间上报接收进度、并响应「拒绝」。
+/// Ok(now)=写入后的总字节；Err(true)=接收方拒绝；Err(false)=连接中断。
+fn recv_append_tracked(
+    request: &mut tiny_http::Request,
+    part: &std::path::Path,
+    offset: u64,
+    app: &AppHandle,
+    token: &str,
+    name: &str,
+    total: u64,
+    reject: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<u64, bool> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut f = match std::fs::OpenOptions::new().create(true).read(true).write(true).open(part) {
+        Ok(f) => f,
+        Err(_) => return Err(false),
+    };
+    if f.set_len(offset).is_err() || f.seek(SeekFrom::Start(offset)).is_err() {
+        return Err(false);
+    }
+    let reader = request.as_reader();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut received = offset;
+    let mut last = offset;
+    loop {
+        if reject.load(Relaxed) {
+            return Err(true);
+        }
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return Err(false),
+        };
+        if f.write_all(&buf[..n]).is_err() {
+            return Err(false);
+        }
+        received += n as u64;
+        if received - last > 256 * 1024 || (total > 0 && received >= total) {
+            last = received;
+            let _ = app.emit(
+                "lan://share-incoming",
+                serde_json::json!({ "token": token, "name": name, "received": received, "total": total, "phase": "recv" }),
+            );
+        }
+    }
+    Ok(received)
 }
 
 /// 解码 URL 查询值：`+`→空格、`%XX`→字节（application/x-www-form-urlencoded，reqwest .query() 用的就是它）。

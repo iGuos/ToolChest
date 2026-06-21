@@ -215,9 +215,11 @@ export default function LanShare() {
     cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
     setRemark, clearChat, togglePin, reorderPins,
     uploadTasks, cancelUpload, resumeUpload, dismissUpload,
+    recvTasks, rejectReceive,
   } = useLan();
   const [retrying, setRetrying] = useState(false);
   const [uploadsMin, setUploadsMin] = useState(false); // 上传任务面板是否最小化
+  const [recvMin, setRecvMin] = useState(false); // 接收任务面板是否最小化
 
   const [draft, setDraft] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -705,7 +707,7 @@ export default function LanShare() {
                   : t.phase === "cancelled"
                   ? "已取消"
                   : t.phase === "error"
-                  ? "失败"
+                  ? t.error || "失败"
                   : t.size === 0
                   ? t.phase === "zip"
                     ? "打包中…"
@@ -733,6 +735,59 @@ export default function LanShare() {
                         width: indeterminate ? "100%" : `${pct}%`,
                         background: t.phase === "error" ? "var(--red-h, #ff6b6b)" : undefined,
                       }}
+                    />
+                  </span>
+                  <span className="dim upload-task-text">{statusText}</span>
+                </div>
+              );
+            })}
+          </div>,
+          document.body
+        )}
+
+      {/* 全局接收任务面板（接收方）：别人上传到本机时显示进度,可拒绝,可最小化,无「继续」 */}
+      {Object.keys(recvTasks).length > 0 &&
+        recvMin &&
+        createPortal(
+          <button className="upload-tasks-pill recv-tasks-pill" onClick={() => setRecvMin(false)}>
+            接收任务 {Object.keys(recvTasks).length} ▴
+          </button>,
+          document.body
+        )}
+      {Object.keys(recvTasks).length > 0 &&
+        !recvMin &&
+        createPortal(
+          <div className="upload-tasks recv-tasks">
+            <div className="upload-tasks-head">
+              <span className="upload-tasks-title dim">接收任务</span>
+              <button className="lan-toast-x" title="最小化" onClick={() => setRecvMin(true)}>—</button>
+            </div>
+            {Object.values(recvTasks).map((t) => {
+              const active = t.phase === "recv" || t.phase === "extract";
+              const indeterminate = active && t.total === 0;
+              const pct = t.total ? Math.min(100, (t.received / t.total) * 100) : 0;
+              const statusText =
+                t.phase === "done"
+                  ? "已完成"
+                  : t.phase === "rejected"
+                  ? "已拒绝"
+                  : t.phase === "extract"
+                  ? "正在解压…"
+                  : t.total === 0
+                  ? "接收中…"
+                  : `${fmtBytes(t.received)} / ${fmtBytes(t.total)} · ${Math.round(pct)}%`;
+              return (
+                <div key={t.token} className="upload-task">
+                  <div className="upload-task-row">
+                    <span className="upload-task-name" title={t.name}>{t.name}</span>
+                    {active && (
+                      <button className="upload-task-reject" title="拒绝接收" onClick={() => rejectReceive(t.token)}>拒绝</button>
+                    )}
+                  </div>
+                  <span className="upload-task-bar">
+                    <span
+                      className={indeterminate ? "indet" : ""}
+                      style={{ width: indeterminate ? "100%" : `${pct}%` }}
                     />
                   </span>
                   <span className="dim upload-task-text">{statusText}</span>

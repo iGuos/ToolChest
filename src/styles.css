@@ -371,6 +371,29 @@ select { cursor: pointer; }
 .upload-tasks-pill:hover {
   border-color: var(--accent);
 }
+/* 接收任务面板：放到左下角，与右下角的「上传任务」错开 */
+.upload-tasks.recv-tasks {
+  right: auto;
+  left: 16px;
+}
+.upload-tasks-pill.recv-tasks-pill {
+  right: auto;
+  left: 16px;
+}
+.upload-task-reject {
+  flex: none;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--red-h, #ff6b6b);
+  color: var(--red-h, #ff6b6b);
+  background: transparent;
+  cursor: pointer;
+}
+.upload-task-reject:hover {
+  background: var(--red-h, #ff6b6b);
+  color: #fff;
+}
 .upload-task {
   display: flex;
   flex-direction: column;
@@ -420,6 +443,8 @@ select { cursor: pointer; }
 }
 .upload-task-text {
   font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
 }
 
 /* 局域网服务启动失败（端口占用等）的常驻提示条 */

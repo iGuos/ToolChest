@@ -41,6 +41,7 @@ pub fn run() {
             tools::lan::lan_share_download,
             tools::lan::lan_share_upload,
             tools::lan::lan_share_upload_cancel,
+            tools::lan::lan_share_receive_reject,
             tools::lan::lan_dir_flags,
             tools::lan::lan_share_op,
             tools::lan::lan_respond,

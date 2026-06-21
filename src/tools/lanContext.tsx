@@ -92,6 +92,7 @@ export interface UploadTask {
   transferred: number;
   size: number;
   phase: UploadPhase;
+  error?: string; // 失败原因（如「对方已收到 X / Y」），用于面板展示
 }
 // 一次上传的入参，留存以便失败后「继续」（断点续传）原样重发
 export interface UploadArgs {
@@ -100,6 +101,16 @@ export interface UploadArgs {
   destDir: string;
   localPath: string;
   auth: string | null;
+}
+
+// 接收方视角：别人正往本机共享目录上传的任务
+export type RecvPhase = "recv" | "extract" | "done" | "rejected";
+export interface RecvTask {
+  token: string;
+  name: string;
+  received: number;
+  total: number;
+  phase: RecvPhase;
 }
 
 interface LanCtxValue {
@@ -121,6 +132,8 @@ interface LanCtxValue {
   cancelUpload: (id: string) => void;
   resumeUpload: (id: string) => void; // 失败任务断点续传
   dismissUpload: (id: string) => void;
+  recvTasks: Record<string, RecvTask>; // 接收方：别人上传到本机的任务
+  rejectReceive: (token: string) => void; // 拒绝某个接收任务
   refreshPeers: () => Promise<void>;
   requestConfirm: (sessionId: string) => void;
   dismissConfirm: () => void;
@@ -212,6 +225,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const [serviceError, setServiceError] = useState<string | null>(null); // 服务启动失败原因（如端口被占用）
   // 共享上传任务（全局，关闭浏览弹框也能看到）：taskId -> 进度/状态
   const [uploadTasks, setUploadTasks] = useState<Record<string, UploadTask>>({});
+  const [recvTasks, setRecvTasks] = useState<Record<string, RecvTask>>({});
   const [livePeers, setLivePeers] = useState<Peer[]>([]); // 当前在线发现到的设备
   const [knownPeers, setKnownPeers] = useState<Record<string, Peer>>(loadKnownPeers); // 历史已知设备（持久化）
   const [items, setItems] = useState<ChatItem[]>(loadItems);
@@ -423,6 +437,15 @@ export function LanProvider({ children }: { children: ReactNode }) {
       return n;
     });
   }, []);
+  // 接收方拒绝某个上传：通知后端中断接收+删分片，并立即从面板移除
+  const rejectReceive = useCallback((token: string) => {
+    invoke("lan_share_receive_reject", { token }).catch(() => {});
+    setRecvTasks((m) => {
+      const n = { ...m };
+      delete n[token];
+      return n;
+    });
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -435,10 +458,10 @@ export function LanProvider({ children }: { children: ReactNode }) {
       track(await listen<Peer[]>("lan://peers", (e) => setLivePeers(e.payload)));
       // 共享上传进度/终态（全局跟踪，不依赖浏览弹框是否打开）
       track(
-        await listen<{ taskId?: string; name?: string; transferred?: number; size?: number; phase?: UploadPhase }>(
+        await listen<{ taskId?: string; name?: string; transferred?: number; size?: number; phase?: UploadPhase; error?: string | null }>(
           "lan://share-upload",
           (e) => {
-            const { taskId, name, transferred, size, phase } = e.payload;
+            const { taskId, name, transferred, size, phase, error } = e.payload;
             if (!taskId) return;
             setUploadTasks((m) => {
               const prev = m[taskId] ?? { id: taskId, name: name ?? "", transferred: 0, size: 0, phase: "upload" as UploadPhase };
@@ -450,6 +473,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
                   transferred: typeof transferred === "number" ? transferred : prev.transferred,
                   size: typeof size === "number" ? size : prev.size,
                   phase: phase ?? prev.phase,
+                  error: phase === "error" ? error ?? prev.error : phase ? undefined : prev.error,
                 },
               };
             });
@@ -459,6 +483,39 @@ export function LanProvider({ children }: { children: ReactNode }) {
                 setUploadTasks((m) => {
                   const n = { ...m };
                   delete n[taskId];
+                  return n;
+                });
+              }, 4000);
+            }
+          }
+        )
+      );
+      // 接收方：别人往本机共享目录上传的进度/终态
+      track(
+        await listen<{ token?: string; name?: string; received?: number; total?: number; phase?: RecvPhase }>(
+          "lan://share-incoming",
+          (e) => {
+            const { token, name, received, total, phase } = e.payload;
+            if (!token) return;
+            setRecvTasks((m) => {
+              const prev = m[token] ?? { token, name: name ?? "", received: 0, total: 0, phase: "recv" as RecvPhase };
+              return {
+                ...m,
+                [token]: {
+                  token,
+                  name: name ?? prev.name,
+                  received: typeof received === "number" ? received : prev.received,
+                  total: typeof total === "number" ? total : prev.total,
+                  phase: phase ?? prev.phase,
+                },
+              };
+            });
+            // 完成/拒绝几秒后自动消失
+            if (phase === "done" || phase === "rejected") {
+              setTimeout(() => {
+                setRecvTasks((m) => {
+                  const n = { ...m };
+                  delete n[token];
                   return n;
                 });
               }, 4000);
@@ -966,6 +1023,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
     serviceError, startService,
     uploadTasks, startShareUpload, cancelUpload, resumeUpload, dismissUpload,
+    recvTasks, rejectReceive,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
     sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend,
