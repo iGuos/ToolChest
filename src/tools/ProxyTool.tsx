@@ -136,7 +136,7 @@ function Copyable({ text, title }: { text: string; title?: string }) {
 }
 
 type Msg = { text: string; kind: "err" | "ok" | "info" };
-type ProxyStatus = { role: number; socksPort: number; port: number; conns: number; bytes: number };
+type ProxyStatus = { role: number; socksPort: number; httpPort: number; port: number; conns: number; bytes: number };
 type HostHit = { target: string; count: number; lastMs: number };
 
 // 人类可读的字节/速率
@@ -199,7 +199,7 @@ function loadPwStore(): PwStore {
 export default function ProxyTool() {
   const { peers } = useLan();
   const pwStore = useRef<PwStore>(loadPwStore());
-  const [proxy, setProxy] = useState<ProxyStatus>({ role: 0, socksPort: 0, port: 0, conns: 0, bytes: 0 });
+  const [proxy, setProxy] = useState<ProxyStatus>({ role: 0, socksPort: 0, httpPort: 0, port: 0, conns: 0, bytes: 0 });
   const [serverView, setServerView] = useState<"traffic" | "hosts">("traffic"); // 服务端视图：流量折线 / 访问网址
   const [samples, setSamples] = useState<number[]>([]); // 实时速率采样(字节/秒)，画折线
   const [hosts, setHosts] = useState<HostHit[]>([]); // 访问过的目标列表
@@ -445,7 +445,11 @@ export default function ProxyTool() {
   const applySys = async (on: boolean): Promise<boolean> => {
     setSysBusy(true);
     try {
-      await invoke("lan_set_system_proxy", { enable: on, port: proxy.socksPort || 53319 });
+      await invoke("lan_set_system_proxy", {
+        enable: on,
+        socksPort: proxy.socksPort || 53319,
+        httpPort: proxy.httpPort || 53320,
+      });
       setSysProxy(on);
       show(on ? "已设为系统代理；多数程序自动走，停止/切回指定应用时自动还原。" : "已还原系统代理。", "ok");
       return true;
@@ -515,7 +519,11 @@ export default function ProxyTool() {
       if (sysProxy) {
         // 停止前先还原系统代理，避免系统代理指向已关闭的端口导致断网
         try {
-          await invoke("lan_set_system_proxy", { enable: false, port: proxy.socksPort || 53319 });
+          await invoke("lan_set_system_proxy", {
+            enable: false,
+            socksPort: proxy.socksPort || 53319,
+            httpPort: proxy.httpPort || 53320,
+          });
         } catch {
           /* 还原失败也继续停止 */
         }
@@ -612,10 +620,14 @@ export default function ProxyTool() {
               </>
             ) : (
               <p className="proxy-socks-line">
-                正作为<b>客户端</b>运行 · 把浏览器/工具的代理设为：
+                正作为<b>客户端</b>运行 · 手动配置代理可用：
                 <br />
+                <span className="dim">HTTP </span>
+                <Copyable text={`127.0.0.1:${proxy.httpPort || 53320}`} title="复制 HTTP 代理地址" />
+                <span className="dim">　SOCKS5 </span>
                 <Copyable text={`127.0.0.1:${proxy.socksPort}`} title="复制 SOCKS5 地址" />
-                <span className="dim"> （SOCKS5）</span>
+                <br />
+                <span className="dim">域名由服务端解析（远程 DNS），适合被污染的站点。</span>
               </p>
             )}
             {proxy.role === 2 && (

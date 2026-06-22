@@ -13,11 +13,22 @@ import { useLan } from "./tools/lanContext";
 import { useEscToClose, useDragReorder } from "./hooks";
 import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
 
+type Platform = "macos" | "windows" | "linux";
 interface ToolMeta {
   id: string;
   name: string;
   icon: string;
+  platforms?: Platform[]; // 不填=全平台；填了则仅这些平台可用
 }
+
+// 当前平台（用 webview UA 同步判定，避免异步导致工具闪现）
+const PLATFORM: Platform = /Windows/i.test(navigator.userAgent)
+  ? "windows"
+  : /Mac/i.test(navigator.userAgent)
+  ? "macos"
+  : "linux";
+const PLATFORM_LABEL: Record<Platform, string> = { macos: "macOS", windows: "Windows", linux: "Linux" };
+const toolSupported = (t: ToolMeta) => !t.platforms || t.platforms.includes(PLATFORM);
 
 const HOME_ID = "home";
 
@@ -26,7 +37,7 @@ const TOOLS: ToolMeta[] = [
   { id: "port-scanner", name: "端口查询", icon: "⚡" },
   { id: "http-client", name: "HTTP 请求测试", icon: "🌐" },
   { id: "hosts-editor", name: "Hosts 编辑器", icon: "📝" },
-  { id: "trust-app", name: "Mac 应用授权", icon: "🔓" },
+  { id: "trust-app", name: "Mac 应用授权", icon: "🔓", platforms: ["macos"] },
   { id: "todo", name: "待办事项", icon: "📋" },
   { id: "lan-share", name: "局域网互传", icon: "📡" },
   { id: "proxy", name: "请求代理", icon: "🔀" },
@@ -182,7 +193,7 @@ export default function App() {
   }, [settings.closeAction]);
   const hiddenTools = new Set(settings.hiddenTools);
   const orderedTools = orderTools(settings.order);
-  const visibleTools = orderedTools.filter((t) => !hiddenTools.has(t.id));
+  const visibleTools = orderedTools.filter((t) => toolSupported(t) && !hiddenTools.has(t.id));
   const toggleToolVisible = (id: string) =>
     setSettings((s) => {
       const hid = new Set(s.hiddenTools);
@@ -487,30 +498,37 @@ export default function App() {
                 勾选是否显示，拖拽卡片调整顺序（侧边栏与首页同步生效）
               </div>
               <div className="settings-cards">
-                {orderedTools.map((t) => (
-                  <div
-                    key={t.id}
-                    data-tool-card-id={t.id}
-                    className={`settings-card${toolDnd.drag?.id === t.id ? " dragging" : ""}${
-                      hiddenTools.has(t.id) ? " off" : ""
-                    }`}
-                    onPointerDown={(e) => toolDnd.onPointerDown(e, t.id)}
-                    onPointerMove={toolDnd.onPointerMove}
-                    onPointerUp={toolDnd.onPointerEnd}
-                    onPointerCancel={toolDnd.onPointerEnd}
-                    title="拖拽排序"
-                  >
-                    <input
-                      className="settings-card-check"
-                      type="checkbox"
-                      checked={!hiddenTools.has(t.id)}
-                      onChange={() => toggleToolVisible(t.id)}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                    <span className="tool-icon">{t.icon}</span>
-                    <span className="settings-card-name">{t.name}</span>
-                  </div>
-                ))}
+                {orderedTools.map((t) => {
+                  const supported = toolSupported(t);
+                  return (
+                    <div
+                      key={t.id}
+                      data-tool-card-id={t.id}
+                      className={`settings-card${toolDnd.drag?.id === t.id ? " dragging" : ""}${
+                        hiddenTools.has(t.id) ? " off" : ""
+                      }${supported ? "" : " unavailable"}`}
+                      onPointerDown={supported ? (e) => toolDnd.onPointerDown(e, t.id) : undefined}
+                      onPointerMove={supported ? toolDnd.onPointerMove : undefined}
+                      onPointerUp={supported ? toolDnd.onPointerEnd : undefined}
+                      onPointerCancel={supported ? toolDnd.onPointerEnd : undefined}
+                      title={supported ? "拖拽排序" : `仅支持 ${t.platforms!.map((p) => PLATFORM_LABEL[p]).join("/")}`}
+                    >
+                      <input
+                        className="settings-card-check"
+                        type="checkbox"
+                        checked={supported && !hiddenTools.has(t.id)}
+                        disabled={!supported}
+                        onChange={() => toggleToolVisible(t.id)}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <span className="tool-icon">{t.icon}</span>
+                      <span className="settings-card-name">{t.name}</span>
+                      {!supported && (
+                        <span className="settings-card-badge">仅 {t.platforms!.map((p) => PLATFORM_LABEL[p]).join("/")}</span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
             <div className="settings-section">

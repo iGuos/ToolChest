@@ -204,6 +204,25 @@ select { cursor: pointer; }
 .settings-card.off {
   opacity: 0.55;
 }
+.settings-card.unavailable {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--bg2);
+}
+.settings-card.unavailable .settings-card-check {
+  cursor: not-allowed;
+}
+.settings-card-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--bg3);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
 .settings-card .tool-icon {
   font-size: 22px;
 }

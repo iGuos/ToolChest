@@ -242,6 +242,7 @@ struct Inner {
     // ── 代理（SOCKS5 over 百宝箱 TLS）。默认关闭、不持久化（每次启动都是关）。──
     proxy_role: u8,                  // 0=关 / 1=服务端(出口,替对端访问) / 2=客户端(本地 SOCKS5 入口)
     proxy_socks_port: u16,           // 客户端模式下本地 SOCKS5 端口（0=未开）
+    proxy_http_port: u16,            // 客户端模式下本地 HTTP 代理端口（0=未开）
     proxy_port: u16,                 // 隧道端口（服务端=监听端口 / 客户端=对方服务端端口）
     proxy_task: Option<tauri::async_runtime::JoinHandle<()>>, // 监听任务句柄，停止时 abort
     proxy_conns: std::sync::Arc<std::sync::atomic::AtomicUsize>, // 当前活跃隧道连接数（供状态展示）
@@ -280,7 +281,7 @@ fn machine_id() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn machine_id() -> Option<String> {
-    let out = std::process::Command::new("reg")
+    let out = crate::tools::hidden_command("reg")
         .args([
             "query",
             "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
@@ -357,6 +358,7 @@ impl Default for Inner {
             share_rejected: HashSet::new(),
             proxy_role: 0,
             proxy_socks_port: 0,
+            proxy_http_port: 0,
             proxy_port: 0,
             proxy_task: None,
             proxy_conns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -926,7 +928,7 @@ fn overlay_routes_impl() -> Vec<OverlayRoute> {
 
 #[cfg(target_os = "windows")]
 fn overlay_routes_impl() -> Vec<OverlayRoute> {
-    let Ok(out) = std::process::Command::new("route").args(["print", "-4"]).output() else {
+    let Ok(out) = crate::tools::hidden_command("route").args(["print", "-4"]).output() else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -3176,6 +3178,7 @@ pub async fn lan_open_path(app: AppHandle, path: String) -> Result<(), String> {
 // A 端不开第二个 VPN（只发普通请求），故不会与飞连冲突。
 const PROXY_PORT: u16 = 53318; // A 端 TLS 隧道监听端口
 const SOCKS_PORT: u16 = 53319; // B 端本地 SOCKS5 端口
+const HTTP_PROXY_PORT: u16 = 53320; // B 端本地 HTTP 代理端口（Windows 系统代理指向它）
 
 /// 活跃连接计数的 RAII 守卫：建立隧道(进入 copy 阶段)时 +1，连接结束/被 abort 析构时 -1。
 struct ConnGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -3411,6 +3414,117 @@ async fn run_socks_server(
     }
 }
 
+/// B 端：本地 HTTP 代理（支持 CONNECT 隧道 + 普通 HTTP 转发），经 TLS 隧道发给 A。
+/// Windows 系统代理对「HTTP 代理」支持可靠（SOCKS 经常不被网页流量采用），故系统代理模式指向它。
+async fn run_http_proxy_server(
+    listener: tokio::net::TcpListener,
+    server_ip: String,
+    server_port: u16,
+    cfg: std::sync::Arc<rustls::ClientConfig>,
+    auth: String,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let connector = tokio_rustls::TlsConnector::from(cfg);
+    let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            r = listener.accept() => {
+                if let Ok((tcp, _)) = r {
+                    let (ip, conn, au, counter) = (server_ip.clone(), connector.clone(), auth.clone(), counter.clone());
+                    conns.spawn(async move {
+                        let _ = http_proxy_handle(tcp, ip, server_port, conn, au, &counter).await;
+                    });
+                }
+            }
+            Some(_) = conns.join_next() => {}
+        }
+    }
+}
+
+/// 从 "host:port" / "host" 解析主机与端口（无端口用默认）。
+fn parse_authority(s: &str, default_port: u16) -> (String, u16) {
+    if let Some(idx) = s.rfind(':') {
+        if let Ok(port) = s[idx + 1..].parse::<u16>() {
+            return (s[..idx].to_string(), port);
+        }
+    }
+    (s.to_string(), default_port)
+}
+
+async fn http_proxy_handle(
+    mut sock: tokio::net::TcpStream,
+    server_ip: String,
+    server_port: u16,
+    connector: tokio_rustls::TlsConnector,
+    auth: String,
+    counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 读到请求头结束(\r\n\r\n)或上限
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 64 * 1024 {
+            break;
+        }
+    }
+    let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
+    let header = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let mut lines = header.split("\r\n");
+    let first = lines.next().unwrap_or("");
+    let mut it = first.split_whitespace();
+    let method = it.next().unwrap_or("");
+    let target = it.next().unwrap_or("");
+    let connect = method.eq_ignore_ascii_case("CONNECT");
+    let host_hdr = lines
+        .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+        .map(|l| l[5..].trim().to_string());
+
+    let (host, port) = if connect {
+        parse_authority(target, 443) // CONNECT host:port
+    } else {
+        // 普通 HTTP：请求行是绝对 URI（http://host[:port]/path），取其 authority；缺则用 Host 头
+        let rest = target
+            .strip_prefix("http://")
+            .or_else(|| target.strip_prefix("https://"))
+            .unwrap_or(target);
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            match host_hdr {
+                Some(h) => parse_authority(&h, 80),
+                None => return Ok(()),
+            }
+        } else {
+            parse_authority(authority, 80)
+        }
+    };
+    if host.is_empty() {
+        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        return Ok(());
+    }
+
+    match tunnel_open(&server_ip, server_port, &connector, &auth, &host, port).await {
+        Ok(mut tls) => {
+            if connect {
+                sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+            } else {
+                tls.write_all(&buf).await?; // 普通 HTTP：把已读请求原样转发给上游
+            }
+            let _guard = ConnGuard::new(counter);
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut tls).await;
+        }
+        Err(_) => {
+            let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+        }
+    }
+    Ok(())
+}
+
 /// 从流里读到 NUL 为止（SOCKS4 的 USERID / SOCKS4a 的 hostname 都以 \0 结尾）。
 async fn read_until_nul(sock: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
@@ -3563,6 +3677,7 @@ fn proxy_stop_locked(g: &mut Inner) {
     }
     g.proxy_role = 0;
     g.proxy_socks_port = 0;
+    g.proxy_http_port = 0;
     g.proxy_port = 0;
     // 换一批新指标，旧任务即便延迟析构也不会再影响展示
     g.proxy_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3575,7 +3690,7 @@ pub fn lan_proxy_status(state: State<'_, LanState>) -> serde_json::Value {
     let g = state.0.lock().unwrap();
     let conns = g.proxy_conns.load(std::sync::atomic::Ordering::Relaxed);
     let bytes = g.proxy_bytes.load(std::sync::atomic::Ordering::Relaxed);
-    serde_json::json!({ "role": g.proxy_role, "socksPort": g.proxy_socks_port, "port": g.proxy_port, "conns": conns, "bytes": bytes })
+    serde_json::json!({ "role": g.proxy_role, "socksPort": g.proxy_socks_port, "httpPort": g.proxy_http_port, "port": g.proxy_port, "conns": conns, "bytes": bytes })
 }
 
 /// 服务端：返回记录到的访问目标列表（host:port + 次数 + 最近时间），按最近时间倒序。
@@ -3670,18 +3785,27 @@ pub async fn lan_proxy_start_client(
         let mut g = st.0.lock().unwrap();
         proxy_stop_locked(&mut g);
     }
-    // 同步绑定本地 SOCKS5 端口，失败直接报错
-    let listener = bind_reuse(SOCKS_PORT, true)
+    // 同步绑定本地 SOCKS5 + HTTP 代理端口，失败直接报错
+    let socks_listener = bind_reuse(SOCKS_PORT, true)
         .and_then(tokio::net::TcpListener::from_std)
         .map_err(|e| format!("本地端口 {SOCKS_PORT} 启动失败（可能被占用）：{e}"))?;
+    let http_listener = bind_reuse(HTTP_PROXY_PORT, true)
+        .and_then(tokio::net::TcpListener::from_std)
+        .map_err(|e| format!("本地端口 {HTTP_PROXY_PORT} 启动失败（可能被占用）：{e}"))?;
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let task_counter = counter.clone();
+    // 一个任务里同时跑 SOCKS5 与 HTTP 代理；停止时 abort 本任务即一并关闭
+    let (ip1, cfg1, auth1, c1) = (server_ip.clone(), cfg.clone(), auth.clone(), counter.clone());
+    let (ip2, cfg2, auth2, c2) = (server_ip, cfg, auth, counter.clone());
     let task = tauri::async_runtime::spawn(async move {
-        run_socks_server(listener, server_ip, server_port, cfg, auth, task_counter).await;
+        tokio::join!(
+            run_socks_server(socks_listener, ip1, server_port, cfg1, auth1, c1),
+            run_http_proxy_server(http_listener, ip2, server_port, cfg2, auth2, c2),
+        );
     });
     let mut g = st.0.lock().unwrap();
     g.proxy_role = 2;
     g.proxy_socks_port = SOCKS_PORT;
+    g.proxy_http_port = HTTP_PROXY_PORT;
     g.proxy_port = server_port;
     g.proxy_conns = counter;
     g.proxy_task = Some(task);
@@ -3744,17 +3868,18 @@ pub async fn lan_proxy_test(
         .map_err(|_| "连接超时".to_string())?
 }
 
-/// 设置 / 还原系统级 SOCKS 代理(指向本机 127.0.0.1:port)。enable=false 时还原。
-/// macOS：osascript 提权跑 networksetup(会弹一次授权框)；Windows：写 HKCU 注册表(免管理员)。
+/// 设置 / 还原系统代理。enable=false 时还原。
+/// macOS 用 SOCKS(networksetup，osascript 提权弹一次框)；
+/// Windows 用 HTTP 代理(写 HKCU 注册表，免管理员)——Windows 系统代理对 SOCKS 网页流量支持不可靠。
 #[tauri::command]
-pub async fn lan_set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || apply_system_socks(enable, port))
+pub async fn lan_set_system_proxy(enable: bool, socks_port: u16, http_port: u16) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || apply_system_proxy(enable, socks_port, http_port))
         .await
         .map_err(|e| format!("任务调度失败：{e}"))?
 }
 
 #[cfg(target_os = "macos")]
-fn apply_system_socks(enable: bool, port: u16) -> Result<(), String> {
+fn apply_system_proxy(enable: bool, port: u16, _http_port: u16) -> Result<(), String> {
     // 取所有网络服务（跳过首行说明 + 带 * 的已禁用项）
     let out = std::process::Command::new("networksetup")
         .arg("-listallnetworkservices")
@@ -3796,18 +3921,19 @@ fn apply_system_socks(enable: bool, port: u16) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_system_socks(enable: bool, port: u16) -> Result<(), String> {
-    use std::process::Command;
+fn apply_system_proxy(enable: bool, _socks_port: u16, http_port: u16) -> Result<(), String> {
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     let run = |args: &[&str]| -> Result<(), String> {
-        Command::new("reg")
+        crate::tools::hidden_command("reg")
             .args(args)
             .status()
             .map_err(|e| format!("写注册表失败：{e}"))
             .and_then(|s| if s.success() { Ok(()) } else { Err("写注册表失败".into()) })
     };
     if enable {
-        run(&["add", KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", &format!("socks=127.0.0.1:{port}"), "/f"])?;
+        // 用 HTTP 代理覆盖 http/https；浏览器对系统 HTTP 代理支持可靠
+        let v = format!("http=127.0.0.1:{http_port};https=127.0.0.1:{http_port}");
+        run(&["add", KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", &v, "/f"])?;
         run(&["add", KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"])?;
     } else {
         run(&["add", KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])?;
@@ -3838,7 +3964,7 @@ fn notify_wininet_changed() {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn apply_system_socks(_enable: bool, _port: u16) -> Result<(), String> {
+fn apply_system_proxy(_enable: bool, _socks_port: u16, _http_port: u16) -> Result<(), String> {
     Err("当前系统暂不支持自动设置系统代理，请手动配置 SOCKS5 127.0.0.1".into())
 }
 
@@ -3990,7 +4116,7 @@ fn list_running_apps() -> Vec<RunningApp> {
 #[cfg(target_os = "windows")]
 fn list_running_apps() -> Vec<RunningApp> {
     // 取有主窗口的进程（即 GUI 应用）及其 exe 路径
-    let out = std::process::Command::new("powershell")
+    let out = crate::tools::hidden_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
