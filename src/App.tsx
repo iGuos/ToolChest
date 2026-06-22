@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import PortScanner from "./tools/PortScanner";
 import HostsEditor from "./tools/HostsEditor";
 import HttpClient from "./tools/HttpClient";
@@ -7,6 +8,7 @@ import TodoList from "./tools/TodoList";
 import LanShare from "./tools/LanShare";
 import LanIncomingModal from "./tools/LanIncomingModal";
 import DeepSeek from "./tools/DeepSeekTab";
+import ProxyTool from "./tools/ProxyTool";
 import { useLan } from "./tools/lanContext";
 import { useEscToClose, useDragReorder } from "./hooks";
 import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
@@ -27,6 +29,7 @@ const TOOLS: ToolMeta[] = [
   { id: "trust-app", name: "Mac 应用授权", icon: "🔓" },
   { id: "todo", name: "待办事项", icon: "📋" },
   { id: "lan-share", name: "局域网互传", icon: "📡" },
+  { id: "proxy", name: "请求代理", icon: "🔀" },
   { id: "deepseek", name: "DeepSeek", icon: "🤖" },
 ];
 
@@ -36,12 +39,18 @@ const tabName = (id: string) =>
 // ── 应用设置（localStorage 持久化，结构预留以便后续扩展）──
 const SETTINGS_KEY = "baibao.settings.v1";
 type ThemeMode = "light" | "dark" | "system";
+type CloseAction = "tray" | "quit";
 interface Settings {
   hiddenTools: string[]; // 在侧栏/首页隐藏的工具 id
   order: string[]; // 工具自定义排序（id 顺序；不在此列的按 TOOLS 默认序追加）
   theme: ThemeMode; // 主题：浅色 / 深色 / 跟随系统
+  closeAction: CloseAction; // 关闭按钮：关到托盘后台常驻 / 直接退出
 }
-const DEFAULT_SETTINGS: Settings = { hiddenTools: [], order: [], theme: "dark" };
+const DEFAULT_SETTINGS: Settings = { hiddenTools: [], order: [], theme: "dark", closeAction: "tray" };
+const CLOSE_OPTIONS: { id: CloseAction; name: string }[] = [
+  { id: "tray", name: "最小化到托盘" },
+  { id: "quit", name: "直接退出" },
+];
 const THEME_OPTIONS: { id: ThemeMode; name: string }[] = [
   { id: "light", name: "浅色" },
   { id: "dark", name: "深色" },
@@ -121,6 +130,8 @@ function renderTool(
       return <LanShare />;
     case "deepseek":
       return <DeepSeek />;
+    case "proxy":
+      return <ProxyTool />;
     default:
       return null;
   }
@@ -165,6 +176,10 @@ export default function App() {
       return () => mq.removeEventListener("change", apply);
     }
   }, [settings.theme]);
+  // 同步「关闭按钮行为」到后端（启动时 + 变更时）：后端在窗口关闭事件读取此设置
+  useEffect(() => {
+    invoke("set_close_to_tray", { enabled: settings.closeAction !== "quit" }).catch(() => {});
+  }, [settings.closeAction]);
   const hiddenTools = new Set(settings.hiddenTools);
   const orderedTools = orderTools(settings.order);
   const visibleTools = orderedTools.filter((t) => !hiddenTools.has(t.id));
@@ -525,6 +540,27 @@ export default function App() {
                   />
                   <span className="switch-slider" />
                 </label>
+              </div>
+              <div className="settings-field">
+                <div className="settings-field-label">
+                  <span>点击关闭按钮时</span>
+                  <span className="settings-field-hint">
+                    {settings.closeAction === "quit"
+                      ? "直接退出应用"
+                      : "隐藏到系统托盘，后台继续运行（互传 / 代理不中断）"}
+                  </span>
+                </div>
+                <div className="theme-options">
+                  {CLOSE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.id}
+                      className={`theme-opt${settings.closeAction === opt.id ? " active" : ""}`}
+                      onClick={() => setSettings((s) => ({ ...s, closeAction: opt.id }))}
+                    >
+                      {opt.name}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
             <div className="modal-actions">

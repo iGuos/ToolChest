@@ -121,6 +121,8 @@ pub struct Peer {
     is_baibao: bool,
     last_seen_ms: u128,
     shares: u32, // 对方对外共享的目录数量（0=无）
+    #[serde(default)]
+    sticky: bool, // 用户手动扫描/按 IP 添加：VPN 等多播不可见网段，不参与 TTL 过期清理
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -237,6 +239,12 @@ struct Inner {
     share_receives: HashMap<String, Arc<std::sync::atomic::AtomicBool>>, // token -> 拒绝标志（接收方点「拒绝」置位）
     share_rejected: HashSet<String>, // 已被接收方拒绝的 token（发送方据此判定「对方拒绝」并停止）
     socket: Option<Arc<UdpSocket>>,
+    // ── 代理（SOCKS5 over 百宝箱 TLS）。默认关闭、不持久化（每次启动都是关）。──
+    proxy_role: u8,                  // 0=关 / 1=服务端(出口,替对端访问) / 2=客户端(本地 SOCKS5 入口)
+    proxy_socks_port: u16,           // 客户端模式下本地 SOCKS5 端口（0=未开）
+    proxy_port: u16,                 // 隧道端口（服务端=监听端口 / 客户端=对方服务端端口）
+    proxy_task: Option<tauri::async_runtime::JoinHandle<()>>, // 监听任务句柄，停止时 abort
+    proxy_conns: std::sync::Arc<std::sync::atomic::AtomicUsize>, // 当前活跃隧道连接数（供状态展示）
 }
 
 /// 用户主目录（跨平台：类 Unix 用 HOME，Windows 用 USERPROFILE）。
@@ -345,6 +353,11 @@ impl Default for Inner {
             share_uploads: HashMap::new(),
             share_receives: HashMap::new(),
             share_rejected: HashSet::new(),
+            proxy_role: 0,
+            proxy_socks_port: 0,
+            proxy_port: 0,
+            proxy_task: None,
+            proxy_conns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             socket: None,
         };
         // 落盘一次，确保（尤其是随机指纹）下次启动可复用
@@ -622,7 +635,7 @@ fn emit_peers(app: &AppHandle, state: &LanState) {
 }
 
 /// 收到对端设备信息：加入/刷新设备表（指纹为键）。
-fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String) {
+fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String, sticky: bool) {
     if info.fingerprint.is_empty() {
         return;
     }
@@ -631,6 +644,8 @@ fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String)
         if info.fingerprint == g.fingerprint {
             return; // 自己
         }
+        // 一旦被手动登记为 sticky，后续多播刷新不应清掉该标记
+        let was_sticky = g.peers.get(&info.fingerprint).map(|p| p.sticky).unwrap_or(false);
         let peer = Peer {
             alias: info.alias.clone(),
             fingerprint: info.fingerprint.clone(),
@@ -641,6 +656,7 @@ fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String)
             is_baibao: info.app.as_deref() == Some("baibao"),
             last_seen_ms: now_ms(),
             shares: info.shares.unwrap_or(0),
+            sticky: sticky || was_sticky,
         };
         g.peers.insert(info.fingerprint.clone(), peer);
     }
@@ -678,6 +694,7 @@ fn upsert_peer_minimal(app: &AppHandle, state: &LanState, alias: &str, fingerpri
                         is_baibao: true,
                         last_seen_ms: now,
                         shares: 0,
+                        sticky: false,
                     },
                 );
             }
@@ -1029,7 +1046,7 @@ fn multicast_listener(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
         if info.fingerprint == state.0.lock().unwrap().fingerprint {
             continue;
         }
-        upsert_peer(&app, &state, &info, ip);
+        upsert_peer(&app, &state, &info, ip, false);
         // 对方在 announce → 回应自己的信息（announce=false），单播避免风暴。
         // 隐身时不应答，使对端无法发现本机（其信号灯显示离线）。
         if info.announce == Some(true) && !state.0.lock().unwrap().invisible {
@@ -1058,7 +1075,8 @@ fn announcer(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
             let mut g = state.0.lock().unwrap();
             let before = g.peers.len();
             let now = now_ms();
-            g.peers.retain(|_, p| now.saturating_sub(p.last_seen_ms) < PEER_TTL_MS);
+            // sticky（手动扫描/+IP，多播不可见）不过期；其余按 TTL 清理
+            g.peers.retain(|_, p| p.sticky || now.saturating_sub(p.last_seen_ms) < PEER_TTL_MS);
             before != g.peers.len()
         };
         if removed {
@@ -1087,7 +1105,7 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
         }
         ("POST", "/api/localsend/v2/register") => {
             if let Ok(info) = read_json::<DeviceInfo>(&mut request) {
-                upsert_peer(&app, &state, &info, remote_ip);
+                upsert_peer(&app, &state, &info, remote_ip, false);
                 let me = state.device_info(None);
                 respond_json(request, 200, &me);
             } else {
@@ -1930,7 +1948,7 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
         return respond_text(request, 403, "rejected: 未开启 LocalSend 兼容");
     }
     // 用连接来源 IP 自动登记发送方（含其完整设备信息），实现单边「+ IP」即可双向。
-    upsert_peer(app, state, &req.info, remote_ip);
+    upsert_peer(app, state, &req.info, remote_ip, false);
 
     let session_id = rand_hex(12);
     let (tx, rx) = mpsc::channel::<Decision>();
@@ -2294,7 +2312,7 @@ pub async fn lan_add_peer(
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))??;
-    upsert_peer(&app, &state, &info, ip);
+    upsert_peer(&app, &state, &info, ip, true); // 手动 +IP：sticky，不被 TTL 清掉
     Ok(())
 }
 
@@ -2494,6 +2512,11 @@ fn build_pinned_client(
         .with_no_client_auth();
     let mut b = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(8))
+        // 我们的服务端(tiny_http)只会 HTTP/1.1：强制 h1，避免 reqwest 默认尝试 HTTP/2 协商，
+        // 在「prepare-upload 长轮询(服务端最长 300s 不返回)」这种连接上引发异常。
+        .http1_only()
+        // 保活长时间挂起、无数据流动的连接（长轮询等待对方接受时）。
+        .tcp_keepalive(Duration::from_secs(30))
         .use_preconfigured_tls(config);
     if let Some(t) = overall_timeout {
         b = b.timeout(t);
@@ -3132,6 +3155,737 @@ pub async fn lan_reveal(app: AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| format!("打开失败：{e}"))
+}
+
+/// 在系统文件管理器中「打开」目录本身（展示其内容），用于共享目录的快捷打开。
+#[tauri::command]
+pub async fn lan_open_path(app: AppHandle, path: String) -> Result<(), String> {
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|e| format!("打开失败：{e}"))
+}
+
+// ── 代理（SOCKS5 over 百宝箱 TLS）─────────────────────────────
+// 用途：A 装了公司 VPN（如飞连），B 没装；B 把浏览器/工具的代理指向 B 本机的 SOCKS5，
+// 流量经百宝箱 TLS 隧道发到 A，A 用「普通连接」(操作系统已经过飞连路由) 访问目标并回传。
+// A=服务端(出口)，B=客户端(本地 SOCKS5 入口)；二者互斥；默认关闭、不持久化。
+// A 端不开第二个 VPN（只发普通请求），故不会与飞连冲突。
+const PROXY_PORT: u16 = 53318; // A 端 TLS 隧道监听端口
+const SOCKS_PORT: u16 = 53319; // B 端本地 SOCKS5 端口
+
+/// 活跃连接计数的 RAII 守卫：建立隧道(进入 copy 阶段)时 +1，连接结束/被 abort 析构时 -1。
+struct ConnGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl ConnGuard {
+    fn new(c: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ConnGuard(c.clone())
+    }
+}
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 用 socket2 建可复用地址的监听器（避免快速重启 bind 冲突），转成 tokio 非阻塞监听。
+fn bind_reuse(port: u16, loopback_only: bool) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let addr: std::net::SocketAddr = if loopback_only {
+        ([127, 0, 0, 1], port).into()
+    } else {
+        ([0, 0, 0, 0], port).into()
+    };
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(128)?;
+    sock.set_nonblocking(true)?;
+    Ok(sock.into())
+}
+
+fn proxy_server_config(cert_pem: &str, key_pem: &str) -> Result<std::sync::Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("证书解析失败：{e}"))?;
+    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|e| format!("私钥解析失败：{e}"))?
+        .ok_or("私钥为空")?;
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS 版本错误：{e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("加载证书失败：{e}"))?;
+    Ok(std::sync::Arc::new(cfg))
+}
+
+fn proxy_client_config(expected_fp: &str) -> std::sync::Arc<rustls::ClientConfig> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let algs = provider.signature_verification_algorithms;
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("tls versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedFp {
+            expected: expected_fp.to_string(),
+            algs,
+        }))
+        .with_no_client_auth();
+    std::sync::Arc::new(cfg)
+}
+
+/// A 端：TLS 隧道服务器。收到 [鉴权][目标host][目标port] 后，连接目标并双向转发。
+/// 监听器由调用方(命令)同步绑定好再传入，便于把「端口被占用/被拦」的错误直接报给前端。
+async fn run_proxy_server(
+    listener: tokio::net::TcpListener,
+    cfg: std::sync::Arc<rustls::ServerConfig>,
+    expected_auth: String,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+    // 用 JoinSet 持有所有子连接任务：停止时本任务被 abort → JoinSet 析构 → 所有连接一并被强制断开。
+    let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            r = listener.accept() => {
+                if let Ok((tcp, _)) = r {
+                    let (acceptor, auth, counter) = (acceptor.clone(), expected_auth.clone(), counter.clone());
+                    conns.spawn(async move {
+                        let _ = proxy_serve_conn(acceptor, tcp, &auth, &counter).await;
+                    });
+                }
+            }
+            Some(_) = conns.join_next() => {} // 回收已结束的连接任务，避免堆积
+        }
+    }
+}
+
+async fn proxy_serve_conn(
+    acceptor: tokio_rustls::TlsAcceptor,
+    tcp: tokio::net::TcpStream,
+    expected_auth: &str,
+    counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 握手也加超时，防 TLS 半开连接堆积
+    let mut tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {
+        Ok(Ok(s)) => s,
+        _ => return Ok(()),
+    };
+    // 读隧道头(鉴权+目标)加超时，防「只连不发」的慢速连接长期占用任务
+    let header = tokio::time::timeout(Duration::from_secs(10), async {
+        let alen = tls.read_u16().await? as usize;
+        if alen == 0 || alen > 256 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad auth len"));
+        }
+        let mut abuf = vec![0u8; alen];
+        tls.read_exact(&mut abuf).await?;
+        let hlen = tls.read_u8().await? as usize;
+        if hlen == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad host len"));
+        }
+        let mut hbuf = vec![0u8; hlen];
+        tls.read_exact(&mut hbuf).await?;
+        let port = tls.read_u16().await?;
+        Ok::<_, std::io::Error>((abuf, hbuf, port))
+    })
+    .await;
+    let (abuf, hbuf, port) = match header {
+        Ok(Ok(v)) => v,
+        _ => return Ok(()),
+    };
+    if String::from_utf8_lossy(&abuf) != expected_auth {
+        tokio::time::sleep(Duration::from_millis(800)).await; // 拖慢在线爆破访问密码
+        let _ = tls.write_u8(1).await; // 鉴权失败
+        return Ok(());
+    }
+    let host = String::from_utf8_lossy(&hbuf).to_string();
+    let mut upstream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = tls.write_u8(2).await; // 连接目标失败
+            return Ok(());
+        }
+    };
+    tls.write_u8(0).await?; // ok
+    tls.flush().await?;
+    let _guard = ConnGuard::new(counter); // 进入转发阶段才计数（排除握手/鉴权失败/探测）
+    let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+    Ok(())
+}
+
+/// B 端：本地 SOCKS5 服务器。每个连接解析目标后，经 TLS 隧道发给 A。
+async fn run_socks_server(
+    listener: tokio::net::TcpListener,
+    server_ip: String,
+    server_port: u16,
+    cfg: std::sync::Arc<rustls::ClientConfig>,
+    auth: String,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let connector = tokio_rustls::TlsConnector::from(cfg);
+    // JoinSet 持有所有子连接：停止时本任务被 abort → 一并强制断开所有代理连接。
+    let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            r = listener.accept() => {
+                if let Ok((tcp, _)) = r {
+                    let (ip, conn, au, counter) = (server_ip.clone(), connector.clone(), auth.clone(), counter.clone());
+                    conns.spawn(async move {
+                        let _ = socks_handle(tcp, ip, server_port, conn, au, &counter).await;
+                    });
+                }
+            }
+            Some(_) = conns.join_next() => {} // 回收已结束的连接任务
+        }
+    }
+}
+
+async fn socks_handle(
+    mut sock: tokio::net::TcpStream,
+    server_ip: String,
+    server_port: u16,
+    connector: tokio_rustls::TlsConnector,
+    auth: String,
+    counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // SOCKS5 握手：版本 + 方法协商（只支持无认证）
+    if sock.read_u8().await? != 5 {
+        return Ok(());
+    }
+    let nm = sock.read_u8().await? as usize;
+    let mut methods = vec![0u8; nm];
+    sock.read_exact(&mut methods).await?;
+    sock.write_all(&[5, 0]).await?;
+    // 请求：VER CMD RSV ATYP ...
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head).await?;
+    if head[0] != 5 || head[1] != 1 {
+        sock.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 不支持的命令
+        return Ok(());
+    }
+    let host = match head[3] {
+        1 => {
+            let mut a = [0u8; 4];
+            sock.read_exact(&mut a).await?;
+            format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+        }
+        3 => {
+            let l = sock.read_u8().await? as usize;
+            let mut d = vec![0u8; l];
+            sock.read_exact(&mut d).await?;
+            String::from_utf8_lossy(&d).to_string()
+        }
+        4 => {
+            let mut a = [0u8; 16];
+            sock.read_exact(&mut a).await?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => {
+            sock.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 地址类型不支持
+            return Ok(());
+        }
+    };
+    let port = sock.read_u16().await?;
+    let fail = |rep: u8| -> [u8; 10] { [5, rep, 0, 1, 0, 0, 0, 0, 0, 0] };
+    // 连到 A 的隧道端口
+    let tcp = match tokio::net::TcpStream::connect((server_ip.as_str(), server_port)).await {
+        Ok(s) => s,
+        Err(_) => {
+            sock.write_all(&fail(1)).await?;
+            return Ok(());
+        }
+    };
+    let dns = rustls::pki_types::ServerName::try_from("baibao.local")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "name"))?
+        .to_owned();
+    let mut tls = match connector.connect(dns, tcp).await {
+        Ok(s) => s,
+        Err(_) => {
+            sock.write_all(&fail(1)).await?;
+            return Ok(());
+        }
+    };
+    // 发送隧道头：[u16 authlen][auth][u8 hostlen][host][u16 port]
+    let (ab, hb) = (auth.as_bytes(), host.as_bytes());
+    if hb.len() > 255 {
+        sock.write_all(&fail(1)).await?;
+        return Ok(());
+    }
+    tls.write_u16(ab.len() as u16).await?;
+    tls.write_all(ab).await?;
+    tls.write_u8(hb.len() as u8).await?;
+    tls.write_all(hb).await?;
+    tls.write_u16(port).await?;
+    tls.flush().await?;
+    match tls.read_u8().await {
+        Ok(0) => {}
+        Ok(1) => {
+            sock.write_all(&fail(2)).await?; // 鉴权失败 → 连接不允许
+            return Ok(());
+        }
+        _ => {
+            sock.write_all(&fail(5)).await?; // 连接目标失败
+            return Ok(());
+        }
+    }
+    sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 成功
+    let _guard = ConnGuard::new(counter); // 进入转发阶段才计数
+    let _ = tokio::io::copy_bidirectional(&mut sock, &mut tls).await;
+    Ok(())
+}
+
+/// 停止当前代理（abort 监听任务，复位状态）。
+fn proxy_stop_locked(g: &mut Inner) {
+    if let Some(h) = g.proxy_task.take() {
+        h.abort();
+    }
+    g.proxy_role = 0;
+    g.proxy_socks_port = 0;
+    g.proxy_port = 0;
+    // 换一个新计数器，旧任务即便延迟析构也不会再影响展示
+    g.proxy_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+}
+
+#[tauri::command]
+pub fn lan_proxy_status(state: State<'_, LanState>) -> serde_json::Value {
+    let g = state.0.lock().unwrap();
+    let conns = g.proxy_conns.load(std::sync::atomic::Ordering::Relaxed);
+    serde_json::json!({ "role": g.proxy_role, "socksPort": g.proxy_socks_port, "port": g.proxy_port, "conns": conns })
+}
+
+#[tauri::command]
+pub fn lan_proxy_stop(state: State<'_, LanState>) {
+    proxy_stop_locked(&mut state.0.lock().unwrap());
+}
+
+/// 开启代理服务端(出口)：替客户端访问网络。需设访问密码。
+#[tauri::command]
+pub async fn lan_proxy_start_server(
+    state: State<'_, LanState>,
+    password: String,
+    port: Option<u16>,
+) -> Result<(), String> {
+    if password.trim().is_empty() {
+        return Err("请设置访问密码（客户端需用它连接）".into());
+    }
+    let port = match port {
+        Some(p) if p > 0 => p,
+        _ => PROXY_PORT,
+    };
+    let st = state.inner().clone();
+    let (cert_pem, key_pem, my_fp) = load_or_create_cert()?;
+    let cfg = proxy_server_config(&cert_pem, &key_pem)?;
+    let pw_hash = sha256_hex(password.trim());
+    let expected_auth = bind_auth(&pw_hash, &my_fp);
+    {
+        let mut g = st.0.lock().unwrap();
+        proxy_stop_locked(&mut g); // 互斥：先停掉之前的角色（释放端口）
+    }
+    // 同步绑定端口，绑定失败（被占用/被防火墙拦）直接报错，不再静默
+    let listener = bind_reuse(port, false)
+        .and_then(tokio::net::TcpListener::from_std)
+        .map_err(|e| format!("监听端口 {port} 启动失败（可能被占用或被防火墙拦截）：{e}"))?;
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_counter = counter.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        run_proxy_server(listener, cfg, expected_auth, task_counter).await;
+    });
+    let mut g = st.0.lock().unwrap();
+    g.proxy_role = 1;
+    g.proxy_port = port;
+    g.proxy_conns = counter;
+    g.proxy_task = Some(task);
+    Ok(())
+}
+
+/// 开启代理客户端(本地 SOCKS5 入口)：把流量经隧道发给 fingerprint 指定的服务端。
+/// 返回本地 SOCKS5 端口。把浏览器/工具代理设为 127.0.0.1:该端口 即可。
+#[tauri::command]
+pub async fn lan_proxy_start_client(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    password: String,
+    port: Option<u16>,
+) -> Result<u16, String> {
+    let st = state.inner().clone();
+    // 取服务端 ip + 身份（用于固定证书 + 通道绑定鉴权）
+    let server_ip = {
+        let g = st.0.lock().unwrap();
+        let p = g.peers.get(&fingerprint).ok_or("服务端设备不在线，请先扫描")?;
+        p.ip.clone()
+    };
+    if fingerprint.trim().is_empty() {
+        return Err("服务端身份未知".into());
+    }
+    let server_port = match port {
+        Some(p) if p > 0 => p,
+        _ => PROXY_PORT,
+    };
+    let cfg = proxy_client_config(&fingerprint);
+    let auth = bind_auth(&sha256_hex(password.trim()), &fingerprint);
+    {
+        let mut g = st.0.lock().unwrap();
+        proxy_stop_locked(&mut g);
+    }
+    // 同步绑定本地 SOCKS5 端口，失败直接报错
+    let listener = bind_reuse(SOCKS_PORT, true)
+        .and_then(tokio::net::TcpListener::from_std)
+        .map_err(|e| format!("本地端口 {SOCKS_PORT} 启动失败（可能被占用）：{e}"))?;
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_counter = counter.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        run_socks_server(listener, server_ip, server_port, cfg, auth, task_counter).await;
+    });
+    let mut g = st.0.lock().unwrap();
+    g.proxy_role = 2;
+    g.proxy_socks_port = SOCKS_PORT;
+    g.proxy_port = server_port;
+    g.proxy_conns = counter;
+    g.proxy_task = Some(task);
+    Ok(SOCKS_PORT)
+}
+
+/// 客户端「开启」前的连通性自检：能否到达服务端 + 证书是否匹配 + 访问密码是否正确。
+/// 用一个「连本不可达的目标(127.0.0.1:1)」的隧道请求来探测：
+/// TLS 握手失败=连不上/非该设备；状态 1=密码错；状态 0/2=鉴权通过(目标被拒符合预期)。
+#[tauri::command]
+pub async fn lan_proxy_test(
+    state: State<'_, LanState>,
+    fingerprint: String,
+    password: String,
+    port: Option<u16>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let st = state.inner().clone();
+    let server_ip = {
+        let g = st.0.lock().unwrap();
+        g.peers.get(&fingerprint).ok_or("服务端设备不在线，请先扫描")?.ip.clone()
+    };
+    if fingerprint.trim().is_empty() {
+        return Err("服务端身份未知".into());
+    }
+    let server_port = match port {
+        Some(p) if p > 0 => p,
+        _ => PROXY_PORT,
+    };
+    let cfg = proxy_client_config(&fingerprint);
+    let auth = bind_auth(&sha256_hex(password.trim()), &fingerprint);
+
+    let fut = async move {
+        let tcp = tokio::net::TcpStream::connect((server_ip.as_str(), server_port))
+            .await
+            .map_err(|_| format!("连不上服务端 {server_ip}:{server_port}（服务端未开启或防火墙未放行）"))?;
+        let connector = tokio_rustls::TlsConnector::from(cfg);
+        let dns = rustls::pki_types::ServerName::try_from("baibao.local")
+            .map_err(|_| "内部错误".to_string())?
+            .to_owned();
+        let mut tls = connector
+            .connect(dns, tcp)
+            .await
+            .map_err(|_| "证书校验失败（对方不是该设备，或证书已变更，请重新扫描）".to_string())?;
+        let host = b"127.0.0.1";
+        tls.write_u16(auth.len() as u16).await.map_err(|e| e.to_string())?;
+        tls.write_all(auth.as_bytes()).await.map_err(|e| e.to_string())?;
+        tls.write_u8(host.len() as u8).await.map_err(|e| e.to_string())?;
+        tls.write_all(host).await.map_err(|e| e.to_string())?;
+        tls.write_u16(1u16).await.map_err(|e| e.to_string())?;
+        tls.flush().await.map_err(|e| e.to_string())?;
+        match tls.read_u8().await {
+            Ok(1) => Err("访问密码错误".to_string()),
+            Ok(_) => Ok(()), // 0/2：鉴权通过（目标 127.0.0.1:1 被拒属预期）
+            Err(_) => Err("服务端无响应".to_string()),
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(8), fut)
+        .await
+        .map_err(|_| "连接超时".to_string())?
+}
+
+/// 设置 / 还原系统级 SOCKS 代理(指向本机 127.0.0.1:port)。enable=false 时还原。
+/// macOS：osascript 提权跑 networksetup(会弹一次授权框)；Windows：写 HKCU 注册表(免管理员)。
+#[tauri::command]
+pub async fn lan_set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || apply_system_socks(enable, port))
+        .await
+        .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+#[cfg(target_os = "macos")]
+fn apply_system_socks(enable: bool, port: u16) -> Result<(), String> {
+    // 取所有网络服务（跳过首行说明 + 带 * 的已禁用项）
+    let out = std::process::Command::new("networksetup")
+        .arg("-listallnetworkservices")
+        .output()
+        .map_err(|e| format!("读取网络服务失败：{e}"))?;
+    let services: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with('*') && !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .collect();
+    if services.is_empty() {
+        return Err("未找到可用网络服务".into());
+    }
+    // 把命令写进临时 sh 文件，再用 osascript 一次性提权执行（只弹一次密码，避免嵌套引号问题）
+    let mut script = String::from("#!/bin/sh\n");
+    for s in &services {
+        let q = format!("'{}'", s.replace('\'', "'\\''")); // 单引号 shell 转义
+        if enable {
+            script += &format!("networksetup -setsocksfirewallproxy {q} 127.0.0.1 {port}\n");
+            script += &format!("networksetup -setsocksfirewallproxystate {q} on\n");
+        } else {
+            script += &format!("networksetup -setsocksfirewallproxystate {q} off\n");
+        }
+    }
+    let path = std::env::temp_dir().join(format!("baibao_sysproxy_{}.sh", rand_hex(6)));
+    std::fs::write(&path, script).map_err(|e| format!("写入脚本失败：{e}"))?;
+    let apple = format!(
+        "do shell script \"/bin/sh {}\" with administrator privileges",
+        path.display()
+    );
+    let st = std::process::Command::new("osascript").arg("-e").arg(&apple).status();
+    let _ = std::fs::remove_file(&path);
+    match st {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => Err("设置系统代理失败（已取消授权或权限不足）".into()),
+        Err(e) => Err(format!("执行失败：{e}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_system_socks(enable: bool, port: u16) -> Result<(), String> {
+    use std::process::Command;
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let run = |args: &[&str]| -> Result<(), String> {
+        Command::new("reg")
+            .args(args)
+            .status()
+            .map_err(|e| format!("写注册表失败：{e}"))
+            .and_then(|s| if s.success() { Ok(()) } else { Err("写注册表失败".into()) })
+    };
+    if enable {
+        run(&["add", KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", &format!("socks=127.0.0.1:{port}"), "/f"])?;
+        run(&["add", KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"])?;
+    } else {
+        run(&["add", KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn apply_system_socks(_enable: bool, _port: u16) -> Result<(), String> {
+    Err("当前系统暂不支持自动设置系统代理，请手动配置 SOCKS5 127.0.0.1".into())
+}
+
+// ── 指定应用走代理（启动式）─────────────────────────────────
+// 由百宝箱「带着代理设置」去启动选定的 App：浏览器(Chromium 系)用命令行 flag，
+// 其他程序注入 ALL_PROXY/HTTPS_PROXY 等环境变量。
+// 局限：只对「经此启动」的实例生效；已在运行的进程（尤其浏览器单实例）不接管。
+
+/// 选择要通过代理启动的应用（跨平台）：macOS 选 .app，Windows 选 .exe。
+#[tauri::command]
+pub async fn lan_proxy_pick_app(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = &app; // macOS 走 osascript（.app 是「包」，原生文件框默认不可直接选中）
+            let script = r#"POSIX path of (choose file with prompt "选择要通过代理启动的 App" of type {"com.apple.application-bundle"} default location (path to applications folder))"#;
+            let out = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .output()
+                .map_err(|e| format!("打开选择器失败：{e}"))?;
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                Ok(if p.is_empty() { None } else { Some(p) })
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr);
+                if err.contains("-128") || err.contains("User canceled") {
+                    Ok(None)
+                } else {
+                    Err(format!("选择失败：{}", err.trim()))
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("选择要通过代理启动的程序")
+                .add_filter("程序", &["exe"])
+                .blocking_pick_file();
+            Ok(picked
+                .and_then(|fp| fp.into_path().ok())
+                .map(|p| p.to_string_lossy().into_owned()))
+        }
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+fn is_chromium(path: &str) -> bool {
+    let p = path.to_lowercase();
+    ["chrome", "chromium", "msedge", "microsoft edge", "edge", "brave", "vivaldi", "opera"]
+        .iter()
+        .any(|k| p.contains(k))
+}
+
+/// 带代理启动选定的应用。返回一句人类可读的结果说明。
+#[tauri::command]
+pub async fn lan_proxy_launch_app(path: String, port: u16) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if path.trim().is_empty() {
+            return Err("未选择应用".into());
+        }
+        let socks = format!("socks5://127.0.0.1:{port}");
+        let chromium = is_chromium(&path);
+
+        // 解析真正要执行的可执行文件 + 展示用名称
+        #[cfg(target_os = "macos")]
+        let (exe, name): (std::path::PathBuf, String) = {
+            let p = std::path::Path::new(&path);
+            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("应用").to_string();
+            if path.ends_with(".app") {
+                // 读 Info.plist 的 CFBundleExecutable，拿到 Contents/MacOS 下的真实可执行名
+                let exe_name = std::process::Command::new("defaults")
+                    .arg("read")
+                    .arg(format!("{path}/Contents/Info"))
+                    .arg("CFBundleExecutable")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| name.clone());
+                (std::path::PathBuf::from(format!("{path}/Contents/MacOS/{exe_name}")), name)
+            } else {
+                (p.to_path_buf(), name)
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (exe, name): (std::path::PathBuf, String) = {
+            let p = std::path::Path::new(&path);
+            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("应用").to_string();
+            (p.to_path_buf(), name)
+        };
+
+        let mut cmd = std::process::Command::new(&exe);
+        if chromium {
+            cmd.arg(format!("--proxy-server={socks}"));
+        }
+        // 代理环境变量（大小写都给，兼容不同程序的读取习惯）
+        for k in ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+            cmd.env(k, &socks);
+        }
+        cmd.spawn().map_err(|e| format!("启动失败：{e}（可能已在运行或路径无效）"))?;
+        let how = if chromium {
+            "已带 SOCKS5 代理参数启动"
+        } else {
+            "已用代理环境变量启动"
+        };
+        Ok(format!("{how}「{name}」"))
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+/// 主动扫描网段（探测 53317 的 /info），发现百宝箱设备并登记。返回发现总数。
+/// prefix=None：扫描本机所有网卡的 /24（全量，负载大）。
+/// prefix=Some("192.168.1")：只扫该指定 /24（.1~.254），大幅减轻压力。
+#[tauri::command]
+pub async fn lan_scan_subnet(
+    app: AppHandle,
+    state: State<'_, LanState>,
+    prefix: Option<String>,
+) -> Result<u32, String> {
+    let st = state.inner().clone();
+    let my_fp = st.0.lock().unwrap().fingerprint.clone();
+    // 候选 IP：每张网卡的 /24（.1~.254），按 (网段, 探测 ip) 收集
+    let mut targets: Vec<std::net::Ipv4Addr> = Vec::new();
+    match prefix.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let o: Vec<u8> = p.split('.').filter_map(|s| s.parse().ok()).collect();
+            if o.len() != 3 {
+                return Err("网段格式不正确（应形如 192.168.1）".into());
+            }
+            for h in 1u8..=254 {
+                targets.push(std::net::Ipv4Addr::new(o[0], o[1], o[2], h));
+            }
+        }
+        None => {
+            for v4 in local_ipv4_ifaces() {
+                let o = v4.octets();
+                for h in 1u8..=254 {
+                    targets.push(std::net::Ipv4Addr::new(o[0], o[1], o[2], h));
+                }
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    let total = targets.len();
+    let _ = app.emit("lan://scan-progress", serde_json::json!({ "done": 0, "total": total }));
+
+    let app2 = app.clone();
+    let found = tauri::async_runtime::spawn_blocking(move || -> Vec<(DeviceInfo, String)> {
+        let client = match reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .timeout(Duration::from_millis(700))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let out = std::sync::Mutex::new(Vec::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..48 {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= targets.len() {
+                        break;
+                    }
+                    let ip = targets[i].to_string();
+                    if let Ok(resp) = client
+                        .get(format!("https://{ip}:{PORT}/api/localsend/v2/info"))
+                        .send()
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(info) = resp.json::<DeviceInfo>() {
+                                if info.app.as_deref() == Some("baibao") {
+                                    out.lock().unwrap().push((info, ip));
+                                }
+                            }
+                        }
+                    }
+                    // 进度上报：每完成 16 个或扫到末尾时推一次，避免过于频繁
+                    let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if d % 16 == 0 || d == total {
+                        let _ = app2.emit("lan://scan-progress", serde_json::json!({ "done": d, "total": total }));
+                    }
+                });
+            }
+        });
+        out.into_inner().unwrap()
+    })
+    .await
+    .map_err(|e| format!("扫描失败：{e}"))?;
+
+    let mut n = 0u32;
+    for (info, ip) in found {
+        if info.fingerprint != my_fp && !info.fingerprint.is_empty() {
+            upsert_peer(&app, &st, &info, ip, true); // 手动扫描：sticky，不被 TTL 清掉
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 // ── 命令：发送 ───────────────────────────────────────────────

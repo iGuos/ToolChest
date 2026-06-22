@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -257,6 +257,36 @@ export default function LanShare() {
   const [retrying, setRetrying] = useState(false);
   const [uploadsMin, setUploadsMin] = useState(false); // 上传任务面板是否最小化
   const [recvMin, setRecvMin] = useState(false); // 接收任务面板是否最小化
+  // 任务面板可拖拽：null=默认(右下角，已上移让出发送按钮)；拖过后用 left/top 绝对定位
+  const [taskPos, setTaskPos] = useState<{ x: number; y: number } | null>(null);
+  const taskDragged = useRef(false); // 刚拖拽过 → 抑制随后的 click（避免拖完误触展开）
+  const startTaskDrag = (e: ReactPointerEvent) => {
+    if (e.button !== 0) return;
+    const stack = (e.currentTarget as HTMLElement).closest(".lan-task-stack") as HTMLElement | null;
+    if (!stack) return;
+    const r = stack.getBoundingClientRect();
+    const sx = e.clientX, sy = e.clientY, bx = r.left, by = r.top, w = r.width, h = r.height;
+    let moved = false;
+    const move = (ev: PointerEvent) => {
+      const dx = ev.clientX - sx, dy = ev.clientY - sy;
+      if (!moved && Math.abs(dx) + Math.abs(dy) < 4) return; // 小抖动不算拖拽
+      moved = true;
+      setTaskPos({
+        x: Math.max(0, Math.min(bx + dx, window.innerWidth - w)),
+        y: Math.max(0, Math.min(by + dy, window.innerHeight - h)),
+      });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (moved) {
+        taskDragged.current = true;
+        setTimeout(() => (taskDragged.current = false), 0);
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
 
   const [draft, setDraft] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -268,6 +298,7 @@ export default function LanShare() {
   useEscToClose(setOpen, () => setSetOpen(false));
   const [aliasDraft, setAliasDraft] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [ifaces, setIfaces] = useState<NetIface[]>([]); // 当前所有网段（设置面板里展示）
   const [routes, setRoutes] = useState<OverlayRoute[]>([]); // 经隧道可达的组网地址（补充展示）
   const [statusOpen, setStatusOpen] = useState(false); // 在线/隐身下拉
@@ -465,6 +496,20 @@ export default function LanShare() {
     } finally {
       const wait = Math.max(0, 600 - (Date.now() - started));
       window.setTimeout(() => setRefreshing(false), wait);
+    }
+  };
+
+  // 主动扫描同网段（不依赖广播）：探测各 /24 的百宝箱设备并登记
+  const handleScan = async () => {
+    if (scanning) return;
+    setScanning(true);
+    try {
+      const n = await invoke<number>("lan_scan_subnet");
+      setError(n > 0 ? `扫描完成，发现 ${n} 台设备` : "扫描完成，未发现新设备");
+    } catch (e) {
+      setError(`扫描失败：${String(e)}`);
+    } finally {
+      setScanning(false);
     }
   };
 
@@ -721,18 +766,25 @@ export default function LanShare() {
       {/* 全局任务面板：接收(上)+上传(下)同在右下角竖向堆叠；关闭共享弹框后仍可见 */}
       {(Object.keys(recvTasks).length > 0 || Object.keys(uploadTasks).length > 0) &&
         createPortal(
-          <div className="lan-task-stack">
+          <div
+            className="lan-task-stack"
+            style={taskPos ? { left: taskPos.x, top: taskPos.y, right: "auto", bottom: "auto" } : undefined}
+          >
             {/* 接收任务（接收方）：显示进度、可拒绝、可最小化、无「继续」 */}
             {Object.keys(recvTasks).length > 0 &&
               (recvMin ? (
-                <button className="upload-tasks-pill" onClick={() => setRecvMin(false)}>
+                <button
+                  className="upload-tasks-pill"
+                  onPointerDown={startTaskDrag}
+                  onClick={() => { if (!taskDragged.current) setRecvMin(false); }}
+                >
                   接收任务 {Object.keys(recvTasks).length} ▴
                 </button>
               ) : (
                 <div className="upload-tasks">
-                  <div className="upload-tasks-head">
+                  <div className="upload-tasks-head drag-handle" onPointerDown={startTaskDrag} title="拖拽可移动位置">
                     <span className="upload-tasks-title dim">接收任务</span>
-                    <button className="lan-toast-x" title="最小化" onClick={() => setRecvMin(true)}>—</button>
+                    <button className="lan-toast-x" title="最小化" onPointerDown={(e) => e.stopPropagation()} onClick={() => setRecvMin(true)}>—</button>
                   </div>
                   {Object.values(recvTasks).map((t) => {
                     const active = t.phase === "recv" || t.phase === "extract";
@@ -772,14 +824,18 @@ export default function LanShare() {
             {/* 上传任务（发送方）：进度/中断/继续/移除，可最小化 */}
             {Object.keys(uploadTasks).length > 0 &&
               (uploadsMin ? (
-                <button className="upload-tasks-pill" onClick={() => setUploadsMin(false)}>
+                <button
+                  className="upload-tasks-pill"
+                  onPointerDown={startTaskDrag}
+                  onClick={() => { if (!taskDragged.current) setUploadsMin(false); }}
+                >
                   上传任务 {Object.keys(uploadTasks).length} ▴
                 </button>
               ) : (
                 <div className="upload-tasks">
-                  <div className="upload-tasks-head">
+                  <div className="upload-tasks-head drag-handle" onPointerDown={startTaskDrag} title="拖拽可移动位置">
                     <span className="upload-tasks-title dim">上传任务</span>
-                    <button className="lan-toast-x" title="最小化" onClick={() => setUploadsMin(true)}>—</button>
+                    <button className="lan-toast-x" title="最小化" onPointerDown={(e) => e.stopPropagation()} onClick={() => setUploadsMin(true)}>—</button>
                   </div>
                   {Object.values(uploadTasks).map((t) => {
                     const active = t.phase === "upload" || t.phase === "zip";
@@ -878,6 +934,18 @@ export default function LanShare() {
                   <polyline points="23 4 23 10 17 10" />
                   <polyline points="1 20 1 14 7 14" />
                   <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                </svg>
+              </button>
+              <button
+                className={`lan-icon-btn${scanning ? " spinning" : ""}`}
+                title="主动扫描同网段设备（不依赖广播）"
+                aria-label="扫描局域网"
+                onClick={handleScan}
+                disabled={scanning}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
                 </svg>
               </button>
             </span>
@@ -1313,6 +1381,13 @@ export default function LanShare() {
                             ⚠ 未设密码 · 不会被共享
                           </span>
                         )}
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          title="在文件管理器中打开该目录"
+                          onClick={() => invoke("lan_open_path", { path: s.path }).catch(() => {})}
+                        >
+                          打开
+                        </button>
                         <button
                           className="btn btn-ghost btn-sm"
                           onClick={() => setPwEdit({ id: s.id, name: s.name, value: s.password ?? "" })}

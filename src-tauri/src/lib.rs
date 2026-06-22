@@ -1,5 +1,32 @@
 mod tools;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, WindowEvent,
+};
+
+/// 应用级配置：关闭按钮行为。close_to_tray=true 关到托盘后台常驻，false 直接退出。
+/// 由前端「设置」推送，Rust 在窗口关闭事件时读取。
+struct AppConfig {
+    close_to_tray: AtomicBool,
+}
+
+#[tauri::command]
+fn set_close_to_tray(state: tauri::State<'_, AppConfig>, enabled: bool) {
+    state.close_to_tray.store(enabled, Ordering::Relaxed);
+}
+
+/// 显示并聚焦主窗口（从托盘恢复）。
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -10,6 +37,10 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // 默认「关到托盘」（LAN 互传/代理等需后台常驻）；前端设置可改为直接退出
+        .manage(AppConfig {
+            close_to_tray: AtomicBool::new(true),
+        })
         .manage(tools::lan::LanState::default())
         .invoke_handler(tauri::generate_handler![
             tools::port::list_ports,
@@ -49,10 +80,62 @@ pub fn run() {
             tools::lan::lan_pick_files,
             tools::lan::lan_pick_dir,
             tools::lan::lan_reveal,
+            tools::lan::lan_open_path,
+            tools::lan::lan_proxy_status,
+            tools::lan::lan_proxy_stop,
+            tools::lan::lan_proxy_start_server,
+            tools::lan::lan_proxy_start_client,
+            tools::lan::lan_proxy_test,
+            tools::lan::lan_set_system_proxy,
+            tools::lan::lan_proxy_pick_app,
+            tools::lan::lan_proxy_launch_app,
+            tools::lan::lan_scan_subnet,
             tools::lan::lan_send_message,
             tools::lan::lan_recall_message,
             tools::lan::lan_send_files,
+            set_close_to_tray,
         ])
+        .setup(|app| {
+            // 系统托盘：左键点图标恢复窗口；右键菜单可显示/退出
+            let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出百宝箱", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let mut builder = TrayIconBuilder::new()
+                .tooltip("百宝箱")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon().cloned() {
+                builder = builder.icon(icon);
+            }
+            builder.build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 主窗口点关闭：按设置决定「关到托盘（隐藏）」还是「直接退出」
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main"
+                    && window.state::<AppConfig>().close_to_tray.load(Ordering::Relaxed)
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
