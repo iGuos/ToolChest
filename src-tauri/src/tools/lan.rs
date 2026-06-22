@@ -3343,6 +3343,56 @@ async fn run_socks_server(
     }
 }
 
+/// 从流里读到 NUL 为止（SOCKS4 的 USERID / SOCKS4a 的 hostname 都以 \0 结尾）。
+async fn read_until_nul(sock: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let b = sock.read_u8().await?;
+        if b == 0 {
+            break;
+        }
+        buf.push(b);
+        if buf.len() > 255 {
+            break; // 防御：异常超长输入
+        }
+    }
+    Ok(buf)
+}
+
+/// 经百宝箱 TLS 隧道把 (host,port) 连到服务端。成功返回 TLS 流；失败返回错误码：
+/// 1=连不上服务端/证书不符，2=访问密码错，5=服务端连不上目标。
+async fn tunnel_open(
+    server_ip: &str,
+    server_port: u16,
+    connector: &tokio_rustls::TlsConnector,
+    auth: &str,
+    host: &str,
+    port: u16,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if host.as_bytes().len() > 255 || host.is_empty() {
+        return Err(1);
+    }
+    let tcp = tokio::net::TcpStream::connect((server_ip, server_port)).await.map_err(|_| 1u8)?;
+    let dns = rustls::pki_types::ServerName::try_from("baibao.local").map_err(|_| 1u8)?.to_owned();
+    let mut tls = connector.connect(dns, tcp).await.map_err(|_| 1u8)?;
+    let (ab, hb) = (auth.as_bytes(), host.as_bytes());
+    tls.write_u16(ab.len() as u16).await.map_err(|_| 1u8)?;
+    tls.write_all(ab).await.map_err(|_| 1u8)?;
+    tls.write_u8(hb.len() as u8).await.map_err(|_| 1u8)?;
+    tls.write_all(hb).await.map_err(|_| 1u8)?;
+    tls.write_u16(port).await.map_err(|_| 1u8)?;
+    tls.flush().await.map_err(|_| 1u8)?;
+    match tls.read_u8().await {
+        Ok(0) => Ok(tls),
+        Ok(1) => Err(2), // 鉴权失败
+        _ => Err(5),     // 目标连不上
+    }
+}
+
+/// 本机 SOCKS 入口处理。同时支持 SOCKS5 和 SOCKS4/4a——
+/// Windows 系统代理(注册表 socks=)会让 Chrome 用 SOCKS4，故必须兼容，否则系统代理模式不可用。
 async fn socks_handle(
     mut sock: tokio::net::TcpStream,
     server_ip: String,
@@ -3352,89 +3402,89 @@ async fn socks_handle(
     counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // SOCKS5 握手：版本 + 方法协商（只支持无认证）
-    if sock.read_u8().await? != 5 {
-        return Ok(());
-    }
-    let nm = sock.read_u8().await? as usize;
-    let mut methods = vec![0u8; nm];
-    sock.read_exact(&mut methods).await?;
-    sock.write_all(&[5, 0]).await?;
-    // 请求：VER CMD RSV ATYP ...
-    let mut head = [0u8; 4];
-    sock.read_exact(&mut head).await?;
-    if head[0] != 5 || head[1] != 1 {
-        sock.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 不支持的命令
-        return Ok(());
-    }
-    let host = match head[3] {
-        1 => {
-            let mut a = [0u8; 4];
-            sock.read_exact(&mut a).await?;
-            format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
-        }
-        3 => {
-            let l = sock.read_u8().await? as usize;
-            let mut d = vec![0u8; l];
-            sock.read_exact(&mut d).await?;
-            String::from_utf8_lossy(&d).to_string()
+    let ver = sock.read_u8().await?;
+    // SOCKS4 应答 8 字节：VN=0, CD(0x5A 成功/0x5B 失败), DSTPORT(2), DSTIP(4)
+    let socks4_reply = |ok: bool| -> [u8; 8] { [0, if ok { 0x5A } else { 0x5B }, 0, 0, 0, 0, 0, 0] };
+
+    let (host, port) = match ver {
+        5 => {
+            // SOCKS5：版本 + 方法协商（只支持无认证）
+            let nm = sock.read_u8().await? as usize;
+            let mut methods = vec![0u8; nm];
+            sock.read_exact(&mut methods).await?;
+            sock.write_all(&[5, 0]).await?;
+            // 请求：VER CMD RSV ATYP ...
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await?;
+            if head[0] != 5 || head[1] != 1 {
+                sock.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 不支持的命令
+                return Ok(());
+            }
+            let host = match head[3] {
+                1 => {
+                    let mut a = [0u8; 4];
+                    sock.read_exact(&mut a).await?;
+                    format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+                }
+                3 => {
+                    let l = sock.read_u8().await? as usize;
+                    let mut d = vec![0u8; l];
+                    sock.read_exact(&mut d).await?;
+                    String::from_utf8_lossy(&d).to_string()
+                }
+                4 => {
+                    let mut a = [0u8; 16];
+                    sock.read_exact(&mut a).await?;
+                    std::net::Ipv6Addr::from(a).to_string()
+                }
+                _ => {
+                    sock.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 地址类型不支持
+                    return Ok(());
+                }
+            };
+            let port = sock.read_u16().await?;
+            (host, port)
         }
         4 => {
-            let mut a = [0u8; 16];
-            sock.read_exact(&mut a).await?;
-            std::net::Ipv6Addr::from(a).to_string()
+            // SOCKS4 / 4a：CD, DSTPORT(2), DSTIP(4), USERID\0, [4a 时 hostname\0]
+            let cd = sock.read_u8().await?;
+            let port = sock.read_u16().await?;
+            let mut ip = [0u8; 4];
+            sock.read_exact(&mut ip).await?;
+            let _userid = read_until_nul(&mut sock).await?;
+            if cd != 1 {
+                sock.write_all(&socks4_reply(false)).await?; // 只支持 CONNECT
+                return Ok(());
+            }
+            // DSTIP 形如 0.0.0.x(x≠0) 表示 SOCKS4a：真正的主机名以 \0 结尾跟在后面
+            let host = if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0 {
+                String::from_utf8_lossy(&read_until_nul(&mut sock).await?).to_string()
+            } else {
+                format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+            };
+            (host, port)
         }
-        _ => {
-            sock.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 地址类型不支持
-            return Ok(());
-        }
+        _ => return Ok(()), // 非 SOCKS4/5
     };
-    let port = sock.read_u16().await?;
-    let fail = |rep: u8| -> [u8; 10] { [5, rep, 0, 1, 0, 0, 0, 0, 0, 0] };
-    // 连到 A 的隧道端口
-    let tcp = match tokio::net::TcpStream::connect((server_ip.as_str(), server_port)).await {
-        Ok(s) => s,
-        Err(_) => {
-            sock.write_all(&fail(1)).await?;
-            return Ok(());
+
+    match tunnel_open(&server_ip, server_port, &connector, &auth, &host, port).await {
+        Ok(mut tls) => {
+            if ver == 5 {
+                sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            } else {
+                sock.write_all(&socks4_reply(true)).await?;
+            }
+            let _guard = ConnGuard::new(counter); // 进入转发阶段才计数
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut tls).await;
         }
-    };
-    let dns = rustls::pki_types::ServerName::try_from("baibao.local")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "name"))?
-        .to_owned();
-    let mut tls = match connector.connect(dns, tcp).await {
-        Ok(s) => s,
-        Err(_) => {
-            sock.write_all(&fail(1)).await?;
-            return Ok(());
-        }
-    };
-    // 发送隧道头：[u16 authlen][auth][u8 hostlen][host][u16 port]
-    let (ab, hb) = (auth.as_bytes(), host.as_bytes());
-    if hb.len() > 255 {
-        sock.write_all(&fail(1)).await?;
-        return Ok(());
-    }
-    tls.write_u16(ab.len() as u16).await?;
-    tls.write_all(ab).await?;
-    tls.write_u8(hb.len() as u8).await?;
-    tls.write_all(hb).await?;
-    tls.write_u16(port).await?;
-    tls.flush().await?;
-    match tls.read_u8().await {
-        Ok(0) => {}
-        Ok(1) => {
-            sock.write_all(&fail(2)).await?; // 鉴权失败 → 连接不允许
-            return Ok(());
-        }
-        _ => {
-            sock.write_all(&fail(5)).await?; // 连接目标失败
-            return Ok(());
+        Err(code) => {
+            if ver == 5 {
+                sock.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            } else {
+                sock.write_all(&socks4_reply(false)).await?;
+            }
         }
     }
-    sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?; // 成功
-    let _guard = ConnGuard::new(counter); // 进入转发阶段才计数
-    let _ = tokio::io::copy_bidirectional(&mut sock, &mut tls).await;
     Ok(())
 }
 

@@ -137,12 +137,32 @@ function Copyable({ text, title }: { text: string; title?: string }) {
 
 type Msg = { text: string; kind: "err" | "ok" | "info" };
 
+// 访问密码持久化：服务端记一个；客户端按「服务端 fingerprint」各记一个，
+// 这样停止/切换/重开后能自动回填上次用过的密码，免重复输入。
+const PW_KEY = "baibao.proxy.pw.v1";
+interface PwStore {
+  server: string;
+  client: Record<string, string>;
+}
+function loadPwStore(): PwStore {
+  try {
+    const o = JSON.parse(localStorage.getItem(PW_KEY) || "{}");
+    return {
+      server: typeof o.server === "string" ? o.server : "",
+      client: o.client && typeof o.client === "object" ? o.client : {},
+    };
+  } catch {
+    return { server: "", client: {} };
+  }
+}
+
 // 请求代理（独立功能）：让没装 VPN 的设备经另一台「已联 VPN」的设备访问内网。
 export default function ProxyTool() {
   const { peers } = useLan();
+  const pwStore = useRef<PwStore>(loadPwStore());
   const [proxy, setProxy] = useState<{ role: number; socksPort: number; port: number; conns: number }>({ role: 0, socksPort: 0, port: 0, conns: 0 });
   const [mode, setMode] = useState<"server" | "client">("server");
-  const [pw, setPw] = useState("");
+  const [pw, setPw] = useState(() => pwStore.current.server); // 默认服务端，回填上次服务端密码
   const [port, setPort] = useState("53318");
   const [serverFp, setServerFp] = useState("");
   const [src, setSrc] = useState<"lan" | "custom">("lan"); // 客户端找服务端的方式：内网网段 / 自定义 IP
@@ -175,10 +195,36 @@ export default function ProxyTool() {
     if (msgTimer.current) window.clearTimeout(msgTimer.current);
   }, []);
 
-  // 切换角色：清空密码（服务端=你设的、客户端=填对方的，语义不同，不应带过去）
+  // 写入持久化（按当前角色/所选服务端归位）
+  const persistPw = (val: string) => {
+    const s = pwStore.current;
+    if (mode === "server") s.server = val;
+    else if (serverFp) s.client[serverFp] = val;
+    try {
+      localStorage.setItem(PW_KEY, JSON.stringify(s));
+    } catch {
+      /* ignore */
+    }
+  };
+  // 用户编辑密码：更新输入并持久化
+  const updatePw = (val: string) => {
+    setPw(val);
+    persistPw(val);
+  };
+  // 取某角色/服务端已保存的密码
+  const savedPw = (m: "server" | "client", fp: string) =>
+    m === "server" ? pwStore.current.server : fp ? pwStore.current.client[fp] ?? "" : "";
+
+  // 选择服务端设备：回填该服务端上次用过的密码
+  const selectServer = (fp: string) => {
+    setServerFp(fp);
+    setPw(savedPw("client", fp));
+  };
+
+  // 切换角色：回填该角色上次用过的密码（服务端=你设的、客户端=对应服务端的）
   const switchMode = (m: "server" | "client") => {
     setMode(m);
-    setPw("");
+    setPw(savedPw(m, serverFp));
     setPwVisible(false);
     setMsg(null);
   };
@@ -188,7 +234,7 @@ export default function ProxyTool() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     const a = new Uint32Array(21);
     crypto.getRandomValues(a);
-    setPw(Array.from(a, (n) => chars[n % chars.length]).join(""));
+    updatePw(Array.from(a, (n) => chars[n % chars.length]).join(""));
     setPwVisible(true);
   };
 
@@ -241,6 +287,8 @@ export default function ProxyTool() {
     const p = peers.find((x) => x.ip === wantIp);
     if (p) {
       setServerFp(p.fingerprint);
+      // 自定义探测：保留已输入的密码；为空则回填该服务端上次用过的
+      setPw((cur) => cur || (pwStore.current.client[p.fingerprint] ?? ""));
       setWantIp("");
     }
   }, [peers, wantIp]);
@@ -307,7 +355,7 @@ export default function ProxyTool() {
         await refresh();
         show(`已连接服务端 · 本地 SOCKS5 127.0.0.1:${sp}`, "ok");
       }
-      setPw("");
+      persistPw(pw); // 连接成功后记住本次密码（停止后仍保留，免重输）
     } catch (e) {
       fail(String(e));
       await refresh();
@@ -536,7 +584,7 @@ export default function ProxyTool() {
                           options={deviceOptions}
                           placeholder="扫描后在此选择…"
                           emptyHint="先选网段并扫描"
-                          onChange={setServerFp}
+                          onChange={selectServer}
                         />
                       </div>
                     </div>
@@ -579,7 +627,7 @@ export default function ProxyTool() {
                   style={{ flex: 1 }}
                   type={pwVisible ? "text" : "password"}
                   value={pw}
-                  onChange={(e) => setPw(e.target.value)}
+                  onChange={(e) => updatePw(e.target.value)}
                   onKeyDown={onPwKey}
                   placeholder={mode === "server" ? "设一个密码（客户端用它连接）" : "对方服务端的密码"}
                 />
