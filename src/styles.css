@@ -1201,6 +1201,122 @@ select { cursor: pointer; }
   font-size: 12.5px;
   color: var(--text);
 }
+/* 指定应用：选文件 / 选运行中 的子分段 */
+.proxy-sub-seg {
+  max-width: 280px;
+}
+.proxy-running {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.proxy-running-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+.proxy-running-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.proxy-running-item {
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.proxy-running-item:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.proxy-running-item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* 服务端流量折线图 */
+.proxy-traffic {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.proxy-chart {
+  width: 100%;
+  height: 90px;
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.proxy-chart-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.proxy-chart-area {
+  fill: color-mix(in srgb, var(--accent) 16%, transparent);
+  stroke: none;
+}
+.proxy-traffic-stat {
+  display: flex;
+  gap: 18px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.proxy-traffic-stat b {
+  color: var(--text);
+  font-weight: 600;
+}
+/* 访问网址记录 */
+.proxy-hostlog {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.proxy-hostlog li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
+.proxy-host-target {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "Menlo", "Monaco", "Consolas", monospace;
+  color: var(--text);
+}
+.proxy-host-count {
+  flex: none;
+  color: var(--text-dim);
+}
 /* 运行中状态卡 */
 .proxy-status {
   align-items: flex-start;

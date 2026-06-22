@@ -245,6 +245,8 @@ struct Inner {
     proxy_port: u16,                 // 隧道端口（服务端=监听端口 / 客户端=对方服务端端口）
     proxy_task: Option<tauri::async_runtime::JoinHandle<()>>, // 监听任务句柄，停止时 abort
     proxy_conns: std::sync::Arc<std::sync::atomic::AtomicUsize>, // 当前活跃隧道连接数（供状态展示）
+    proxy_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>, // 服务端累计转发字节（前端算实时速率画折线）
+    proxy_hosts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u128)>>>, // "host:port" -> (次数, 最近时间ms)
 }
 
 /// 用户主目录（跨平台：类 Unix 用 HOME，Windows 用 USERPROFILE）。
@@ -358,6 +360,8 @@ impl Default for Inner {
             proxy_port: 0,
             proxy_task: None,
             proxy_conns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            proxy_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            proxy_hosts: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             socket: None,
         };
         // 落盘一次，确保（尤其是随机指纹）下次启动可复用
@@ -3236,13 +3240,65 @@ fn proxy_client_config(expected_fp: &str) -> std::sync::Arc<rustls::ClientConfig
     std::sync::Arc::new(cfg)
 }
 
+/// 服务端转发的运行指标：活跃连接数 / 累计字节 / 访问过的目标（仅记录展示，不解码报文）。
+#[derive(Clone)]
+struct ServeCtx {
+    conns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    hosts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u128)>>>,
+}
+
+/// 双向转发并累计字节数（替代 copy_bidirectional，用于实时流量统计）。
+async fn relay_counted(
+    tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    upstream: tokio::net::TcpStream,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut cr, mut cw) = tokio::io::split(tls);
+    let (mut sr, mut sw) = tokio::io::split(upstream);
+    let b_up = bytes.clone();
+    let up = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match cr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    b_up.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        let _ = sw.shutdown().await;
+    };
+    let down = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match sr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if cw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    bytes.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        let _ = cw.shutdown().await;
+    };
+    tokio::join!(up, down);
+}
+
 /// A 端：TLS 隧道服务器。收到 [鉴权][目标host][目标port] 后，连接目标并双向转发。
 /// 监听器由调用方(命令)同步绑定好再传入，便于把「端口被占用/被拦」的错误直接报给前端。
 async fn run_proxy_server(
     listener: tokio::net::TcpListener,
     cfg: std::sync::Arc<rustls::ServerConfig>,
     expected_auth: String,
-    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ctx: ServeCtx,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
     // 用 JoinSet 持有所有子连接任务：停止时本任务被 abort → JoinSet 析构 → 所有连接一并被强制断开。
@@ -3251,9 +3307,9 @@ async fn run_proxy_server(
         tokio::select! {
             r = listener.accept() => {
                 if let Ok((tcp, _)) = r {
-                    let (acceptor, auth, counter) = (acceptor.clone(), expected_auth.clone(), counter.clone());
+                    let (acceptor, auth, ctx) = (acceptor.clone(), expected_auth.clone(), ctx.clone());
                     conns.spawn(async move {
-                        let _ = proxy_serve_conn(acceptor, tcp, &auth, &counter).await;
+                        let _ = proxy_serve_conn(acceptor, tcp, &auth, &ctx).await;
                     });
                 }
             }
@@ -3266,7 +3322,7 @@ async fn proxy_serve_conn(
     acceptor: tokio_rustls::TlsAcceptor,
     tcp: tokio::net::TcpStream,
     expected_auth: &str,
-    counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ctx: &ServeCtx,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // 握手也加超时，防 TLS 半开连接堆积
@@ -3302,7 +3358,7 @@ async fn proxy_serve_conn(
         return Ok(());
     }
     let host = String::from_utf8_lossy(&hbuf).to_string();
-    let mut upstream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+    let upstream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
         Ok(s) => s,
         Err(_) => {
             let _ = tls.write_u8(2).await; // 连接目标失败
@@ -3311,8 +3367,20 @@ async fn proxy_serve_conn(
     };
     tls.write_u8(0).await?; // ok
     tls.flush().await?;
-    let _guard = ConnGuard::new(counter); // 进入转发阶段才计数（排除握手/鉴权失败/探测）
-    let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+    // 记录访问的目标（仅 host:port + 次数/时间，不看内容），供「请求走了哪些网址」展示
+    if let Ok(mut h) = ctx.hosts.lock() {
+        if h.len() >= 1000 {
+            // 软上限：超量时清掉最旧的一个，避免无限增长
+            if let Some(oldest) = h.iter().min_by_key(|(_, v)| v.1).map(|(k, _)| k.clone()) {
+                h.remove(&oldest);
+            }
+        }
+        let e = h.entry(format!("{host}:{port}")).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = now_ms();
+    }
+    let _guard = ConnGuard::new(&ctx.conns); // 进入转发阶段才计数（排除握手/鉴权失败/探测）
+    relay_counted(tls, upstream, ctx.bytes.clone()).await;
     Ok(())
 }
 
@@ -3496,15 +3564,30 @@ fn proxy_stop_locked(g: &mut Inner) {
     g.proxy_role = 0;
     g.proxy_socks_port = 0;
     g.proxy_port = 0;
-    // 换一个新计数器，旧任务即便延迟析构也不会再影响展示
+    // 换一批新指标，旧任务即便延迟析构也不会再影响展示
     g.proxy_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    g.proxy_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    g.proxy_hosts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 }
 
 #[tauri::command]
 pub fn lan_proxy_status(state: State<'_, LanState>) -> serde_json::Value {
     let g = state.0.lock().unwrap();
     let conns = g.proxy_conns.load(std::sync::atomic::Ordering::Relaxed);
-    serde_json::json!({ "role": g.proxy_role, "socksPort": g.proxy_socks_port, "port": g.proxy_port, "conns": conns })
+    let bytes = g.proxy_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    serde_json::json!({ "role": g.proxy_role, "socksPort": g.proxy_socks_port, "port": g.proxy_port, "conns": conns, "bytes": bytes })
+}
+
+/// 服务端：返回记录到的访问目标列表（host:port + 次数 + 最近时间），按最近时间倒序。
+#[tauri::command]
+pub fn lan_proxy_hosts(state: State<'_, LanState>) -> Vec<serde_json::Value> {
+    let g = state.0.lock().unwrap();
+    let map = g.proxy_hosts.lock().unwrap();
+    let mut list: Vec<(&String, &(u64, u128))> = map.iter().collect();
+    list.sort_by(|a, b| b.1 .1.cmp(&a.1 .1)); // 按最近时间倒序
+    list.into_iter()
+        .map(|(target, (count, last))| serde_json::json!({ "target": target, "count": count, "lastMs": *last as u64 }))
+        .collect()
 }
 
 #[tauri::command]
@@ -3539,15 +3622,21 @@ pub async fn lan_proxy_start_server(
     let listener = bind_reuse(port, false)
         .and_then(tokio::net::TcpListener::from_std)
         .map_err(|e| format!("监听端口 {port} 启动失败（可能被占用或被防火墙拦截）：{e}"))?;
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let task_counter = counter.clone();
+    let ctx = ServeCtx {
+        conns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        hosts: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+    let task_ctx = ctx.clone();
     let task = tauri::async_runtime::spawn(async move {
-        run_proxy_server(listener, cfg, expected_auth, task_counter).await;
+        run_proxy_server(listener, cfg, expected_auth, task_ctx).await;
     });
     let mut g = st.0.lock().unwrap();
     g.proxy_role = 1;
     g.proxy_port = port;
-    g.proxy_conns = counter;
+    g.proxy_conns = ctx.conns;
+    g.proxy_bytes = ctx.bytes;
+    g.proxy_hosts = ctx.hosts;
     g.proxy_task = Some(task);
     Ok(())
 }
@@ -3723,7 +3812,29 @@ fn apply_system_socks(enable: bool, port: u16) -> Result<(), String> {
     } else {
         run(&["add", KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])?;
     }
+    // 关键：广播刷新，否则 Chrome/Edge 等会用缓存的旧代理配置（不重启就不生效）
+    notify_wininet_changed();
     Ok(())
+}
+
+/// 通知 WinINET 重新加载系统代理，让 Chrome/Edge 等无需重启即时生效。
+#[cfg(target_os = "windows")]
+fn notify_wininet_changed() {
+    #[link(name = "wininet")]
+    extern "system" {
+        fn InternetSetOptionW(
+            h: *mut core::ffi::c_void,
+            opt: u32,
+            buf: *mut core::ffi::c_void,
+            len: u32,
+        ) -> i32;
+    }
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+    unsafe {
+        InternetSetOptionW(std::ptr::null_mut(), INTERNET_OPTION_SETTINGS_CHANGED, std::ptr::null_mut(), 0);
+        InternetSetOptionW(std::ptr::null_mut(), INTERNET_OPTION_REFRESH, std::ptr::null_mut(), 0);
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3842,6 +3953,80 @@ pub async fn lan_proxy_launch_app(path: String, port: u16) -> Result<String, Str
     })
     .await
     .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningApp {
+    name: String,
+    path: String, // macOS=.app 路径 / Windows=.exe 路径，可直接交给 lan_proxy_launch_app
+}
+
+/// 列出当前正在运行的「有界面的」应用，供「指定应用」里直接挑选（免去文件浏览）。
+#[cfg(target_os = "macos")]
+fn list_running_apps() -> Vec<RunningApp> {
+    // ps 的 comm 列给出可执行文件全路径；GUI 应用主程序路径含 .app/Contents/MacOS/
+    let out = std::process::Command::new("ps").args(["-axo", "comm="]).output();
+    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Ok(o) = out {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let line = line.trim();
+            if let Some(idx) = line.find(".app/Contents/MacOS/") {
+                let app_path = &line[..idx + 4]; // 含 ".app"
+                let name = std::path::Path::new(app_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    map.entry(name).or_insert_with(|| app_path.to_string());
+                }
+            }
+        }
+    }
+    map.into_iter().map(|(name, path)| RunningApp { name, path }).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn list_running_apps() -> Vec<RunningApp> {
+    // 取有主窗口的进程（即 GUI 应用）及其 exe 路径
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Process | Where-Object {$_.MainWindowHandle -ne 0 -and $_.Path} | Select-Object ProcessName,Path -Unique | ConvertTo-Json -Compress",
+        ])
+        .output();
+    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Ok(o) = out {
+        let txt = String::from_utf8_lossy(&o.stdout);
+        let v: serde_json::Value = serde_json::from_str(txt.trim()).unwrap_or(serde_json::Value::Null);
+        let arr = match v {
+            serde_json::Value::Array(a) => a,
+            serde_json::Value::Object(_) => vec![v],
+            _ => vec![],
+        };
+        for item in arr {
+            let name = item.get("ProcessName").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let path = item.get("Path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() && !path.is_empty() {
+                map.entry(name).or_insert(path);
+            }
+        }
+    }
+    map.into_iter().map(|(name, path)| RunningApp { name, path }).collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn list_running_apps() -> Vec<RunningApp> {
+    Vec::new()
+}
+
+#[tauri::command]
+pub async fn lan_proxy_running_apps() -> Result<Vec<RunningApp>, String> {
+    tauri::async_runtime::spawn_blocking(list_running_apps)
+        .await
+        .map_err(|e| format!("任务调度失败：{e}"))
 }
 
 /// 主动扫描网段（探测 53317 的 /info），发现百宝箱设备并登记。返回发现总数。

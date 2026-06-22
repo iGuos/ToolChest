@@ -136,6 +136,45 @@ function Copyable({ text, title }: { text: string; title?: string }) {
 }
 
 type Msg = { text: string; kind: "err" | "ok" | "info" };
+type ProxyStatus = { role: number; socksPort: number; port: number; conns: number; bytes: number };
+type HostHit = { target: string; count: number; lastMs: number };
+
+// 人类可读的字节/速率
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${Math.round(n)} B`;
+  const u = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${u[i]}`;
+}
+
+// 流量折线图（实时速率采样）。纯 SVG，无依赖。
+function Sparkline({ data }: { data: number[] }) {
+  const W = 460;
+  const H = 90;
+  const max = Math.max(1, ...data);
+  const n = Math.max(data.length, 2);
+  const pts = data.map((v, i) => {
+    const x = (i / (n - 1)) * W;
+    const y = H - (v / max) * (H - 8) - 2;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const area = pts.length ? `0,${H} ${pts.join(" ")} ${((data.length - 1) / (n - 1) * W).toFixed(1)},${H}` : "";
+  return (
+    <svg className="proxy-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+      {data.length >= 2 && (
+        <>
+          <polygon points={area} className="proxy-chart-area" />
+          <polyline points={pts.join(" ")} className="proxy-chart-line" />
+        </>
+      )}
+    </svg>
+  );
+}
 
 // 访问密码持久化：服务端记一个；客户端按「服务端 fingerprint」各记一个，
 // 这样停止/切换/重开后能自动回填上次用过的密码，免重复输入。
@@ -160,7 +199,11 @@ function loadPwStore(): PwStore {
 export default function ProxyTool() {
   const { peers } = useLan();
   const pwStore = useRef<PwStore>(loadPwStore());
-  const [proxy, setProxy] = useState<{ role: number; socksPort: number; port: number; conns: number }>({ role: 0, socksPort: 0, port: 0, conns: 0 });
+  const [proxy, setProxy] = useState<ProxyStatus>({ role: 0, socksPort: 0, port: 0, conns: 0, bytes: 0 });
+  const [serverView, setServerView] = useState<"traffic" | "hosts">("traffic"); // 服务端视图：流量折线 / 访问网址
+  const [samples, setSamples] = useState<number[]>([]); // 实时速率采样(字节/秒)，画折线
+  const [hosts, setHosts] = useState<HostHit[]>([]); // 访问过的目标列表
+  const lastBytesRef = useRef<{ bytes: number; t: number } | null>(null);
   const [mode, setMode] = useState<"server" | "client">("server");
   const [pw, setPw] = useState(() => pwStore.current.server); // 默认服务端，回填上次服务端密码
   const [port, setPort] = useState("53318");
@@ -178,7 +221,10 @@ export default function ProxyTool() {
   const [pwVisible, setPwVisible] = useState(false);
   const [sysProxy, setSysProxy] = useState(false); // 是否已接管系统代理(仅客户端)
   const [sysBusy, setSysBusy] = useState(false); // 系统代理设置中（弹授权框，耗时）
-  const [apply, setApply] = useState<"sys" | "app">("sys"); // 代理生效方式：系统代理 / 指定应用
+  const [apply, setApply] = useState<"sys" | "app">("app"); // 代理生效方式：默认指定应用，可切到系统代理
+  const [appPickMode, setAppPickMode] = useState<"file" | "running">("file"); // 指定应用：选文件 / 选运行中
+  const [runningApps, setRunningApps] = useState<{ name: string; path: string }[]>([]);
+  const [loadingApps, setLoadingApps] = useState(false);
   const [launching, setLaunching] = useState(false); // 正在带代理启动应用
   const [launched, setLaunched] = useState<string[]>([]); // 最近通过代理启动的应用
   const msgTimer = useRef<number | null>(null);
@@ -240,7 +286,7 @@ export default function ProxyTool() {
 
   const refresh = async () => {
     try {
-      setProxy(await invoke<{ role: number; socksPort: number; port: number; conns: number }>("lan_proxy_status"));
+      setProxy(await invoke<ProxyStatus>("lan_proxy_status"));
     } catch {
       /* ignore */
     }
@@ -249,12 +295,43 @@ export default function ProxyTool() {
     refresh();
   }, []);
 
-  // 运行中：每 2 秒刷新一次状态（活跃连接数实时变化）
+  // 运行中：每 1 秒取状态；服务端据累计字节算实时速率，采样画折线
   useEffect(() => {
-    if (proxy.role === 0) return;
-    const t = window.setInterval(refresh, 2000);
+    if (proxy.role === 0) {
+      setSamples([]);
+      lastBytesRef.current = null;
+      return;
+    }
+    lastBytesRef.current = null; // 重新建立基准
+    setSamples([]);
+    const tick = async () => {
+      try {
+        const s = await invoke<ProxyStatus>("lan_proxy_status");
+        setProxy(s);
+        const now = Date.now();
+        const prev = lastBytesRef.current;
+        lastBytesRef.current = { bytes: s.bytes, t: now };
+        if (prev && s.role === 1) {
+          const dt = (now - prev.t) / 1000;
+          const rate = dt > 0 ? Math.max(0, (s.bytes - prev.bytes) / dt) : 0;
+          setSamples((arr) => [...arr, rate].slice(-60));
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    const t = window.setInterval(tick, 1000);
     return () => window.clearInterval(t);
   }, [proxy.role]);
+
+  // 服务端「网址」视图：每 2 秒拉一次访问目标列表
+  useEffect(() => {
+    if (proxy.role !== 1 || serverView !== "hosts") return;
+    const load = () => invoke<HostHit[]>("lan_proxy_hosts").then(setHosts).catch(() => {});
+    load();
+    const t = window.setInterval(load, 2000);
+    return () => window.clearInterval(t);
+  }, [proxy.role, serverView]);
 
   // 扫描进度事件
   useEffect(() => {
@@ -364,26 +441,40 @@ export default function ProxyTool() {
     }
   };
 
-  const setSystemProxy = async (on: boolean) => {
+  // 设置/还原系统代理，返回是否成功（失败含用户取消授权）
+  const applySys = async (on: boolean): Promise<boolean> => {
     setSysBusy(true);
     try {
       await invoke("lan_set_system_proxy", { enable: on, port: proxy.socksPort || 53319 });
       setSysProxy(on);
-      show(on ? "已接管系统代理；停止代理会自动还原。" : "已还原系统代理。", "ok");
+      show(on ? "已设为系统代理；多数程序自动走，停止/切回指定应用时自动还原。" : "已还原系统代理。", "ok");
+      return true;
     } catch (e) {
       fail(String(e));
+      return false;
     } finally {
       setSysBusy(false);
     }
   };
 
-  // 指定应用：选一个 App，由百宝箱带代理参数启动它
-  const launchApp = async () => {
-    if (launching) return;
+  // 切换生效方式：选「系统代理」即刻接管系统代理；切回「指定应用」则还原。
+  const chooseApply = async (next: "sys" | "app") => {
+    if (next === apply || sysBusy) return;
+    if (next === "sys") {
+      setApply("sys");
+      const ok = await applySys(true); // macOS 这步会弹一次授权
+      if (!ok) setApply("app"); // 失败/取消则回退
+    } else {
+      setApply("app");
+      if (sysProxy) await applySys(false); // 切回指定应用：还原系统代理
+    }
+  };
+
+  // 带代理启动指定路径的应用
+  const launchPath = async (path: string) => {
+    if (launching || !path) return;
     setLaunching(true);
     try {
-      const path = await invoke<string | null>("lan_proxy_pick_app");
-      if (!path) return; // 用户取消
       const r = await invoke<string>("lan_proxy_launch_app", { path, port: proxy.socksPort || 53319 });
       setLaunched((l) => [r, ...l.filter((x) => x !== r)].slice(0, 5));
       show(r, "ok");
@@ -391,6 +482,30 @@ export default function ProxyTool() {
       fail(String(e));
     } finally {
       setLaunching(false);
+    }
+  };
+
+  // 方式一：从文件选择器挑一个 App
+  const pickAndLaunch = async () => {
+    if (launching) return;
+    try {
+      const path = await invoke<string | null>("lan_proxy_pick_app");
+      if (path) await launchPath(path);
+    } catch (e) {
+      fail(String(e));
+    }
+  };
+
+  // 方式二：列出当前运行中的有界面应用，直接挑选
+  const loadRunningApps = async () => {
+    if (loadingApps) return;
+    setLoadingApps(true);
+    try {
+      setRunningApps(await invoke<{ name: string; path: string }[]>("lan_proxy_running_apps"));
+    } catch (e) {
+      fail(String(e));
+    } finally {
+      setLoadingApps(false);
     }
   };
 
@@ -406,6 +521,7 @@ export default function ProxyTool() {
         }
         setSysProxy(false);
       }
+      setApply("app"); // 复位为默认，下次连接从「指定应用」开始
       await invoke("lan_proxy_stop");
       show("已停止代理。", "info");
     } finally {
@@ -444,11 +560,56 @@ export default function ProxyTool() {
               {proxy.conns > 0 && <em className="proxy-conns">{proxy.conns} 个活跃连接</em>}
             </span>
             {proxy.role === 1 ? (
-              <p>
-                正作为<b>服务端</b>运行 · 隧道端口 <Copyable text={String(proxy.port || 53318)} title="复制端口" />
-                <br />
-                客户端凭访问密码连接本机。
-              </p>
+              <>
+                <p>
+                  正作为<b>服务端</b>运行 · 隧道端口 <Copyable text={String(proxy.port || 53318)} title="复制端口" />
+                  <br />
+                  客户端凭访问密码连接本机。
+                </p>
+                <div className="proxy-apply">
+                  <div className="proxy-apply-seg proxy-sub-seg">
+                    <button
+                      type="button"
+                      className={`proxy-src${serverView === "traffic" ? " active" : ""}`}
+                      onClick={() => setServerView("traffic")}
+                    >
+                      流量
+                    </button>
+                    <button
+                      type="button"
+                      className={`proxy-src${serverView === "hosts" ? " active" : ""}`}
+                      onClick={() => setServerView("hosts")}
+                    >
+                      访问网址
+                    </button>
+                  </div>
+                  {serverView === "traffic" ? (
+                    <div className="proxy-traffic">
+                      <Sparkline data={samples} />
+                      <div className="proxy-traffic-stat">
+                        <span>实时 <b>{fmtBytes(samples[samples.length - 1] ?? 0)}/s</b></span>
+                        <span>累计 <b>{fmtBytes(proxy.bytes)}</b></span>
+                        <span>活跃 <b>{proxy.conns}</b></span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="proxy-running">
+                      <div className="proxy-running-head">
+                        <span className="dim">访问目标（{hosts.length}）· 仅记录 host:port，不查看内容</span>
+                      </div>
+                      <ul className="proxy-hostlog">
+                        {hosts.map((h) => (
+                          <li key={h.target}>
+                            <span className="proxy-host-target" title={h.target}>{h.target}</span>
+                            <span className="proxy-host-count">×{h.count}</span>
+                          </li>
+                        ))}
+                        {hosts.length === 0 && <li className="dropdown-empty dim">暂无访问记录</li>}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </>
             ) : (
               <p className="proxy-socks-line">
                 正作为<b>客户端</b>运行 · 把浏览器/工具的代理设为：
@@ -459,38 +620,78 @@ export default function ProxyTool() {
             )}
             {proxy.role === 2 && (
               <div className="proxy-apply">
+                <div className="proxy-label">生效方式</div>
                 <div className="proxy-apply-seg">
                   <button
                     type="button"
-                    className={`proxy-src${apply === "sys" ? " active" : ""}`}
-                    onClick={() => setApply("sys")}
-                  >
-                    系统代理
-                  </button>
-                  <button
-                    type="button"
                     className={`proxy-src${apply === "app" ? " active" : ""}`}
-                    onClick={() => setApply("app")}
+                    disabled={sysBusy}
+                    onClick={() => chooseApply("app")}
                   >
                     指定应用
                   </button>
+                  <button
+                    type="button"
+                    className={`proxy-src${apply === "sys" ? " active" : ""}`}
+                    disabled={sysBusy}
+                    onClick={() => chooseApply("sys")}
+                  >
+                    系统代理
+                  </button>
                 </div>
-                {apply === "sys" ? (
-                  <label className={`proxy-sysproxy${sysBusy ? " busy" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={sysProxy}
-                      disabled={sysBusy}
-                      onChange={(e) => setSystemProxy(e.target.checked)}
-                    />
-                    设为系统代理（多数程序自动走，免逐个配置；停止时自动还原）
-                    {sysBusy && <span className="proxy-spin" aria-hidden />}
-                  </label>
-                ) : (
+                {apply === "app" ? (
                   <div className="proxy-applist">
-                    <button className="btn btn-ghost btn-sm" disabled={launching} onClick={launchApp}>
-                      {launching ? "启动中…" : "＋ 选择应用并通过代理启动"}
-                    </button>
+                    <div className="proxy-apply-seg proxy-sub-seg">
+                      <button
+                        type="button"
+                        className={`proxy-src${appPickMode === "file" ? " active" : ""}`}
+                        onClick={() => setAppPickMode("file")}
+                      >
+                        选择应用文件
+                      </button>
+                      <button
+                        type="button"
+                        className={`proxy-src${appPickMode === "running" ? " active" : ""}`}
+                        onClick={() => {
+                          setAppPickMode("running");
+                          loadRunningApps();
+                        }}
+                      >
+                        运行中的应用
+                      </button>
+                    </div>
+                    {appPickMode === "file" ? (
+                      <button className="btn btn-ghost btn-sm" disabled={launching} onClick={pickAndLaunch}>
+                        {launching ? "启动中…" : "＋ 选择应用并通过代理启动"}
+                      </button>
+                    ) : (
+                      <div className="proxy-running">
+                        <div className="proxy-running-head">
+                          <span className="dim">{loadingApps ? "读取中…" : `运行中的应用（${runningApps.length}）`}</span>
+                          <button className="btn btn-ghost btn-sm" disabled={loadingApps} onClick={loadRunningApps}>
+                            刷新
+                          </button>
+                        </div>
+                        <ul className="proxy-running-list">
+                          {runningApps.map((a) => (
+                            <li key={a.path}>
+                              <button
+                                type="button"
+                                className="proxy-running-item"
+                                disabled={launching}
+                                title={`通过代理启动：${a.path}`}
+                                onClick={() => launchPath(a.path)}
+                              >
+                                {a.name}
+                              </button>
+                            </li>
+                          ))}
+                          {!loadingApps && runningApps.length === 0 && (
+                            <li className="dropdown-empty dim">未读到应用，点「刷新」</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
                     <p className="proxy-apply-hint dim">
                       浏览器带 <code>--proxy-server</code> 启动；其他程序注入代理环境变量。已在运行的实例需先完全退出再启动。
                     </p>
@@ -504,6 +705,17 @@ export default function ProxyTool() {
                         ))}
                       </ul>
                     )}
+                  </div>
+                ) : (
+                  <div className="proxy-applist">
+                    <p className="proxy-apply-hint dim">
+                      {sysBusy
+                        ? "正在设置系统代理…"
+                        : sysProxy
+                        ? "✓ 已设为系统代理，多数程序自动走；切回「指定应用」或停止时自动还原。"
+                        : "切到此项即接管系统代理。若浏览器装了管代理的扩展，会覆盖系统代理需先关闭。"}
+                      {sysBusy && <span className="proxy-spin" aria-hidden />}
+                    </p>
                   </div>
                 )}
               </div>
