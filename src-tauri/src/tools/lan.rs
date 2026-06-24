@@ -20,7 +20,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
@@ -149,12 +149,29 @@ struct FileMeta {
 struct PrepareUploadRequest {
     info: DeviceInfo,
     files: HashMap<String, FileMeta>,
+    /// 百宝箱抗抖动扩展：发送端生成的稳定 offer 标识。带它即走「立即应答 + 幂等轮询」路径，
+    /// 等待对方接收期间断连可后台重连重试，且接收端按它幂等、不会重复弹「点击接收」。
+    /// LocalSend 等旧端不带此字段 → 走原阻塞式握手（兼容）。
+    #[serde(default)]
+    offer_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PrepareUploadResponse {
     session_id: String,
+    files: HashMap<String, String>,
+}
+
+/// 发送端解析握手应答。`status` 仅百宝箱接收端返回："pending"=对方还没点接收，需继续轮询；
+/// 其余（含 LocalSend 旧端无此字段的情况）一律视为已接受，`files` 即各文件的上传 token。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareUploadReply {
+    #[serde(default)]
+    status: Option<String>,
+    session_id: String,
+    #[serde(default)]
     files: HashMap<String, String>,
 }
 
@@ -180,6 +197,23 @@ struct RecallPayload {
 struct Decision {
     accept: bool,
     file_ids: Vec<String>,
+}
+
+/// 一次「待接收」请求的状态（抗抖动握手用）。接收端按 offerId 保存，发送端轮询读取：
+/// 发送端可对同一 offerId 反复重试（网络抖动后后台重连），接收端据此幂等——既不重复弹窗，
+/// 也不会因一次瞬断就丢掉这次请求。
+enum OfferState {
+    Pending,                           // 还没点「接收」
+    Accepted(HashMap<String, String>), // 已接收：file_id -> token（Session 已写入 sessions）
+    Declined,                          // 已拒绝
+}
+
+struct Offer {
+    created: Instant,
+    session_id: String,
+    peer: String,                     // 发送方指纹
+    files: HashMap<String, FileMeta>, // 接收时据此生成 token
+    state: OfferState,
 }
 
 struct FileSlot {
@@ -231,7 +265,8 @@ struct Inner {
     shares: Vec<ShareCfg>, // 对外共享的目录列表
     auth_fails: HashMap<String, AuthFail>, // 共享密码失败记录（按来源 IP），用于防暴力破解
     peers: HashMap<String, Peer>,
-    decisions: HashMap<String, Sender<Decision>>,
+    decisions: HashMap<String, Sender<Decision>>, // 旧阻塞式握手（LocalSend 兼容）：sessionId -> 决定通道
+    offers: HashMap<String, Offer>,     // 抗抖动握手：offerId -> 待接收/已决定请求
     sessions: HashMap<String, Session>, // sessionId -> 会话
     cancelled: HashSet<String>,         // 已取消的 sessionId（收发双向）
     cancelled_sends: HashSet<String>,   // 发送方取消的 fileId（对方还没接受前就撤销发送）
@@ -350,6 +385,7 @@ impl Default for Inner {
             auth_fails: HashMap::new(),
             peers: HashMap::new(),
             decisions: HashMap::new(),
+            offers: HashMap::new(),
             sessions: HashMap::new(),
             cancelled: HashSet::new(),
             cancelled_sends: HashSet::new(),
@@ -1087,6 +1123,29 @@ fn announcer(app: AppHandle, state: LanState, sock: Arc<UdpSocket>) {
         };
         if removed {
             emit_peers(&app, &state);
+        }
+        // 清理抗抖动握手的 offer：pending 超 5 分钟 → 超时（通知前端标记过期）；其余（已接收/拒绝）超 10 分钟 → 丢弃。
+        let timed_out: Vec<String> = {
+            let mut g = state.0.lock().unwrap();
+            let now = Instant::now();
+            let timed_out: Vec<String> = g
+                .offers
+                .values()
+                .filter(|o| {
+                    matches!(o.state, OfferState::Pending)
+                        && now.duration_since(o.created) >= Duration::from_secs(300)
+                })
+                .map(|o| o.session_id.clone())
+                .collect();
+            g.offers.retain(|_, o| {
+                !(matches!(o.state, OfferState::Pending)
+                    && now.duration_since(o.created) >= Duration::from_secs(300))
+                    && now.duration_since(o.created) < Duration::from_secs(600)
+            });
+            timed_out
+        };
+        for sid in timed_out {
+            let _ = app.emit("lan://offer-timeout", serde_json::json!({ "sessionId": sid }));
         }
     }
 }
@@ -1956,6 +2015,12 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
     // 用连接来源 IP 自动登记发送方（含其完整设备信息），实现单边「+ IP」即可双向。
     upsert_peer(app, state, &req.info, remote_ip, false);
 
+    // 发送端带 offerId → 走「立即应答 + 幂等」的抗抖动握手：不挂起连接，发送端断连后可后台重连重试。
+    // 不带（LocalSend 旧端 / 旧版百宝箱）→ 下面的原阻塞式握手（兼容）。
+    if req.offer_id.is_some() {
+        return handle_prepare_upload_poll(app, state, request, req, is_baibao);
+    }
+
     let session_id = rand_hex(12);
     let (tx, rx) = mpsc::channel::<Decision>();
     {
@@ -2027,6 +2092,90 @@ fn handle_prepare_upload(app: &AppHandle, state: &LanState, mut request: tiny_ht
             files: tokens,
         },
     );
+}
+
+/// 抗抖动握手（发送端带 offerId 时）：**立即应答**，绝不挂起连接等用户点接收。
+/// - 首次见到该 offerId：建一条 Pending offer、弹一次「点击接收」，返回 `{status:"pending"}`。
+/// - 之后对同一 offerId 的重试（发送端网络抖动后后台重连）：直接按当前状态幂等应答，不再弹窗。
+///   pending → `{status:"pending"}`；已接收 → 200 + tokens；拒绝 → 403 declined；超 5 分钟 → 403 timeout。
+fn handle_prepare_upload_poll(
+    app: &AppHandle,
+    state: &LanState,
+    request: tiny_http::Request,
+    req: PrepareUploadRequest,
+    is_baibao: bool,
+) {
+    let offer_id = req.offer_id.clone().unwrap_or_default();
+
+    enum Reply {
+        Pending(String),
+        Accepted(String, HashMap<String, String>),
+        Declined,
+        Timeout(String),
+    }
+
+    let reply = {
+        let mut g = state.0.lock().unwrap();
+        if let Some(off) = g.offers.get(&offer_id) {
+            // 已有此 offer：按当前状态幂等应答（不重复弹窗）
+            let sid = off.session_id.clone();
+            let r = match &off.state {
+                OfferState::Accepted(tokens) => Reply::Accepted(sid.clone(), tokens.clone()),
+                OfferState::Declined => Reply::Declined,
+                OfferState::Pending if off.created.elapsed() >= Duration::from_secs(300) => {
+                    Reply::Timeout(sid.clone())
+                }
+                OfferState::Pending => Reply::Pending(sid.clone()),
+            };
+            // 终态（拒绝/超时）：清理掉，后续重试不会再命中
+            if matches!(r, Reply::Declined | Reply::Timeout(_)) {
+                g.offers.remove(&offer_id);
+            }
+            r
+        } else {
+            // 新 offer：建状态 + 弹一次确认框
+            let session_id = rand_hex(12);
+            g.offers.insert(
+                offer_id.clone(),
+                Offer {
+                    created: Instant::now(),
+                    session_id: session_id.clone(),
+                    peer: req.info.fingerprint.clone(),
+                    files: req.files.clone(),
+                    state: OfferState::Pending,
+                },
+            );
+            drop(g);
+            let files_for_ui: Vec<&FileMeta> = req.files.values().collect();
+            let _ = app.emit(
+                "lan://incoming",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "alias": req.info.alias,
+                    "fingerprint": req.info.fingerprint,
+                    "isBaibao": is_baibao,
+                    "files": files_for_ui,
+                }),
+            );
+            Reply::Pending(session_id)
+        }
+    };
+
+    match reply {
+        Reply::Pending(sid) => respond_json(
+            request,
+            200,
+            &serde_json::json!({ "status": "pending", "sessionId": sid }),
+        ),
+        Reply::Accepted(session_id, files) => {
+            respond_json(request, 200, &PrepareUploadResponse { session_id, files })
+        }
+        Reply::Declined => respond_text(request, 403, "declined"),
+        Reply::Timeout(sid) => {
+            let _ = app.emit("lan://offer-timeout", serde_json::json!({ "sessionId": sid }));
+            respond_text(request, 403, "timeout")
+        }
+    }
 }
 
 /// 部分文件存放目录（断点续传用），完成后再移动到接收目录。
@@ -3102,6 +3251,58 @@ pub fn lan_respond(
     accept: bool,
     file_ids: Vec<String>,
 ) -> Result<(), String> {
+    // 优先处理抗抖动握手的 offer（按 sessionId 反查 offerId）：把决定写进 offer 状态，
+    // 由发送端的下一次轮询取走——这样即使确认时发送端那条连接正巧断着，重连后也能拿到结果。
+    {
+        let mut g = state.0.lock().unwrap();
+        let oid = g
+            .offers
+            .iter()
+            .find(|(_, o)| o.session_id == session_id)
+            .map(|(k, _)| k.clone());
+        if let Some(oid) = oid {
+            if !accept {
+                if let Some(o) = g.offers.get_mut(&oid) {
+                    o.state = OfferState::Declined;
+                }
+                return Ok(());
+            }
+            // 接收：为选中的文件生成 token，写入 sessions，再把 offer 标记为已接收
+            let (peer, files, sid) = {
+                let o = g.offers.get(&oid).unwrap();
+                (o.peer.clone(), o.files.clone(), o.session_id.clone())
+            };
+            let mut tokens = HashMap::new();
+            let mut slots = HashMap::new();
+            for (fid, meta) in &files {
+                if file_ids.is_empty() || file_ids.contains(fid) {
+                    let token = rand_hex(12);
+                    tokens.insert(fid.clone(), token.clone());
+                    slots.insert(
+                        fid.clone(),
+                        FileSlot {
+                            token,
+                            file_name: meta.file_name.clone(),
+                            size: meta.size,
+                            sha256: meta.sha256.clone(),
+                        },
+                    );
+                }
+            }
+            if slots.is_empty() {
+                if let Some(o) = g.offers.get_mut(&oid) {
+                    o.state = OfferState::Declined;
+                }
+                return Ok(());
+            }
+            g.sessions.insert(sid, Session { peer, files: slots });
+            if let Some(o) = g.offers.get_mut(&oid) {
+                o.state = OfferState::Accepted(tokens);
+            }
+            return Ok(());
+        }
+    }
+    // 否则走旧的阻塞式 decisions 通道（LocalSend 兼容 / 旧版）
     let tx = state
         .0
         .lock()
@@ -4518,20 +4719,59 @@ fn send_one_file_inner(
     let mut files = serde_json::Map::new();
     files.insert(id.to_string(), fj);
 
-    // 握手：prepare-upload
-    let prep = client
-        .post(format!("{base}/api/localsend/v2/prepare-upload"))
-        .json(&serde_json::json!({ "info": info, "files": files }))
-        .send()
-        .map_err(|_| "无法连接对方".to_string())?;
-    let status = prep.status();
-    if status == reqwest::StatusCode::FORBIDDEN {
-        return Err("对方拒绝接收".to_string());
-    }
-    if !status.is_success() {
-        return Err(format!("对方未接受（{status}）"));
-    }
-    let resp: PrepareUploadResponse = prep.json().map_err(|_| "握手响应异常".to_string())?;
+    // 握手：prepare-upload（抗网络抖动）。带稳定 offerId，对端「立即」应答而非挂起连接：
+    // 对方还没点「接收」时返回 pending，下面就每 2 秒轮询一次；用户点「接收」后才返回 token。
+    // 等待期间若网络瞬断/抖动，.send() 出错也不判失败——歇 2 秒在后台重连重试，同一 offerId
+    // 在接收端是幂等的：既不会重复弹「点击接收」，也不会因一次抖动就丢掉这次发送请求。
+    // 直到对方接收 / 拒绝 / 满 5 分钟超时。（真正的大文件上传另有断点续传重试，见下方循环。）
+    let offer_id = rand_hex(12);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let resp: PrepareUploadResponse = loop {
+        // 等待期间用户撤销了发送
+        if state.is_send_cancelled(id) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("对方 5 分钟未接收，已超时".to_string());
+        }
+        let reply = client
+            .post(format!("{base}/api/localsend/v2/prepare-upload"))
+            .timeout(Duration::from_secs(15))
+            .json(&serde_json::json!({ "info": info, "files": files, "offerId": offer_id }))
+            .send();
+        let reply = match reply {
+            Ok(r) => r,
+            // 网络抖动/瞬断：歇 2 秒后台重连重试，不报错、不打扰用户
+            Err(_) => {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        let status = reply.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            // 403：拒绝 or 接收端 5 分钟超时（见 handle_prepare_upload_poll），用响应体区分
+            let timed_out = reply.text().map(|b| b.contains("timeout")).unwrap_or(false);
+            return Err(if timed_out {
+                "对方 5 分钟未接收，已超时".to_string()
+            } else {
+                "对方拒绝接收".to_string()
+            });
+        }
+        if !status.is_success() {
+            return Err(format!("对方未接受（{status}）"));
+        }
+        let body: PrepareUploadReply = reply.json().map_err(|_| "握手响应异常".to_string())?;
+        // 对方还没点「接收」：等 2 秒再轮询（offerId 幂等，接收端不会重复弹窗）
+        if body.status.as_deref() == Some("pending") {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        // 已接受
+        break PrepareUploadResponse {
+            session_id: body.session_id,
+            files: body.files,
+        };
+    };
 
     let Some(token) = resp.files.get(id) else {
         return Err("对方未接受此文件".to_string());
