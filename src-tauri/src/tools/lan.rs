@@ -1342,6 +1342,11 @@ fn handle_request(app: AppHandle, state: LanState, mut request: tiny_http::Reque
             respond_text(request, 200, "ok");
             Ok(())
         }
+        // 发送方在对方接收前撤销发送：撤回接收端的「待接收」，使其无法再点「接收」。
+        ("POST", "/api/baibao/v1/cancel-offer") => {
+            handle_cancel_offer(&app, &state, request);
+            Ok(())
+        }
         _ => {
             respond_text(request, 404, "not found");
             Ok(())
@@ -2246,6 +2251,37 @@ fn handle_prepare_upload_poll(
             respond_text(request, 403, "timeout")
         }
     }
+}
+
+/// 发送方撤销发送（对方还没点「接收」时）：按 offerId 撤回该待接收 offer。
+/// offerId 是发送方生成的 12 位随机串，等同于一次性能力令牌——知道它即有权撤销，无需额外鉴权。
+/// 移除该 offer（及竞态下已生成的 session），并通知接收端把对应「待接收」标记为已取消。
+fn handle_cancel_offer(app: &AppHandle, state: &LanState, mut request: tiny_http::Request) {
+    #[derive(Deserialize)]
+    struct CancelOfferReq {
+        #[serde(rename = "offerId")]
+        offer_id: String,
+    }
+    let req: CancelOfferReq = match read_json(&mut request) {
+        Ok(v) => v,
+        Err(_) => return respond_text(request, 400, "bad request"),
+    };
+    let sid = {
+        let mut g = state.0.lock().unwrap();
+        match g.offers.remove(&req.offer_id) {
+            Some(off) => {
+                // 若在并发竞态下对方刚好已接收：把生成的会话也清掉，使后续 upload 无 token 可用
+                g.sessions.remove(&off.session_id);
+                Some(off.session_id)
+            }
+            None => None,
+        }
+    };
+    if let Some(sid) = sid {
+        // 通知接收端把这些「待接收」标记为已取消并移除（无法再点「接收」/已接收的也归为取消）
+        let _ = app.emit("lan://offer-cancelled", serde_json::json!({ "sessionId": sid }));
+    }
+    respond_text(request, 200, "ok");
 }
 
 /// 部分文件存放目录（断点续传用），完成后再移动到接收目录。
@@ -4827,8 +4863,13 @@ fn send_one_file_inner(
     let offer_id = rand_hex(12);
     let deadline = Instant::now() + Duration::from_secs(300);
     let resp: PrepareUploadResponse = loop {
-        // 等待期间用户撤销了发送
+        // 等待期间用户撤销了发送：通知接收端撤回「待接收」，否则对方仍能点「接收」
         if state.is_send_cancelled(id) {
+            let _ = client
+                .post(format!("{base}/api/baibao/v1/cancel-offer"))
+                .timeout(Duration::from_secs(5))
+                .json(&serde_json::json!({ "offerId": offer_id }))
+                .send();
             return Ok(());
         }
         if Instant::now() >= deadline {

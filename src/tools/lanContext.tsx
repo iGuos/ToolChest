@@ -578,6 +578,21 @@ export function LanProvider({ children }: { children: ReactNode }) {
           }
         })
       );
+      // 发送方在我接收前撤销了发送：把对应「待接收」标记为已取消并移除（与超时同样处理）
+      track(
+        await listen<{ sessionId: string }>("lan://offer-cancelled", (e) => {
+          const sid = e.payload.sessionId;
+          const inc = offersRef.current[sid];
+          if (inc) {
+            for (const f of inc.files) {
+              upsertFile({ id: fileKey("in", sid, f.id), status: "cancelled" });
+            }
+            const next = { ...offersRef.current };
+            delete next[sid];
+            offersRef.current = next;
+          }
+        })
+      );
       track(
         await listen<{ fingerprint: string; alias: string; text: string; id?: string | null }>("lan://message", (e) => {
           const m = e.payload;
