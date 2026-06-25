@@ -10,7 +10,7 @@ import LanIncomingModal from "./tools/LanIncomingModal";
 import DeepSeek from "./tools/DeepSeekTab";
 import ProxyTool from "./tools/ProxyTool";
 import { useLan } from "./tools/lanContext";
-import { useEscToClose, useDragReorder } from "./hooks";
+import { useEscToClose, useDragReorder, IS_MOBILE } from "./hooks";
 import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
 
 type Platform = "macos" | "windows" | "linux";
@@ -29,6 +29,7 @@ const PLATFORM: Platform = /Windows/i.test(navigator.userAgent)
   : "linux";
 const PLATFORM_LABEL: Record<Platform, string> = { macos: "macOS", windows: "Windows", linux: "Linux" };
 const toolSupported = (t: ToolMeta) => !t.platforms || t.platforms.includes(PLATFORM);
+
 
 const HOME_ID = "home";
 
@@ -148,7 +149,53 @@ function renderTool(
   }
 }
 
+// ── 移动端外壳（iOS/Android）：只保留「局域网互传」「请求代理」，底部切换 ──
+const MOBILE_TABS = [
+  { id: "lan-share", name: "局域网互传", icon: "📡" },
+  { id: "proxy", name: "请求代理", icon: "🔀" },
+] as const;
+
+function MobileApp() {
+  const { totalUnread } = useLan();
+  const [tab, setTab] = useState<string>("lan-share");
+  // 移动端固定深色背景（与桌面默认一致）
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = "dark";
+    root.style.background = "#1e1e1e";
+  }, []);
+  return (
+    <div className="mobile-app">
+      <div className="mobile-body">
+        <div className={`mobile-pane${tab === "lan-share" ? "" : " hidden"}`}>
+          <LanShare />
+        </div>
+        <div className={`mobile-pane${tab === "proxy" ? "" : " hidden"}`}>
+          <ProxyTool />
+        </div>
+      </div>
+      <nav className="mobile-nav">
+        {MOBILE_TABS.map((t) => (
+          <button
+            key={t.id}
+            className={`mobile-nav-btn${tab === t.id ? " active" : ""}`}
+            onClick={() => setTab(t.id)}
+          >
+            <span className="mobile-nav-icon">{t.icon}</span>
+            <span className="mobile-nav-name">{t.name}</span>
+            {t.id === "lan-share" && totalUnread > 0 && (
+              <span className="lan-badge nav">{totalUnread}</span>
+            )}
+          </button>
+        ))}
+      </nav>
+      <LanIncomingModal />
+    </div>
+  );
+}
+
 export default function App() {
+  if (IS_MOBILE) return <MobileApp />;
   const { totalUnread } = useLan(); // 局域网未读消息总数（用于侧栏红点）
   // 已打开的 tab（首页恒常驻，不可关闭）与当前激活的 tab
   const [openTabs, setOpenTabs] = useState<string[]>([HOME_ID]);

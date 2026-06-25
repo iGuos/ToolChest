@@ -40,6 +40,7 @@ pub async fn open_deepseek(
     if let Some(w) = app.get_webview_window(&label) {
         if w.is_visible().unwrap_or(true) {
             let _ = w.show();
+            #[cfg(desktop)]
             let _ = w.unminimize();
             let _ = w.set_focus();
         }
@@ -54,7 +55,11 @@ pub async fn open_deepseek(
     if let (Some(x), Some(y)) = (x, y) {
         builder = builder.position(x, y);
     } else {
-        builder = builder.center();
+        // center() 仅桌面有；移动端不居中（也不会用到此命令）
+        #[cfg(desktop)]
+        {
+            builder = builder.center();
+        }
     }
     if let Some(c) = bg.as_deref().and_then(parse_hex_color) {
         builder = builder.background_color(c); // 同时作用于窗口和 webview，盖住首帧白屏

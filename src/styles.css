@@ -41,7 +41,11 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* 显式带上中文与 emoji 字体：iOS WKWebView 不会像 Safari 那样自动级联到 PingFang，
+     缺了会把中文/emoji 渲染成 .notdef「?」方块。 */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif, "Apple Color Emoji",
+    "Segoe UI Emoji";
   background: var(--bg);
   color: var(--text);
   font-size: 13px;
@@ -3467,3 +3471,157 @@ tr:hover td { background: #28282c; }
 }
 .group-item:hover .group-del { opacity: 1; }
 .group-del:hover { background: var(--red); color: #fff; }
+
+/* ── 移动端外壳（iOS/Android）：底部两 Tab，只含局域网互传 / 请求代理 ── */
+.mobile-app {
+  /* #root 是 display:flex（行），必须 flex:1 撑满整屏宽，否则按内容收缩成左侧窄条 */
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  background: var(--bg, #1e1e1e);
+  padding-top: env(safe-area-inset-top);
+}
+.mobile-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+.mobile-pane {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.mobile-pane.hidden {
+  display: none;
+}
+.mobile-nav {
+  display: flex;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.mobile-nav-btn {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 0 6px;
+  background: none;
+  border: none;
+  color: var(--text-dim, #8a8a8a);
+  cursor: pointer;
+}
+.mobile-nav-btn.active {
+  color: var(--accent, #1f6feb);
+}
+.mobile-nav-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+.mobile-nav-name {
+  font-size: 11px;
+}
+.mobile-nav-btn .lan-badge.nav {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  margin-left: 6px;
+}
+
+/* ── 移动端工具适配：桌面多栏 → 单列/主从（仅 .mobile-app 内生效） ── */
+/* 返回按钮默认隐藏，仅移动端聊天页显示 */
+.lan-back { display: none; }
+
+/* 请求代理：表单全宽、可纵向滚动 */
+.mobile-app .proxy-tool-body {
+  max-width: none;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px;
+}
+
+/* 局域网互传：设备列表 ↔ 聊天 主从切换 */
+.mobile-app .lan-body {
+  display: block;
+  position: relative;
+}
+.mobile-app .lan-peers {
+  width: 100%;
+  height: 100%;
+  border-right: none;
+  box-sizing: border-box;
+}
+.mobile-app .lan-main {
+  height: 100%;
+}
+.mobile-app .lan-body:not(.has-sel) .lan-main {
+  display: none; /* 没选设备：只看列表 */
+}
+.mobile-app .lan-body.has-sel .lan-peers {
+  display: none; /* 选了设备：只看聊天 */
+}
+.mobile-app .lan-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+/* 顶部标题栏在窄屏收紧 padding */
+.mobile-app .tool-header {
+  padding: 10px 14px;
+}
+
+/* ── 移动端原生化交互 + 头部松绑 ── */
+/* 禁止双击/捏合缩放，去除点按高亮、滚动回弹，贴近原生 App 手感 */
+html { -webkit-text-size-adjust: 100%; }
+.mobile-app, .mobile-app * { -webkit-tap-highlight-color: transparent; }
+.mobile-app { touch-action: manipulation; overscroll-behavior: none; }
+.mobile-app .mobile-pane { overscroll-behavior: contain; }
+
+/* 局域网互传头部：手机上竖向堆叠，标题不再被挤到换行 */
+.mobile-app .tool-header {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.mobile-app .lan-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mobile-app .lan-title-row h2 {
+  white-space: nowrap;
+}
+.mobile-app .lan-status-inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+.mobile-app .lan-gear {
+  margin-left: auto;
+}
+/* 列表/卡片在手机上给足点按高度与间距 */
+.mobile-app .lan-peer {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}

@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState, type MutableRefObject, type PointerEvent } from "react";
 
+// 是否移动端（iOS/Android）。优先用「主指针为触摸(coarse)」，不依赖 UA。
+export const IS_MOBILE =
+  (typeof window !== "undefined" &&
+    (window.matchMedia?.("(pointer: coarse)").matches ||
+      /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+      navigator.maxTouchPoints > 1)) ||
+  false;
+
 /**
  * 弹框统一交互：按 Esc 关闭。
  * 配合「点遮罩层不关闭，只认 × 和 Esc」的约定使用——遮罩层不再绑定关闭点击。

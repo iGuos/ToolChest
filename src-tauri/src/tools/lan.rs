@@ -436,8 +436,10 @@ struct LanConfig {
 }
 
 fn config_path() -> Option<PathBuf> {
-    // 跨平台配置位置：macOS 用 Application Support，Windows 用 %APPDATA%，其余用 ~/.config
-    #[cfg(target_os = "macos")]
+    // 跨平台配置位置：macOS/iOS 用 Application Support，Windows 用 %APPDATA%，其余用 ~/.config。
+    // iOS 沙盒只有 Library/、Documents/、tmp/ 可写；写到容器根的 ~/.config 会失败，
+    // 导致证书每次启动都重新生成 → 设备指纹变化 → 每次重启都被当成新设备。故 iOS 也走 Library。
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let home = std::env::var("HOME").ok()?;
         Some(PathBuf::from(home).join("Library/Application Support/com.baibao.toolbox/lan.json"))
@@ -447,7 +449,7 @@ fn config_path() -> Option<PathBuf> {
         let base = std::env::var("APPDATA").ok()?;
         Some(PathBuf::from(base).join("com.baibao.toolbox").join("lan.json"))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
     {
         let home = std::env::var("HOME").ok()?;
         Some(PathBuf::from(home).join(".config/com.baibao.toolbox/lan.json"))
@@ -3447,20 +3449,30 @@ pub async fn lan_pick_files(app: AppHandle) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub async fn lan_pick_dir(app: AppHandle) -> Result<Option<String>, String> {
-    // 原生跨平台目录选择器：选「接收文件的保存目录」。
-    tauri::async_runtime::spawn_blocking(move || {
-        let picked = app
-            .dialog()
-            .file()
-            .set_title("选择接收文件的保存目录")
-            .blocking_pick_folder();
-        Ok(picked
-            .and_then(|fp| fp.into_path().ok())
-            .map(|p| p.to_string_lossy().into_owned()))
-    })
-    .await
-    .map_err(|e| format!("任务调度失败：{e}"))?
+    // 原生目录选择器：选「接收文件的保存目录」。blocking_pick_folder 仅桌面有；
+    // 移动端无系统目录选择器（走 SAF/文件 App），此命令暂不支持。
+    #[cfg(desktop)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("选择接收文件的保存目录")
+                .blocking_pick_folder();
+            Ok(picked
+                .and_then(|fp| fp.into_path().ok())
+                .map(|p| p.to_string_lossy().into_owned()))
+        })
+        .await
+        .map_err(|e| format!("任务调度失败：{e}"))?
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Err("移动端暂不支持选择目录".into())
+    }
 }
+
 
 #[tauri::command]
 pub async fn lan_reveal(app: AppHandle, path: String) -> Result<(), String> {

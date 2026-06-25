@@ -967,7 +967,7 @@ export default function LanShare() {
         </div>
       )}
 
-      <div className="lan-body" ref={bodyRef}>
+      <div className={`lan-body${selectedPeer ? " has-sel" : ""}`} ref={bodyRef}>
         <div className="lan-peers">
           <div className="lan-section-title">
             设备（{peers.length}）
@@ -1067,6 +1067,14 @@ export default function LanShare() {
           ) : (
             <>
               <div className="lan-chat-head">
+                <button
+                  className="lan-back"
+                  onClick={() => setSelected(null)}
+                  aria-label="返回设备列表"
+                  title="返回设备列表"
+                >
+                  ←
+                </button>
                 {selectedPeer.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
                 <b>{selectedPeer.remark || selectedPeer.alias}</b>
                 <span className="dim">{selectedPeer.remark ? selectedPeer.alias : selectedPeer.ip}</span>

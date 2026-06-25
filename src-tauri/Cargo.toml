@@ -13,10 +13,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
-tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip", "rustls-tls", "json"] }
@@ -35,6 +34,13 @@ chacha20poly1305 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+
+# 桌面专属：系统托盘 + 开机自启（iOS/Android 无此概念）。
+# 注意：cargo 不认识 Tauri 的 `desktop` cfg，依赖筛选必须用真实 target_os。
+# tauri 的特性按平台合并：桌面 = [] ∪ [tray-icon]，移动端 = []。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
 
 [profile.release]
 panic = "abort"

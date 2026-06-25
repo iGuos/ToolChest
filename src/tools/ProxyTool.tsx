@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useLan } from "./lanContext";
+import { IS_MOBILE } from "../hooks";
 
 type NetIface = { name: string; ip: string; cidr: string; isVpn: boolean };
 type OverlayRoute = { dest: string; gateway: string; iface: string };
@@ -691,25 +692,30 @@ export default function ProxyTool() {
           </div>
         ) : (
           <div className={`proxy-card${busy ? " card-busy" : ""}`}>
-            <div className="proxy-label">选择角色</div>
-            <div className="proxy-seg">
-              <button
-                type="button"
-                className={`proxy-seg-item${mode === "server" ? " active" : ""}`}
-                onClick={() => switchMode("server")}
-              >
-                <b>服务端</b>
-                <span className="dim">出口 · 本机已联 VPN</span>
-              </button>
-              <button
-                type="button"
-                className={`proxy-seg-item${mode === "client" ? " active" : ""}`}
-                onClick={() => switchMode("client")}
-              >
-                <b>客户端</b>
-                <span className="dim">本地代理入口</span>
-              </button>
-            </div>
+            {/* 手机端只作服务端（出口节点），不显示角色切换 */}
+            {!IS_MOBILE && (
+              <>
+                <div className="proxy-label">选择角色</div>
+                <div className="proxy-seg">
+                  <button
+                    type="button"
+                    className={`proxy-seg-item${mode === "server" ? " active" : ""}`}
+                    onClick={() => switchMode("server")}
+                  >
+                    <b>服务端</b>
+                    <span className="dim">出口 · 本机已联 VPN</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`proxy-seg-item${mode === "client" ? " active" : ""}`}
+                    onClick={() => switchMode("client")}
+                  >
+                    <b>客户端</b>
+                    <span className="dim">本地代理入口</span>
+                  </button>
+                </div>
+              </>
+            )}
 
             {mode === "client" && (
               <>
