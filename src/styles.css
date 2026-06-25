@@ -374,6 +374,10 @@ select { cursor: pointer; }
   font-size: 11px;
   line-height: 1.6;
 }
+.lan-netiface-scan.ok {
+  color: var(--ok, #2ea043);
+  border-color: var(--ok, #2ea043);
+}
 /* 扫描进度弹框：叠在设置弹框之上 */
 .lan-scan-overlay {
   z-index: 400;
@@ -879,6 +883,9 @@ select { cursor: pointer; }
   border-top: 1px dashed var(--border);
 }
 .lan-overlay-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-size: 12px;
   margin-bottom: 6px;
 }
@@ -1230,6 +1237,30 @@ select { cursor: pointer; }
   margin: 0;
   font-size: 12.5px;
   color: var(--text);
+}
+/* 主界面「内网网段」固定展示文本（取代原下拉选择） */
+.proxy-fixed {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--bg-elev, rgba(127, 127, 127, 0.08));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+/* 配置弹框里「发现的设备」可点选行 */
+.proxy-dev-pick {
+  cursor: pointer;
+}
+.proxy-dev-pick:hover {
+  background: var(--bg-elev, rgba(127, 127, 127, 0.14));
+}
+.proxy-dev-pick.active {
+  outline: 1px solid var(--accent, #1f6feb);
+  outline-offset: -1px; /* 描边画到内侧，避免首/末行被滚动容器边缘裁掉 */
 }
 /* 客户端代理生效方式（系统代理 / 指定应用） */
 .proxy-apply {

@@ -1,103 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useLan } from "./lanContext";
 
-type Opt = { value: string; label: string; online?: boolean };
-
-// 跟随主题的自定义下拉（替代原生 select，原生在深色主题下样式不可控）。
-// 支持键盘上下键导航 + 回车选择 + Esc 关闭，并可显示在线状态小圆点。
-function Dropdown({
-  value,
-  options,
-  placeholder,
-  emptyHint,
-  onChange,
-}: {
-  value: string;
-  options: Opt[];
-  placeholder: string;
-  emptyHint?: string;
-  onChange: (v: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(-1); // 键盘高亮项索引
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
-  // 打开时把高亮定位到当前选中项
-  useEffect(() => {
-    if (open) setActive(Math.max(0, options.findIndex((o) => o.value === value)));
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const sel = options.find((o) => o.value === value);
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") return setOpen(false);
-    if (!open && (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ")) {
-      e.preventDefault();
-      return setOpen(true);
-    }
-    if (!open) return;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setActive((i) => Math.min(options.length - 1, i + 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setActive((i) => Math.max(0, i - 1));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const o = options[active];
-      if (o) {
-        onChange(o.value);
-        setOpen(false);
-      }
-    }
-  };
-  return (
-    <div className={`dropdown${open ? " open" : ""}`} ref={ref}>
-      <button type="button" className="dropdown-btn" onClick={() => setOpen((o) => !o)} onKeyDown={onKey}>
-        <span className={sel ? "dropdown-val" : "dim"}>
-          {sel && sel.online !== undefined && (
-            <span className={`peer-dot${sel.online ? " on" : ""}`} />
-          )}
-          {sel ? sel.label : placeholder}
-        </span>
-        <svg className="dropdown-caret" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="6 9 12 15 18 9" />
-        </svg>
-      </button>
-      {open && (
-        <div className="dropdown-menu">
-          {options.length === 0 ? (
-            <div className="dropdown-empty dim">{emptyHint ?? "暂无选项"}</div>
-          ) : (
-            options.map((o, i) => (
-              <button
-                type="button"
-                key={o.value}
-                className={`dropdown-item${o.value === value ? " sel" : ""}${i === active ? " active" : ""}`}
-                onMouseEnter={() => setActive(i)}
-                onClick={() => {
-                  onChange(o.value);
-                  setOpen(false);
-                }}
-              >
-                {o.online !== undefined && <span className={`peer-dot${o.online ? " on" : ""}`} />}
-                {o.label}
-              </button>
-            ))
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
+type NetIface = { name: string; ip: string; cidr: string; isVpn: boolean };
+type OverlayRoute = { dest: string; gateway: string; iface: string };
 
 // 可点击复制的代码块：点一下复制内容，并就地闪现「已复制」。
 function Copyable({ text, title }: { text: string; title?: string }) {
@@ -197,7 +104,7 @@ function loadPwStore(): PwStore {
 
 // 请求代理（独立功能）：让没装 VPN 的设备经另一台「已联 VPN」的设备访问内网。
 export default function ProxyTool() {
-  const { peers } = useLan();
+  const { peers, addPeerByIp } = useLan();
   const pwStore = useRef<PwStore>(loadPwStore());
   const [proxy, setProxy] = useState<ProxyStatus>({ role: 0, socksPort: 0, httpPort: 0, port: 0, conns: 0, bytes: 0 });
   const [serverView, setServerView] = useState<"traffic" | "hosts">("traffic"); // 服务端视图：流量折线 / 访问网址
@@ -208,15 +115,27 @@ export default function ProxyTool() {
   const [pw, setPw] = useState(() => pwStore.current.server); // 默认服务端，回填上次服务端密码
   const [port, setPort] = useState("53318");
   const [serverFp, setServerFp] = useState("");
+  const [chosenIp, setChosenIp] = useState(""); // 指定走的服务端 IP（同设备多网段时选其一）
   const [src, setSrc] = useState<"lan" | "custom">("lan"); // 客户端找服务端的方式：内网网段 / 自定义 IP
-  const [subnets, setSubnets] = useState<Opt[]>([]); // 本机网卡推导出的可选 /24 网段
-  const [subnet, setSubnet] = useState(""); // 选中的网段前缀，如 192.168.1
+  const [ifaces, setIfaces] = useState<NetIface[]>([]); // 本机所有网段（配置弹框里展示+逐段扫描）
+  const [routes, setRoutes] = useState<OverlayRoute[]>([]); // 经隧道可达的组网地址
   const [subnetRefreshing, setSubnetRefreshing] = useState(false); // 网段刷新动效
+  const [cfgOpen, setCfgOpen] = useState(false); // 内网网段配置弹框
+  // 扫描进度弹框（与局域网互传一致）：title/done/total/phase/found/prefix
+  type ScanState = {
+    title: string;
+    done: number;
+    total: number;
+    phase: "running" | "done" | "cancelled";
+    found: number;
+  };
+  const [scan, setScan] = useState<ScanState | null>(null);
+  const scanCancelled = useRef(false);
+  // 组网地址直连探测状态
+  const [overlayProbe, setOverlayProbe] = useState<Record<string, "probing" | "ok" | "fail">>({});
   const [customIp, setCustomIp] = useState(""); // 自定义服务端 IP
   const [wantIp, setWantIp] = useState(""); // 自定义探测中：待回填 fingerprint 的 IP
   const [busy, setBusy] = useState(false);
-  const [scanning, setScanning] = useState(false);
-  const [scanProg, setScanProg] = useState<{ done: number; total: number } | null>(null);
   const [msg, setMsg] = useState<Msg | null>(null);
   const [shake, setShake] = useState(0); // 自增触发错误提示抖动动画
   const [pwVisible, setPwVisible] = useState(false);
@@ -262,9 +181,10 @@ export default function ProxyTool() {
   const savedPw = (m: "server" | "client", fp: string) =>
     m === "server" ? pwStore.current.server : fp ? pwStore.current.client[fp] ?? "" : "";
 
-  // 选择服务端设备：回填该服务端上次用过的密码
-  const selectServer = (fp: string) => {
+  // 选择服务端设备（指定走哪个 IP）：回填该服务端上次用过的密码
+  const selectServer = (fp: string, ip?: string) => {
     setServerFp(fp);
+    setChosenIp(ip ?? "");
     setPw(savedPw("client", fp));
   };
 
@@ -334,32 +254,27 @@ export default function ProxyTool() {
     return () => window.clearInterval(t);
   }, [proxy.role, serverView]);
 
-  // 扫描进度事件
+  // 扫描进度事件：仅在扫描进行中更新进度弹框的 done/total
   useEffect(() => {
     let un: (() => void) | undefined;
-    listen<{ done: number; total: number }>("lan://scan-progress", (e) => setScanProg(e.payload)).then((u) => (un = u));
+    listen<{ done: number; total: number }>("lan://scan-progress", (e) => {
+      setScan((s) => (s && s.phase === "running" ? { ...s, done: e.payload.done, total: e.payload.total } : s));
+    }).then((u) => (un = u));
     return () => un?.();
   }, []);
 
-  // 载入本机网卡，推导可选 /24 网段（按前缀去重；VPN/虚拟网卡标注）。
-  // 抽成可重复调用：VPN/网络切换后网段会变，需支持「刷新」拉到最新。
+  // 载入本机所有网段 + 组网可达地址。VPN/网络切换后会变，支持「刷新」拉最新。
   // syscall 极快，至少转 0.6s 让刷新动效可见。
   const loadSubnets = useCallback(async () => {
     setSubnetRefreshing(true);
     const started = Date.now();
     try {
-      const ifs = await invoke<{ ip: string; name: string; isVpn: boolean }[]>("lan_interfaces");
-      const seen = new Set<string>();
-      const opts: Opt[] = [];
-      for (const i of ifs) {
-        const p = i.ip.split(".").slice(0, 3).join(".");
-        if (seen.has(p)) continue;
-        seen.add(p);
-        opts.push({ value: p, label: `${p}.x（${i.isVpn ? "VPN/虚拟" : i.name}）` });
-      }
-      setSubnets(opts);
-      // 选中项已消失（如对应网卡被关掉）则回退到第一项，否则保留用户的选择
-      setSubnet((cur) => (cur && opts.some((o) => o.value === cur) ? cur : opts[0]?.value ?? ""));
+      const [ifs, rts] = await Promise.all([
+        invoke<NetIface[]>("lan_interfaces"),
+        invoke<OverlayRoute[]>("lan_overlay_routes").catch(() => [] as OverlayRoute[]),
+      ]);
+      setIfaces(ifs);
+      setRoutes(rts);
     } catch {
       /* ignore */
     } finally {
@@ -377,33 +292,53 @@ export default function ProxyTool() {
     const p = peers.find((x) => x.ip === wantIp);
     if (p) {
       setServerFp(p.fingerprint);
+      setChosenIp(wantIp); // 自定义 IP：就走用户填的这个地址
       // 自定义探测：保留已输入的密码；为空则回填该服务端上次用过的
       setPw((cur) => cur || (pwStore.current.client[p.fingerprint] ?? ""));
       setWantIp("");
     }
   }, [peers, wantIp]);
 
-  // 只扫选中的那个 /24 网段，避免全量扫描的压力
-  const scan = async () => {
-    if (scanning || !subnet) return;
-    setScanning(true);
-    setScanProg(null);
-    setMsg(null);
+  // 扫描指定网段（按真实掩码整段扫，CIDR 形如 192.168.56.0/22）→ 弹进度条弹框，支持中断。
+  // 找到的设备进入「发现的设备」。
+  const scanCidr = async (cidr: string) => {
+    if (scan?.phase === "running") return;
+    scanCancelled.current = false;
+    setScan({ title: `扫描网段 ${cidr}`, done: 0, total: 0, phase: "running", found: 0 });
     try {
-      const n = await invoke<number>("lan_scan_subnet", { prefix: subnet });
-      show(n > 0 ? `扫描完成，本网段发现 ${n} 台设备` : "扫描完成，本网段未发现设备", n > 0 ? "ok" : "info");
+      const n = await invoke<number>("lan_scan_subnet", { prefix: cidr });
+      setScan((s) => (s ? { ...s, phase: scanCancelled.current ? "cancelled" : "done", found: n } : s));
     } catch (e) {
+      setScan(null);
       fail(`扫描失败：${String(e)}`);
-    } finally {
-      setScanning(false);
-      setScanProg(null);
     }
   };
+  const cancelScan = () => {
+    scanCancelled.current = true;
+    invoke("lan_scan_cancel").catch(() => {});
+  };
+
+  // 组网地址：不在本机网卡、走隧道路由，扫描/多播都覆盖不到，只能逐个直连探测（复用 lan_add_peer）。
+  const isHostAddr = (dest: string) => !dest.includes("/");
+  const overlayHosts = useMemo(() => routes.filter((r) => isHostAddr(r.dest)), [routes]);
+  const probeOverlay = async (ip: string) => {
+    if (overlayProbe[ip] === "probing") return;
+    setOverlayProbe((m) => ({ ...m, [ip]: "probing" }));
+    try {
+      await addPeerByIp(ip);
+      setOverlayProbe((m) => ({ ...m, [ip]: "ok" }));
+    } catch {
+      setOverlayProbe((m) => ({ ...m, [ip]: "fail" }));
+    }
+  };
+  const probeAllOverlay = () => Promise.all(overlayHosts.map((r) => probeOverlay(r.dest)));
+  const overlayAnyProbing = Object.values(overlayProbe).some((v) => v === "probing");
 
   // 切换「来源」：清掉已选服务端，避免跨来源串台
   const switchSrc = (s: "lan" | "custom") => {
     setSrc(s);
     setServerFp("");
+    setChosenIp("");
     setWantIp("");
     setMsg(null);
   };
@@ -439,9 +374,10 @@ export default function ProxyTool() {
         await refresh();
         show(`服务端已开启 · 隧道端口 ${portNum}，把访问密码告诉客户端即可`, "ok");
       } else {
-        // 客户端先做连通性自检（可达 + 证书匹配 + 密码正确），不通不开启
-        await invoke("lan_proxy_test", { fingerprint: serverFp, password: pw, port: portNum });
-        const sp = await invoke<number>("lan_proxy_start_client", { fingerprint: serverFp, password: pw, port: portNum });
+        // 客户端先做连通性自检（可达 + 证书匹配 + 密码正确），不通不开启。ip 指定走选定网段。
+        const ipArg = chosenIp || null;
+        await invoke("lan_proxy_test", { fingerprint: serverFp, password: pw, port: portNum, ip: ipArg });
+        const sp = await invoke<number>("lan_proxy_start_client", { fingerprint: serverFp, password: pw, port: portNum, ip: ipArg });
         await refresh();
         show(`已连接服务端 · 本地 SOCKS5 127.0.0.1:${sp}`, "ok");
       }
@@ -551,13 +487,8 @@ export default function ProxyTool() {
     }
   };
 
-  // 列出所有已发现/已知设备（不按网段过滤：多归属设备的上报 IP 可能不在所扫网段，
-  // 过滤会导致「选中后下拉又空了」）。网段只用于触发扫描，结果一律保留可选。
-  const deviceOptions: Opt[] = peers.map((p) => ({
-    value: p.fingerprint,
-    label: `${p.remark || p.alias}（${p.ip}）`,
-    online: !!p.online,
-  }));
+  // 发现的设备：只列当前在线的（离线/历史设备不参与代理连接，避免选了连不上）。
+  const onlinePeers = peers.filter((p) => p.online);
   const selectedPeer = peers.find((p) => p.fingerprint === serverFp);
 
   const onPwKey = (e: React.KeyboardEvent) => {
@@ -803,51 +734,29 @@ export default function ProxyTool() {
                 </div>
 
                 {src === "lan" ? (
-                  <>
-                    <div className="proxy-row">
-                      <span className="proxy-label">选择网段</span>
-                      <div className="proxy-row-main">
-                        <Dropdown
-                          value={subnet}
-                          options={subnets}
-                          placeholder="选择网段…"
-                          emptyHint="未检测到网卡"
-                          onChange={(v) => {
-                            setSubnet(v);
-                            setServerFp("");
-                          }}
-                        />
-                        <button
-                          className={`btn btn-ghost btn-sm lan-refresh-btn${subnetRefreshing ? " spinning" : ""}`}
-                          title="重新读取本机网段（VPN/网络切换后）"
-                          onClick={loadSubnets}
-                          disabled={subnetRefreshing}
-                        >
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <polyline points="23 4 23 10 17 10" />
-                            <polyline points="1 20 1 14 7 14" />
-                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-                          </svg>
-                          刷新
-                        </button>
-                        <button className="btn btn-ghost btn-sm" disabled={scanning || !subnet} onClick={scan}>
-                          {scanning ? (scanProg ? `扫描 ${scanProg.done}/${scanProg.total}` : "扫描中…") : "扫描本网段"}
-                        </button>
-                      </div>
+                  <div className="proxy-row">
+                    <span className="proxy-label">服务端设备</span>
+                    <div className="proxy-row-main">
+                      {selectedPeer ? (
+                        <span className="proxy-fixed">
+                          <span className="peer-dot on" /> {selectedPeer.remark || selectedPeer.alias}（{chosenIp || selectedPeer.ip}）
+                        </span>
+                      ) : (
+                        <span className="proxy-fixed dim">未选择，点右侧齿轮扫描并选择</span>
+                      )}
+                      <button
+                        className="lan-icon-btn"
+                        title="配置网段与服务端设备"
+                        aria-label="配置"
+                        onClick={() => setCfgOpen(true)}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="12" r="3" />
+                          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                        </svg>
+                      </button>
                     </div>
-                    <div className="proxy-row">
-                      <span className="proxy-label">服务端设备</span>
-                      <div className="proxy-row-main">
-                        <Dropdown
-                          value={serverFp}
-                          options={deviceOptions}
-                          placeholder="扫描后在此选择…"
-                          emptyHint="先选网段并扫描"
-                          onChange={selectServer}
-                        />
-                      </div>
-                    </div>
-                  </>
+                  </div>
                 ) : (
                   <div className="proxy-row">
                     <span className="proxy-label">服务端 IP</span>
@@ -869,7 +778,7 @@ export default function ProxyTool() {
                   </div>
                 )}
 
-                {serverFp && selectedPeer && (
+                {src === "custom" && serverFp && selectedPeer && (
                   <p className="proxy-picked">
                     <span className="peer-dot on" />
                     已选服务端：{selectedPeer.remark || selectedPeer.alias}（{selectedPeer.ip}）
@@ -963,6 +872,199 @@ export default function ProxyTool() {
           <p>· 全程 TLS 加密 + 证书固定 + 密码鉴权。</p>
         </div>
       </div>
+
+      {cfgOpen && (
+        <div
+          className="modal-overlay"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setCfgOpen(false);
+          }}
+        >
+          <div className="modal">
+            <div className="modal-head">
+              <h3>内网网段配置</h3>
+              <button className="modal-close" onClick={() => setCfgOpen(false)}>×</button>
+            </div>
+            <div className="modal-scroll">
+              <div className="lan-netifaces">
+                <div className="lan-netifaces-head">
+                  <span>当前网段（{ifaces.length}）</span>
+                  <button
+                    className={`btn btn-ghost btn-sm lan-refresh-btn${subnetRefreshing ? " spinning" : ""}`}
+                    title="重新读取本机网段（VPN/网络切换后）"
+                    onClick={loadSubnets}
+                    disabled={subnetRefreshing}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="23 4 23 10 17 10" />
+                      <polyline points="1 20 1 14 7 14" />
+                      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                    </svg>
+                    刷新
+                  </button>
+                </div>
+                {ifaces.length === 0 ? (
+                  <div className="dim" style={{ fontSize: 12 }}>未检测到可用网段</div>
+                ) : (
+                  <ul className="lan-netifaces-list">
+                    {ifaces.map((nf) => (
+                      <li key={`${nf.name}-${nf.ip}`} className="lan-netiface">
+                        <span className="lan-netiface-cidr">{nf.cidr}</span>
+                        <span className="lan-netiface-meta dim">
+                          {nf.name} · {nf.ip}
+                        </span>
+                        {nf.isVpn && <span className="lan-netiface-tag">VPN</span>}
+                        <button
+                          className="btn btn-ghost btn-sm lan-netiface-scan"
+                          title={`扫描该网段（${nf.cidr}）查找服务端`}
+                          onClick={() => scanCidr(nf.cidr)}
+                          disabled={scan?.phase === "running"}
+                        >
+                          扫描
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="lan-netifaces-tip dim">
+                  点某网段「扫描」查找服务端设备（VPN 段按真实掩码整段扫，可能稍慢）；发现的设备在下方选择。
+                </div>
+              </div>
+
+              {routes.length > 0 && (
+                <div className="lan-overlay">
+                  <div className="lan-overlay-head">
+                    <span>组网可达地址（经隧道路由）</span>
+                    {overlayHosts.length > 0 && (
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        title="并发探测下方所有组网地址，发现的设备进入「发现的设备」供选择"
+                        onClick={probeAllOverlay}
+                        disabled={overlayAnyProbing}
+                      >
+                        {overlayAnyProbing ? "扫描中…" : "全部扫描"}
+                      </button>
+                    )}
+                  </div>
+                  <ul className="lan-netifaces-list">
+                    {routes.map((r, i) => (
+                      <li key={`${r.dest}-${i}`} className="lan-netiface">
+                        <span className="lan-netiface-cidr">{r.dest}</span>
+                        <span className="lan-netiface-meta dim">
+                          经 {r.iface} · 网关 {r.gateway}
+                        </span>
+                        <span className="lan-netiface-tag overlay">组网</span>
+                        {isHostAddr(r.dest) && (
+                          <button
+                            className={`btn btn-ghost btn-sm lan-netiface-scan${
+                              overlayProbe[r.dest] === "ok" ? " ok" : ""
+                            }`}
+                            title={`扫描该组网地址（${r.dest}），发现后在下方「发现的设备」选择`}
+                            onClick={() => probeOverlay(r.dest)}
+                            disabled={overlayProbe[r.dest] === "probing"}
+                          >
+                            {overlayProbe[r.dest] === "probing"
+                              ? "扫描中…"
+                              : overlayProbe[r.dest] === "ok"
+                              ? "✓ 已发现"
+                              : overlayProbe[r.dest] === "fail"
+                              ? "重试"
+                              : "扫描"}
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="lan-netifaces-tip dim">
+                    这些地址经隧道路由可达、不在本机网卡上。点「扫描」或「全部扫描」探测发现，发现的设备进入下方「发现的设备」，在那里选择要连接的服务端。
+                  </div>
+                </div>
+              )}
+
+              <div className="lan-overlay">
+                <div className="lan-overlay-head">
+                  <span>发现的设备（{onlinePeers.length}）</span>
+                </div>
+                {onlinePeers.length === 0 ? (
+                  <div className="dim" style={{ fontSize: 12 }}>暂无在线设备，先扫描上面的网段</div>
+                ) : (
+                  <ul className="lan-netifaces-list">
+                    {/* 同一设备多网段：每个 IP 一行，可分别选择走哪个 IP */}
+                    {onlinePeers.flatMap((p) => {
+                      const ips = p.ips && p.ips.length ? p.ips : [p.ip];
+                      return ips.map((ip) => {
+                        const active = serverFp === p.fingerprint && (chosenIp ? chosenIp === ip : p.ip === ip);
+                        return (
+                          <li
+                            key={`${p.fingerprint}-${ip}`}
+                            className={`lan-netiface proxy-dev-pick${active ? " active" : ""}`}
+                            onClick={() => selectServer(p.fingerprint, ip)}
+                          >
+                            <span className={`peer-dot${p.online ? " on" : ""}`} />
+                            <span className="lan-netiface-cidr">{p.remark || p.alias}</span>
+                            <span className="lan-netiface-meta dim">{ip}</span>
+                            {active && <span className="lan-netiface-tag overlay">已选</span>}
+                          </li>
+                        );
+                      });
+                    })}
+                  </ul>
+                )}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-primary" onClick={() => setCfgOpen(false)}>完成</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {scan && (
+        <div className="modal-overlay lan-scan-overlay">
+          <div className="modal lan-scan-modal">
+            <div className="modal-head">
+              <h3>{scan.title}</h3>
+            </div>
+            <div className="lan-scan-body">
+              <div className="lan-scan-bar">
+                <div
+                  className={`lan-scan-bar-fill${scan.phase === "running" ? " active" : ""}`}
+                  style={{
+                    width:
+                      scan.phase === "running"
+                        ? `${scan.total > 0 ? Math.round((scan.done / scan.total) * 100) : 0}%`
+                        : "100%",
+                  }}
+                />
+              </div>
+              <div className="lan-scan-text">
+                {scan.phase === "running" && (
+                  <span className="dim">
+                    正在扫描… {scan.done}/{scan.total || "?"}
+                    {scan.total > 0 && `（${Math.round((scan.done / scan.total) * 100)}%）`}
+                  </span>
+                )}
+                {scan.phase === "done" &&
+                  (scan.found > 0 ? (
+                    <span className="lan-scan-ok">✓ 扫描完成，发现 {scan.found} 台设备</span>
+                  ) : (
+                    <span className="dim">扫描完成，未发现设备</span>
+                  ))}
+                {scan.phase === "cancelled" && (
+                  <span className="dim">已中断{scan.found > 0 ? `，已发现 ${scan.found} 台设备` : ""}</span>
+                )}
+              </div>
+            </div>
+            <div className="modal-actions">
+              {scan.phase === "running" ? (
+                <button className="btn btn-ghost" onClick={cancelScan}>中断</button>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setScan(null)}>关闭</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

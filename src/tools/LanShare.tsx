@@ -523,6 +523,26 @@ export default function LanShare() {
     }
   };
 
+  // 组网/覆盖网地址不在本机网卡、走隧道路由，网段扫描与多播都覆盖不到，只能逐个直连探测。
+  // 复用单点 TOFU 探测（lan_add_peer）：探到即登记进设备列表。
+  const [overlayProbe, setOverlayProbe] = useState<Record<string, "probing" | "ok" | "fail">>({});
+  // 单主机地址（如 100.66.1.3）才能直连探测；含「/」的是网段路由（如 100.64.0.0/10），无法当主机连。
+  const isHostAddr = (dest: string) => !dest.includes("/");
+  const overlayHosts = useMemo(() => routes.filter((r) => isHostAddr(r.dest)), [routes]);
+  const probeOverlay = async (ip: string) => {
+    if (overlayProbe[ip] === "probing") return;
+    setOverlayProbe((m) => ({ ...m, [ip]: "probing" }));
+    try {
+      await addPeerByIp(ip);
+      setOverlayProbe((m) => ({ ...m, [ip]: "ok" }));
+    } catch {
+      setOverlayProbe((m) => ({ ...m, [ip]: "fail" })); // addPeerByIp 已弹红色错误提示
+    }
+  };
+  // 一键连接：并发探测所有单主机组网地址（多播过不去隧道，这是组网设备入列的主要途径）。
+  const probeAllOverlay = () => Promise.all(overlayHosts.map((r) => probeOverlay(r.dest)));
+  const overlayAnyProbing = Object.values(overlayProbe).some((v) => v === "probing");
+
   // 统一扫描入口：弹出进度弹框，实时显示 done/total，支持中断。
   // prefix=null → 只扫真实 LAN（后端跳过 VPN）；prefix="192.168.56.0/22" → 按 CIDR 整段扫。
   const runScan = async (title: string, prefix: string | null) => {
@@ -1503,7 +1523,19 @@ export default function LanShare() {
               </div>
               {routes.length > 0 && (
                 <div className="lan-overlay">
-                  <div className="lan-overlay-head">组网可达地址（经隧道路由）</div>
+                  <div className="lan-overlay-head">
+                    <span>组网可达地址（经隧道路由）</span>
+                    {overlayHosts.length > 0 && (
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        title="并发探测下方所有组网地址，连上的设备会进入左侧列表"
+                        onClick={probeAllOverlay}
+                        disabled={overlayAnyProbing}
+                      >
+                        {overlayAnyProbing ? "连接中…" : "全部连接"}
+                      </button>
+                    )}
+                  </div>
                   <ul className="lan-netifaces-list">
                     {routes.map((r, i) => (
                       <li key={`${r.dest}-${i}`} className="lan-netiface">
@@ -1512,11 +1544,29 @@ export default function LanShare() {
                           经 {r.iface} · 网关 {r.gateway}
                         </span>
                         <span className="lan-netiface-tag overlay">组网</span>
+                        {isHostAddr(r.dest) && (
+                          <button
+                            className={`btn btn-ghost btn-sm lan-netiface-scan${
+                              overlayProbe[r.dest] === "ok" ? " ok" : ""
+                            }`}
+                            title={`直连探测该组网地址（${r.dest}:${me?.port ?? 53317}）`}
+                            onClick={() => probeOverlay(r.dest)}
+                            disabled={overlayProbe[r.dest] === "probing"}
+                          >
+                            {overlayProbe[r.dest] === "probing"
+                              ? "连接中…"
+                              : overlayProbe[r.dest] === "ok"
+                              ? "✓ 已连接"
+                              : overlayProbe[r.dest] === "fail"
+                              ? "重试"
+                              : "连接"}
+                          </button>
+                        )}
                       </li>
                     ))}
                   </ul>
                   <div className="lan-netifaces-tip dim">
-                    这些地址不在本机网卡上，而是经隧道路由可达的组网/覆盖网节点。多播发现不过隧道，可用「+ IP」填这里的地址直连。
+                    这些地址不在本机网卡上，而是经隧道路由可达的组网/覆盖网节点。多播发现不过隧道，点「连接」或「全部连接」直连即可；连上的设备会进入左侧列表。
                   </div>
                 </div>
               )}

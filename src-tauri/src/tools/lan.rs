@@ -114,7 +114,9 @@ struct DeviceInfo {
 pub struct Peer {
     alias: String,
     fingerprint: String,
-    ip: String,
+    ip: String, // 主 IP（最近一次发现）
+    #[serde(default)]
+    ips: Vec<String>, // 同一设备被发现过的所有 IP（多网段），最近的在前；供请求代理指定走哪个 IP
     port: u16,
     protocol: String,
     device_type: Option<String>,
@@ -123,6 +125,18 @@ pub struct Peer {
     shares: u32, // 对方对外共享的目录数量（0=无）
     #[serde(default)]
     sticky: bool, // 用户手动扫描/按 IP 添加：VPN 等多播不可见网段，不参与 TTL 过期清理
+}
+
+/// 把新发现的 IP 并入已知 IP 列表：去重、最近的放最前、上限 8 个。
+fn merge_ips(existing: &[String], new_ip: &str) -> Vec<String> {
+    let mut out = vec![new_ip.to_string()];
+    for ip in existing {
+        if ip != new_ip && !out.contains(ip) {
+            out.push(ip.clone());
+        }
+    }
+    out.truncate(8);
+    out
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -687,11 +701,14 @@ fn upsert_peer(app: &AppHandle, state: &LanState, info: &DeviceInfo, ip: String,
             return; // 自己
         }
         // 一旦被手动登记为 sticky，后续多播刷新不应清掉该标记
-        let was_sticky = g.peers.get(&info.fingerprint).map(|p| p.sticky).unwrap_or(false);
+        let prev = g.peers.get(&info.fingerprint);
+        let was_sticky = prev.map(|p| p.sticky).unwrap_or(false);
+        let ips = merge_ips(prev.map(|p| p.ips.as_slice()).unwrap_or(&[]), &ip);
         let peer = Peer {
             alias: info.alias.clone(),
             fingerprint: info.fingerprint.clone(),
             ip,
+            ips,
             port: info.port.unwrap_or(PORT),
             protocol: info.protocol.clone().unwrap_or_else(|| "https".into()),
             device_type: info.device_type.clone(),
@@ -720,6 +737,7 @@ fn upsert_peer_minimal(app: &AppHandle, state: &LanState, alias: &str, fingerpri
         match g.peers.get_mut(fingerprint) {
             Some(p) => {
                 p.alias = alias.to_string();
+                p.ips = merge_ips(&p.ips, &ip);
                 p.ip = ip;
                 p.last_seen_ms = now;
             }
@@ -729,6 +747,7 @@ fn upsert_peer_minimal(app: &AppHandle, state: &LanState, alias: &str, fingerpri
                     Peer {
                         alias: alias.to_string(),
                         fingerprint: fingerprint.to_string(),
+                        ips: vec![ip.clone()],
                         ip,
                         port: PORT,
                         protocol: "https".into(),
@@ -4016,13 +4035,17 @@ pub async fn lan_proxy_start_client(
     fingerprint: String,
     password: String,
     port: Option<u16>,
+    ip: Option<String>,
 ) -> Result<u16, String> {
     let st = state.inner().clone();
-    // 取服务端 ip + 身份（用于固定证书 + 通道绑定鉴权）
-    let server_ip = {
-        let g = st.0.lock().unwrap();
-        let p = g.peers.get(&fingerprint).ok_or("服务端设备不在线，请先扫描")?;
-        p.ip.clone()
+    // 取服务端 ip + 身份（用于固定证书 + 通道绑定鉴权）。
+    // ip 指定时走该 IP（同设备多网段，用户选定走哪个）；否则用 peer 主 IP。
+    let server_ip = match ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => {
+            let g = st.0.lock().unwrap();
+            g.peers.get(&fingerprint).ok_or("服务端设备不在线，请先扫描")?.ip.clone()
+        }
     };
     if fingerprint.trim().is_empty() {
         return Err("服务端身份未知".into());
@@ -4073,12 +4096,16 @@ pub async fn lan_proxy_test(
     fingerprint: String,
     password: String,
     port: Option<u16>,
+    ip: Option<String>,
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let st = state.inner().clone();
-    let server_ip = {
-        let g = st.0.lock().unwrap();
-        g.peers.get(&fingerprint).ok_or("服务端设备不在线，请先扫描")?.ip.clone()
+    let server_ip = match ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => {
+            let g = st.0.lock().unwrap();
+            g.peers.get(&fingerprint).ok_or("服务端设备不在线，请先扫描")?.ip.clone()
+        }
     };
     if fingerprint.trim().is_empty() {
         return Err("服务端身份未知".into());

@@ -29,6 +29,7 @@ export interface Peer {
   alias: string;
   fingerprint: string;
   ip: string;
+  ips?: string[]; // 同一设备被发现过的所有 IP（多网段）；请求代理可指定走哪个
   port: number;
   protocol: string;
   deviceType?: string | null;
