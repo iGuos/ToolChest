@@ -348,7 +348,8 @@ select { cursor: pointer; }
   font-weight: 600;
 }
 .lan-netiface-meta {
-  flex: 1;
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -365,6 +366,65 @@ select { cursor: pointer; }
 }
 .lan-netiface-tag.overlay {
   background: var(--accent, #1f6feb);
+}
+.lan-netiface-scan {
+  flex-shrink: 0;
+  margin-left: auto; /* 标签紧贴左侧文字，扫描按钮推到最右 */
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+/* 扫描进度弹框：叠在设置弹框之上 */
+.lan-scan-overlay {
+  z-index: 400;
+}
+.lan-scan-modal {
+  width: min(420px, 90%);
+}
+.lan-scan-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 0 4px;
+}
+.lan-scan-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-elev, rgba(127, 127, 127, 0.18));
+  overflow: hidden;
+}
+.lan-scan-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent, #1f6feb);
+  transition: width 0.25s ease;
+}
+/* 扫描中：进度条上叠加流动条纹，强化「正在进行」的感知 */
+.lan-scan-bar-fill.active {
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.25) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.25) 50%,
+    rgba(255, 255, 255, 0.25) 75%,
+    transparent 75%
+  );
+  background-size: 24px 24px;
+  animation: lan-scan-stripes 0.7s linear infinite;
+}
+@keyframes lan-scan-stripes {
+  to {
+    background-position: 24px 0;
+  }
+}
+.lan-scan-text {
+  font-size: 13px;
+  text-align: center;
+}
+.lan-scan-ok {
+  color: var(--ok, #2ea043);
+  font-weight: 600;
 }
 /* 全局上传任务面板（右下角浮层，关闭共享弹框后仍可见） */
 /* 右下角任务堆叠容器：接收(上)+上传(下)竖向并排。
@@ -2380,6 +2440,17 @@ select { cursor: pointer; }
   align-items: center;
   justify-content: space-between;
 }
+/* 内容过长时滚动，头部与底部操作栏（完成）保持固定可见，不再溢出弹框边框 */
+.modal-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
 .modal-close {
   background: none;
   border: none;
@@ -2600,6 +2671,10 @@ select { cursor: pointer; }
 /* 刷新时图标旋转 */
 @keyframes lan-spin { to { transform: rotate(360deg); } }
 .lan-icon-btn.spinning svg { animation: lan-spin 0.6s linear infinite; }
+/* 文字「刷新」按钮：图标 + 文字，刷新中图标旋转 */
+.lan-refresh-btn { display: inline-flex; align-items: center; gap: 4px; }
+.lan-refresh-btn svg { width: 13px; height: 13px; }
+.lan-refresh-btn.spinning svg { animation: lan-spin 0.6s linear infinite; }
 
 /* ── Table ── */
 .table-wrap {

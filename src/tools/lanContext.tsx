@@ -127,6 +127,7 @@ interface LanCtxValue {
   setError: (e: string | null) => void;
   serviceError: string | null; // 服务启动失败（如端口被占用）；null=正常
   startService: () => Promise<boolean>; // 重试启动服务
+  refreshMe: () => Promise<void>; // 重新读取本机信息（网络切换/VPN 后刷新出网 IP）
   uploadTasks: Record<string, UploadTask>; // 共享上传任务（全局）
   startShareUpload: (taskId: string, name: string, args: UploadArgs) => Promise<void>;
   cancelUpload: (id: string) => void;
@@ -395,6 +396,16 @@ export function LanProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, [refreshPeers]);
+
+  // 重新读取本机信息：出网 IP 由 local_ip() 实时探测，网络/VPN 切换后据此更新「本机 …」。
+  const refreshMe = useCallback(async () => {
+    try {
+      const info = await invoke<MyInfo>("lan_my_info");
+      setMe(info);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const setSelected = useCallback((fp: string | null) => {
     setSelectedRaw(fp);
@@ -1021,7 +1032,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
 
   const value: LanCtxValue = {
     me, peers, items, confirm, pendingFiles, unread, totalUnread, selected, error,
-    serviceError, startService,
+    serviceError, startService, refreshMe,
     uploadTasks, startShareUpload, cancelUpload, resumeUpload, dismissUpload,
     recvTasks, rejectReceive,
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,

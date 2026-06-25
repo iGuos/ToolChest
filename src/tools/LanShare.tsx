@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEven
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLan, type Peer, type FileMsg, type ChatItem } from "./lanContext";
 import { useEscToClose, useDragReorder } from "../hooks";
 import ShareBrowser from "./ShareBrowser";
@@ -247,7 +247,7 @@ const PAGE_SIZE = 20; // 聊天记录每页条数：默认显示最近 20 条，
 
 export default function LanShare() {
   const {
-    me, peers, items, unread, selected, error, serviceError, startService,
+    me, peers, items, unread, selected, error, serviceError, startService, refreshMe,
     setSelected, setError, refreshPeers, sendMessage, resendMessage, recallMessage, deleteItem, sendFiles,
     cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
     setRemark, clearChat, togglePin, reorderPins,
@@ -298,14 +298,38 @@ export default function LanShare() {
   useEscToClose(setOpen, () => setSetOpen(false));
   const [aliasDraft, setAliasDraft] = useState("");
   const [refreshing, setRefreshing] = useState(false);
-  const [scanning, setScanning] = useState(false);
+  // 扫描进度弹框状态：title=标题，done/total=进度，phase=阶段，found=已发现台数，prefix=正在扫的网段(null=真实 LAN)
+  type ScanState = {
+    title: string;
+    prefix: string | null;
+    done: number;
+    total: number;
+    phase: "running" | "done" | "cancelled";
+    found: number;
+  };
+  const [scan, setScan] = useState<ScanState | null>(null);
+  const scanCancelled = useRef(false);
   const [ifaces, setIfaces] = useState<NetIface[]>([]); // 当前所有网段（设置面板里展示）
   const [routes, setRoutes] = useState<OverlayRoute[]>([]); // 经隧道可达的组网地址（补充展示）
   const [statusOpen, setStatusOpen] = useState(false); // 在线/隐身下拉
+  const [netRefreshing, setNetRefreshing] = useState(false); // 网段刷新动效
   // 拉取本机网段 + 组网可达地址（诊断「VPN 多网段」「mesh 组网 IP 在哪条隧道」）
-  const loadNet = () => {
-    invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([]));
-    invoke<OverlayRoute[]>("lan_overlay_routes").then(setRoutes).catch(() => setRoutes([]));
+  // 一并刷新本机信息：VPN/网络切换后出网 IP 会变，否则顶部「本机 …」停在旧值。
+  // 本地 syscall 极快，按设备刷新同样的规则至少转 0.6s 让动效可见。
+  const loadNet = async () => {
+    if (netRefreshing) return;
+    setNetRefreshing(true);
+    const started = Date.now();
+    try {
+      await Promise.all([
+        invoke<NetIface[]>("lan_interfaces").then(setIfaces).catch(() => setIfaces([])),
+        invoke<OverlayRoute[]>("lan_overlay_routes").then(setRoutes).catch(() => setRoutes([])),
+        refreshMe(),
+      ]);
+    } finally {
+      const wait = Math.max(0, 600 - (Date.now() - started));
+      window.setTimeout(() => setNetRefreshing(false), wait);
+    }
   };
   // 打开设置面板时拉一次
   useEffect(() => {
@@ -499,19 +523,34 @@ export default function LanShare() {
     }
   };
 
-  // 主动扫描同网段（不依赖广播）：探测各 /24 的百宝箱设备并登记
-  const handleScan = async () => {
-    if (scanning) return;
-    setScanning(true);
+  // 统一扫描入口：弹出进度弹框，实时显示 done/total，支持中断。
+  // prefix=null → 只扫真实 LAN（后端跳过 VPN）；prefix="192.168.56.0/22" → 按 CIDR 整段扫。
+  const runScan = async (title: string, prefix: string | null) => {
+    if (scan?.phase === "running") return;
+    scanCancelled.current = false;
+    setScan({ title, prefix, done: 0, total: 0, phase: "running", found: 0 });
     try {
-      const n = await invoke<number>("lan_scan_subnet");
-      setError(n > 0 ? `扫描完成，发现 ${n} 台设备` : "扫描完成，未发现新设备");
+      const n = await invoke<number>("lan_scan_subnet", prefix ? { prefix } : {});
+      setScan((s) => (s ? { ...s, phase: scanCancelled.current ? "cancelled" : "done", found: n } : s));
     } catch (e) {
+      setScan(null);
       setError(`扫描失败：${String(e)}`);
-    } finally {
-      setScanning(false);
     }
   };
+  const handleScan = () => runScan("扫描局域网设备", null);
+  const scanSegment = (cidr: string) => runScan(`扫描网段 ${cidr}`, cidr);
+  const cancelScan = () => {
+    scanCancelled.current = true;
+    invoke("lan_scan_cancel").catch(() => {});
+  };
+  // 扫描进度事件：仅在扫描进行中更新弹框的 done/total
+  useEffect(() => {
+    let un: UnlistenFn | undefined;
+    listen<{ done: number; total: number }>("lan://scan-progress", (e) => {
+      setScan((s) => (s && s.phase === "running" ? { ...s, done: e.payload.done, total: e.payload.total } : s));
+    }).then((f) => (un = f));
+    return () => un?.();
+  }, []);
 
   useEffect(() => {
     if (setOpen && me) setAliasDraft(me.alias);
@@ -937,11 +976,11 @@ export default function LanShare() {
                 </svg>
               </button>
               <button
-                className={`lan-icon-btn${scanning ? " spinning" : ""}`}
-                title="主动扫描同网段设备（不依赖广播）"
+                className={`lan-icon-btn${scan?.phase === "running" ? " spinning" : ""}`}
+                title="扫描真实局域网网段（不含 VPN；VPN 段请在设置→当前网段里单独扫）"
                 aria-label="扫描局域网"
                 onClick={handleScan}
-                disabled={scanning}
+                disabled={scan?.phase === "running"}
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="11" cy="11" r="7" />
@@ -1320,6 +1359,7 @@ export default function LanShare() {
               <button className="modal-close" onClick={() => setSetOpen(false)}>×</button>
             </div>
 
+            <div className="modal-scroll">
             <div className="settings-section">
               <div className="settings-section-title">基本</div>
               <div className="settings-field">
@@ -1420,7 +1460,16 @@ export default function LanShare() {
             <div className="lan-netifaces">
               <div className="lan-netifaces-head">
                 <span>当前网段（{ifaces.length}）</span>
-                <button className="btn btn-ghost btn-sm" onClick={loadNet}>
+                <button
+                  className={`btn btn-ghost btn-sm lan-refresh-btn${netRefreshing ? " spinning" : ""}`}
+                  onClick={loadNet}
+                  disabled={netRefreshing}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="23 4 23 10 17 10" />
+                    <polyline points="1 20 1 14 7 14" />
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                  </svg>
                   刷新
                 </button>
               </div>
@@ -1435,15 +1484,23 @@ export default function LanShare() {
                         {nf.name} · {nf.ip}
                       </span>
                       {nf.isVpn && <span className="lan-netiface-tag">VPN</span>}
+                      <button
+                        className="btn btn-ghost btn-sm lan-netiface-scan"
+                        title={`扫描该网段（${nf.cidr}）查找设备`}
+                        onClick={() => scanSegment(nf.cidr)}
+                        disabled={scan?.phase === "running"}
+                      >
+                        扫描
+                      </button>
                     </li>
                   ))}
                 </ul>
               )}
-              {ifaces.filter((n) => !n.isVpn).length > 1 && (
-                <div className="lan-netifaces-tip dim">
-                  检测到多个真实网段：两台设备只有处于同一网段才能自动发现。若开了 VPN，可临时关闭，或用「+ IP」手动添加对方。
-                </div>
-              )}
+              <div className="lan-netifaces-tip dim">
+                顶部「扫描」按钮只扫真实局域网；VPN/虚拟网段点本行「扫描」按需查找（按真实掩码整段扫，可能稍慢）。
+                {ifaces.filter((n) => !n.isVpn).length > 1 &&
+                  "检测到多个真实网段：两台设备需处于同一网段才能自动发现。"}
+              </div>
               {routes.length > 0 && (
                 <div className="lan-overlay">
                   <div className="lan-overlay-head">组网可达地址（经隧道路由）</div>
@@ -1464,8 +1521,56 @@ export default function LanShare() {
                 </div>
               )}
             </div>
+            </div>
             <div className="modal-actions">
               <button className="btn btn-primary" onClick={() => setSetOpen(false)}>完成</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {scan && (
+        <div className="modal-overlay lan-scan-overlay">
+          <div className="modal lan-scan-modal">
+            <div className="modal-head">
+              <h3>{scan.title}</h3>
+            </div>
+            <div className="lan-scan-body">
+              <div className="lan-scan-bar">
+                <div
+                  className={`lan-scan-bar-fill${scan.phase === "running" ? " active" : ""}`}
+                  style={{
+                    width:
+                      scan.phase === "running"
+                        ? `${scan.total > 0 ? Math.round((scan.done / scan.total) * 100) : 0}%`
+                        : "100%",
+                  }}
+                />
+              </div>
+              <div className="lan-scan-text">
+                {scan.phase === "running" && (
+                  <span className="dim">
+                    正在扫描… {scan.done}/{scan.total || "?"}
+                    {scan.total > 0 && `（${Math.round((scan.done / scan.total) * 100)}%）`}
+                  </span>
+                )}
+                {scan.phase === "done" &&
+                  (scan.found > 0 ? (
+                    <span className="lan-scan-ok">✓ 扫描完成，发现 {scan.found} 台设备</span>
+                  ) : (
+                    <span className="dim">扫描完成，未发现设备</span>
+                  ))}
+                {scan.phase === "cancelled" && (
+                  <span className="dim">已中断{scan.found > 0 ? `，已发现 ${scan.found} 台设备` : ""}</span>
+                )}
+              </div>
+            </div>
+            <div className="modal-actions">
+              {scan.phase === "running" ? (
+                <button className="btn btn-ghost" onClick={cancelScan}>中断</button>
+              ) : (
+                <button className="btn btn-primary" onClick={() => setScan(null)}>关闭</button>
+              )}
             </div>
           </div>
         </div>

@@ -845,6 +845,57 @@ fn local_ipv4_ifaces() -> Vec<Ipv4Addr> {
         .unwrap_or_default()
 }
 
+/// 本机所有非回环 IPv4 接口（含接口名与子网掩码）。主动扫描据此按「真实网段」枚举候选 IP，
+/// 并可凭接口名区分真实 LAN 与 VPN/虚拟网卡（默认扫描只扫真实 LAN，VPN 网段由用户手动触发）。
+fn local_ipv4_ifaces_masked() -> Vec<(String, Ipv4Addr, Ipv4Addr)> {
+    if_addrs::get_if_addrs()
+        .map(|ifs| {
+            ifs.into_iter()
+                .filter_map(|i| match i.addr {
+                    if_addrs::IfAddr::V4(ref v4) if !v4.ip.is_loopback() && !v4.ip.is_unspecified() => {
+                        Some((i.name.clone(), v4.ip, v4.netmask))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 列出某网段内可探测的主机 IP（去掉网络号/广播地址）。
+/// 按真实掩码枚举：/28 只扫 14 台、/24 扫 254 台、/22 扫 1022 台。
+/// 可用主机数超过 MAX_SUBNET_HOSTS（约 /21）或掩码退化（/31、/32）时，退回本机所在 /24 兜底，
+/// 避免对超大网段（如 /16 = 6.5 万台）发起海量探测拖死扫描。
+fn subnet_scan_targets(ip: Ipv4Addr, netmask: Ipv4Addr) -> Vec<Ipv4Addr> {
+    const MAX_SUBNET_HOSTS: u32 = 2048; // 覆盖到 /21；更大网段退回 /24
+    let o = ip.octets();
+    let host_24 = || (1u8..=254).map(|h| Ipv4Addr::new(o[0], o[1], o[2], h)).collect::<Vec<_>>();
+    let mask = u32::from(netmask);
+    let prefix = mask.count_ones();
+    if prefix == 0 || prefix >= 31 {
+        return host_24();
+    }
+    let count = 1u32 << (32 - prefix); // 子网地址总数
+    if count.saturating_sub(2) > MAX_SUBNET_HOSTS {
+        return host_24();
+    }
+    let network = u32::from(ip) & mask;
+    let broadcast = network | !mask;
+    ((network + 1)..broadcast).map(Ipv4Addr::from).collect()
+}
+
+/// 解析 CIDR（如 "192.168.56.0/22"）为 (网络地址, 掩码)。供「手动扫描指定网段」用。
+fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    let (addr, plen) = cidr.split_once('/')?;
+    let ip: Ipv4Addr = addr.trim().parse().ok()?;
+    let prefix: u8 = plen.trim().parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    Some((ip, Ipv4Addr::from(mask)))
+}
+
 /// 一张本机网卡的网段信息，供前端「查看当前所有网段」诊断用。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4356,9 +4407,20 @@ pub async fn lan_proxy_running_apps() -> Result<Vec<RunningApp>, String> {
         .map_err(|e| format!("任务调度失败：{e}"))
 }
 
+/// 扫描中断标志：前端点「中断」时置位，扫描线程据此提前退出（已发现的设备照常登记）。
+static SCAN_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 中断正在进行的网段扫描。
+#[tauri::command]
+pub fn lan_scan_cancel() {
+    SCAN_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 主动扫描网段（探测 53317 的 /info），发现百宝箱设备并登记。返回发现总数。
-/// prefix=None：扫描本机所有网卡的 /24（全量，负载大）。
-/// prefix=Some("192.168.1")：只扫该指定 /24（.1~.254），大幅减轻压力。
+/// prefix=None：只扫真实 LAN 网卡（跳过 VPN）。
+/// prefix=Some("192.168.1")：只扫该指定 /24。
+/// prefix=Some("192.168.56.0/22")：按 CIDR 整段扫（VPN 段手动触发用）。
+/// 扫描过程中通过 `lan://scan-progress` 上报 {done,total}，可用 `lan_scan_cancel` 中断。
 #[tauri::command]
 pub async fn lan_scan_subnet(
     app: AppHandle,
@@ -4367,9 +4429,16 @@ pub async fn lan_scan_subnet(
 ) -> Result<u32, String> {
     let st = state.inner().clone();
     let my_fp = st.0.lock().unwrap().fingerprint.clone();
-    // 候选 IP：每张网卡的 /24（.1~.254），按 (网段, 探测 ip) 收集
+    // 候选 IP 三种来源：
+    // - 含「/」：手动指定网段（CIDR，如 "192.168.56.0/22"），按真实掩码整段扫——VPN 网段由用户手动触发。
+    // - 形如 "192.168.1"：单个 /24（请求代理「扫描本网段」用）。
+    // - None：默认扫描，只扫真实 LAN 网卡（跳过 VPN/虚拟），避免每次都扫慢且大的 VPN 段。
     let mut targets: Vec<std::net::Ipv4Addr> = Vec::new();
     match prefix.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) if p.contains('/') => {
+            let (ip, mask) = parse_cidr(p).ok_or("网段格式不正确（应形如 192.168.56.0/22）")?;
+            targets.extend(subnet_scan_targets(ip, mask));
+        }
         Some(p) => {
             let o: Vec<u8> = p.split('.').filter_map(|s| s.parse().ok()).collect();
             if o.len() != 3 {
@@ -4380,17 +4449,18 @@ pub async fn lan_scan_subnet(
             }
         }
         None => {
-            for v4 in local_ipv4_ifaces() {
-                let o = v4.octets();
-                for h in 1u8..=254 {
-                    targets.push(std::net::Ipv4Addr::new(o[0], o[1], o[2], h));
+            for (name, ip, mask) in local_ipv4_ifaces_masked() {
+                if looks_like_vpn(&name) {
+                    continue; // 默认扫描跳过 VPN/虚拟网卡，VPN 段需用户在网段列表手动扫
                 }
+                targets.extend(subnet_scan_targets(ip, mask));
             }
         }
     }
     targets.sort();
     targets.dedup();
     let total = targets.len();
+    SCAN_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed); // 每次扫描前清除中断标志
     let _ = app.emit("lan://scan-progress", serde_json::json!({ "done": 0, "total": total }));
 
     let app2 = app.clone();
@@ -4410,6 +4480,9 @@ pub async fn lan_scan_subnet(
         std::thread::scope(|s| {
             for _ in 0..48 {
                 s.spawn(|| loop {
+                    if SCAN_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+                        break; // 用户中断：停止取新任务，已发现的照常返回
+                    }
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if i >= targets.len() {
                         break;

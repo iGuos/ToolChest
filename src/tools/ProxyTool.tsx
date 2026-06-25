@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useLan } from "./lanContext";
@@ -211,6 +211,7 @@ export default function ProxyTool() {
   const [src, setSrc] = useState<"lan" | "custom">("lan"); // 客户端找服务端的方式：内网网段 / 自定义 IP
   const [subnets, setSubnets] = useState<Opt[]>([]); // 本机网卡推导出的可选 /24 网段
   const [subnet, setSubnet] = useState(""); // 选中的网段前缀，如 192.168.1
+  const [subnetRefreshing, setSubnetRefreshing] = useState(false); // 网段刷新动效
   const [customIp, setCustomIp] = useState(""); // 自定义服务端 IP
   const [wantIp, setWantIp] = useState(""); // 自定义探测中：待回填 fingerprint 的 IP
   const [busy, setBusy] = useState(false);
@@ -340,23 +341,35 @@ export default function ProxyTool() {
     return () => un?.();
   }, []);
 
-  // 载入本机网卡，推导可选 /24 网段（按前缀去重；VPN/虚拟网卡标注）
-  useEffect(() => {
-    invoke<{ ip: string; name: string; isVpn: boolean }[]>("lan_interfaces")
-      .then((ifs) => {
-        const seen = new Set<string>();
-        const opts: Opt[] = [];
-        for (const i of ifs) {
-          const p = i.ip.split(".").slice(0, 3).join(".");
-          if (seen.has(p)) continue;
-          seen.add(p);
-          opts.push({ value: p, label: `${p}.x（${i.isVpn ? "VPN/虚拟" : i.name}）` });
-        }
-        setSubnets(opts);
-        setSubnet((cur) => cur || (opts[0]?.value ?? ""));
-      })
-      .catch(() => {});
+  // 载入本机网卡，推导可选 /24 网段（按前缀去重；VPN/虚拟网卡标注）。
+  // 抽成可重复调用：VPN/网络切换后网段会变，需支持「刷新」拉到最新。
+  // syscall 极快，至少转 0.6s 让刷新动效可见。
+  const loadSubnets = useCallback(async () => {
+    setSubnetRefreshing(true);
+    const started = Date.now();
+    try {
+      const ifs = await invoke<{ ip: string; name: string; isVpn: boolean }[]>("lan_interfaces");
+      const seen = new Set<string>();
+      const opts: Opt[] = [];
+      for (const i of ifs) {
+        const p = i.ip.split(".").slice(0, 3).join(".");
+        if (seen.has(p)) continue;
+        seen.add(p);
+        opts.push({ value: p, label: `${p}.x（${i.isVpn ? "VPN/虚拟" : i.name}）` });
+      }
+      setSubnets(opts);
+      // 选中项已消失（如对应网卡被关掉）则回退到第一项，否则保留用户的选择
+      setSubnet((cur) => (cur && opts.some((o) => o.value === cur) ? cur : opts[0]?.value ?? ""));
+    } catch {
+      /* ignore */
+    } finally {
+      const wait = Math.max(0, 600 - (Date.now() - started));
+      window.setTimeout(() => setSubnetRefreshing(false), wait);
+    }
   }, []);
+  useEffect(() => {
+    loadSubnets();
+  }, [loadSubnets]);
 
   // 自定义探测成功后：peers 更新时回填对应设备的 fingerprint 并自动选中
   useEffect(() => {
@@ -680,7 +693,16 @@ export default function ProxyTool() {
                       <div className="proxy-running">
                         <div className="proxy-running-head">
                           <span className="dim">{loadingApps ? "读取中…" : `运行中的应用（${runningApps.length}）`}</span>
-                          <button className="btn btn-ghost btn-sm" disabled={loadingApps} onClick={loadRunningApps}>
+                          <button
+                            className={`btn btn-ghost btn-sm lan-refresh-btn${loadingApps ? " spinning" : ""}`}
+                            disabled={loadingApps}
+                            onClick={loadRunningApps}
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="23 4 23 10 17 10" />
+                              <polyline points="1 20 1 14 7 14" />
+                              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                            </svg>
                             刷新
                           </button>
                         </div>
@@ -795,6 +817,19 @@ export default function ProxyTool() {
                             setServerFp("");
                           }}
                         />
+                        <button
+                          className={`btn btn-ghost btn-sm lan-refresh-btn${subnetRefreshing ? " spinning" : ""}`}
+                          title="重新读取本机网段（VPN/网络切换后）"
+                          onClick={loadSubnets}
+                          disabled={subnetRefreshing}
+                        >
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="23 4 23 10 17 10" />
+                            <polyline points="1 20 1 14 7 14" />
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                          </svg>
+                          刷新
+                        </button>
                         <button className="btn btn-ghost btn-sm" disabled={scanning || !subnet} onClick={scan}>
                           {scanning ? (scanProg ? `扫描 ${scanProg.done}/${scanProg.total}` : "扫描中…") : "扫描本网段"}
                         </button>

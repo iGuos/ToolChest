@@ -92,6 +92,7 @@ pub fn run() {
             tools::lan::lan_proxy_launch_app,
             tools::lan::lan_proxy_running_apps,
             tools::lan::lan_scan_subnet,
+            tools::lan::lan_scan_cancel,
             tools::lan::lan_send_message,
             tools::lan::lan_recall_message,
             tools::lan::lan_send_files,
