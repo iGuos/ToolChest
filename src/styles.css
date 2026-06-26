@@ -3625,3 +3625,65 @@ html { -webkit-text-size-adjust: 100%; }
   padding-top: 10px;
   padding-bottom: 10px;
 }
+
+/* ── 移动端设置页 ── */
+.mobile-settings {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 14px;
+}
+.ms-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg2);
+  color: var(--text);
+  font-size: 15px;
+  cursor: pointer;
+}
+.ms-row-icon { font-size: 18px; }
+.ms-row-title { flex: 1; text-align: left; }
+.ms-row-caret { color: var(--text-dim, #888); transform: rotate(90deg); transition: transform 0.15s; }
+.ms-row-caret.open { transform: rotate(-90deg); }
+.ms-detail {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev, rgba(127, 127, 127, 0.06));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ms-kv {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+}
+.ms-kv span { color: var(--text-dim, #8a8a8a); flex-shrink: 0; }
+.ms-kv b { text-align: right; word-break: break-all; }
+.ms-note { font-size: 12px; line-height: 1.6; }
+.ms-note code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* 系统代理崩溃遗留告警条 */
+.proxy-leftover {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn, #e0883a);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn, #e0883a) 14%, transparent);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.proxy-leftover span { flex: 1; }
+.proxy-leftover .btn { flex-shrink: 0; }

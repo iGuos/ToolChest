@@ -153,7 +153,60 @@ function renderTool(
 const MOBILE_TABS = [
   { id: "lan-share", name: "局域网互传", icon: "📡" },
   { id: "proxy", name: "请求代理", icon: "🔀" },
+  { id: "settings", name: "设置", icon: "⚙️" },
 ] as const;
+
+interface AppInfo {
+  name: string;
+  version: string;
+  identifier: string;
+  expiration?: string | null;
+}
+
+// 设置页：含「软件详情」，点开展示应用信息与签名到期日
+function MobileSettings() {
+  const [info, setInfo] = useState<AppInfo | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    invoke<AppInfo>("app_info").then(setInfo).catch(() => {});
+  }, []);
+  // ISO → 「2027-06-25（剩 364 天）」
+  const fmtExpire = (iso?: string | null) => {
+    if (!iso) return "长期有效";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    const days = Math.ceil((d.getTime() - Date.now()) / 86400000);
+    const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    return days >= 0 ? `${date}（剩 ${days} 天）` : `${date}（已过期）`;
+  };
+  return (
+    <div className="tool-container">
+      <div className="tool-header">
+        <h2>设置</h2>
+      </div>
+      <div className="mobile-settings">
+        <button className="ms-row" onClick={() => setOpen((v) => !v)}>
+          <span className="ms-row-icon">ℹ️</span>
+          <span className="ms-row-title">软件详情</span>
+          <span className={`ms-row-caret${open ? " open" : ""}`}>›</span>
+        </button>
+        {open && (
+          <div className="ms-detail">
+            <div className="ms-kv"><span>应用名称</span><b>{info?.name ?? "百宝箱"}</b></div>
+            <div className="ms-kv"><span>版本</span><b>{info?.version ?? "—"}</b></div>
+            <div className="ms-kv"><span>包标识</span><b>{info?.identifier ?? "—"}</b></div>
+            <div className="ms-kv"><span>到期日</span><b>{fmtExpire(info?.expiration)}</b></div>
+            {info?.expiration && (
+              <div className="ms-note dim">
+                到期后重新安装（在电脑上执行 <code>pnpm install:ios</code>）即可继续使用，无需重新配置。
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function MobileApp() {
   const { totalUnread } = useLan();
@@ -172,6 +225,9 @@ function MobileApp() {
         </div>
         <div className={`mobile-pane${tab === "proxy" ? "" : " hidden"}`}>
           <ProxyTool />
+        </div>
+        <div className={`mobile-pane${tab === "settings" ? "" : " hidden"}`}>
+          <MobileSettings />
         </div>
       </div>
       <nav className="mobile-nav">

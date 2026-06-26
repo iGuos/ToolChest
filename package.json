@@ -14,7 +14,9 @@
     "dist": "tauri build",
     "build:web": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dist:ios": "APPLE_DEVELOPMENT_TEAM=J4JFUVCFB4 tauri ios build --export-method debugging",
+    "install:ios": "pnpm dist:ios && bash scripts/ios-install.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

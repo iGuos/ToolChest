@@ -14,6 +14,46 @@ fn set_close_to_tray(state: tauri::State<'_, AppConfig>, enabled: bool) {
     state.close_to_tray.store(enabled, Ordering::Relaxed);
 }
 
+/// 软件详情：名称/版本/包标识 + iOS 签名描述文件到期日（开发签名约 1 年）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+    name: String,
+    version: String,
+    identifier: String,
+    /// 描述文件到期时间（ISO8601）；非 iOS 开发包为空。
+    expiration: Option<String>,
+}
+
+/// 读 app 包内 embedded.mobileprovision 的 ExpirationDate。
+/// .mobileprovision 是 CMS 签名块，内部 plist 以明文嵌着，直接截取 <plist>…</plist> 再取日期即可。
+fn provision_expiration() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let data = std::fs::read(exe.parent()?.join("embedded.mobileprovision")).ok()?;
+    let text = String::from_utf8_lossy(&data);
+    let plist = {
+        let s = text.find("<plist")?;
+        let e = text.find("</plist>")? + "</plist>".len();
+        &text[s..e]
+    };
+    let key = "<key>ExpirationDate</key>";
+    let after = &plist[plist.find(key)? + key.len()..];
+    let ds = after.find("<date>")? + "<date>".len();
+    let de = after.find("</date>")?;
+    Some(after[ds..de].trim().to_string())
+}
+
+#[tauri::command]
+fn app_info(app: tauri::AppHandle) -> AppInfo {
+    let pkg = app.package_info();
+    AppInfo {
+        name: "百宝箱".into(),
+        version: pkg.version.to_string(),
+        identifier: app.config().identifier.clone(),
+        expiration: provision_expiration(),
+    }
+}
+
 /// 显示并聚焦主窗口（从托盘恢复）。仅桌面有托盘/多窗口。
 #[cfg(desktop)]
 fn show_main(app: &tauri::AppHandle) {
@@ -82,6 +122,7 @@ pub fn run() {
             tools::lan::lan_proxy_start_client,
             tools::lan::lan_proxy_test,
             tools::lan::lan_set_system_proxy,
+            tools::lan::lan_proxy_leftover,
             tools::lan::lan_proxy_pick_app,
             tools::lan::lan_proxy_launch_app,
             tools::lan::lan_proxy_running_apps,
@@ -91,6 +132,7 @@ pub fn run() {
             tools::lan::lan_recall_message,
             tools::lan::lan_send_files,
             set_close_to_tray,
+            app_info,
         ]);
 
     // 桌面专属：开机自启 + 系统托盘 + 「关到托盘」。iOS/Android 无这些概念，跳过。

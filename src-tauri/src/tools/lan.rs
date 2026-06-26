@@ -4295,6 +4295,68 @@ fn apply_system_proxy(_enable: bool, _socks_port: u16, _http_port: u16) -> Resul
     Err("当前系统暂不支持自动设置系统代理，请手动配置 SOCKS5 127.0.0.1".into())
 }
 
+/// 检测系统代理是否被"遗留"指向本应用的本地端口（上次崩溃/被强杀没还原）。
+/// 代理状态本应用从不持久化（每次启动都是关），所以一旦系统代理仍指向 127.0.0.1:<本应用端口>，
+/// 必是遗留——此时本地端口没人服务，会导致全系统断网。检测只读、不需要管理员权限。
+#[cfg(target_os = "macos")]
+fn detect_leftover_system_proxy() -> bool {
+    let Ok(out) = std::process::Command::new("networksetup")
+        .arg("-listallnetworkservices")
+        .output()
+    else {
+        return false;
+    };
+    let services = String::from_utf8_lossy(&out.stdout);
+    for s in services.lines().skip(1).filter(|l| !l.starts_with('*') && !l.trim().is_empty()) {
+        if let Ok(o) = std::process::Command::new("networksetup")
+            .args(["-getsocksfirewallproxy", s.trim()])
+            .output()
+        {
+            let t = String::from_utf8_lossy(&o.stdout);
+            let enabled = t.lines().any(|l| l.starts_with("Enabled:") && l.contains("Yes"));
+            let local = t.lines().any(|l| l.starts_with("Server:") && l.contains("127.0.0.1"));
+            let our_port = t.lines().any(|l| l.starts_with("Port:") && l.contains(&SOCKS_PORT.to_string()));
+            if enabled && local && our_port {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn detect_leftover_system_proxy() -> bool {
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let on = crate::tools::hidden_command("reg")
+        .args(["query", KEY, "/v", "ProxyEnable"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+        .unwrap_or(false);
+    if !on {
+        return false;
+    }
+    crate::tools::hidden_command("reg")
+        .args(["query", KEY, "/v", "ProxyServer"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("127.0.0.1:{HTTP_PROXY_PORT}")))
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn detect_leftover_system_proxy() -> bool {
+    false
+}
+
+/// 启动后由前端调用：系统代理是否被本应用遗留（需要清理）。
+#[tauri::command]
+pub async fn lan_proxy_leftover() -> bool {
+    tauri::async_runtime::spawn_blocking(detect_leftover_system_proxy)
+        .await
+        .unwrap_or(false)
+}
+
 // ── 指定应用走代理（启动式）─────────────────────────────────
 // 由百宝箱「带着代理设置」去启动选定的 App：浏览器(Chromium 系)用命令行 flag，
 // 其他程序注入 ALL_PROXY/HTTPS_PROXY 等环境变量。

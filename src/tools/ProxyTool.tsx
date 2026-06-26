@@ -142,6 +142,7 @@ export default function ProxyTool() {
   const [pwVisible, setPwVisible] = useState(false);
   const [sysProxy, setSysProxy] = useState(false); // 是否已接管系统代理(仅客户端)
   const [sysBusy, setSysBusy] = useState(false); // 系统代理设置中（弹授权框，耗时）
+  const [leftover, setLeftover] = useState(false); // 上次崩溃/强杀遗留的系统代理（指向本机端口→断网）
   const [apply, setApply] = useState<"sys" | "app">("app"); // 代理生效方式：默认指定应用，可切到系统代理
   const [appPickMode, setAppPickMode] = useState<"file" | "running">("file"); // 指定应用：选文件 / 选运行中
   const [runningApps, setRunningApps] = useState<{ name: string; path: string }[]>([]);
@@ -424,6 +425,17 @@ export default function ProxyTool() {
     }
   };
 
+  // 启动自愈：检测上次遗留的系统代理（指向本机端口→会断网），桌面端才有
+  useEffect(() => {
+    if (IS_MOBILE) return;
+    invoke<boolean>("lan_proxy_leftover").then(setLeftover).catch(() => {});
+  }, []);
+  // 一键清除遗留系统代理（还原系统配置，macOS 会弹一次授权）
+  const clearLeftover = async () => {
+    const ok = await applySys(false);
+    if (ok) setLeftover(false);
+  };
+
   // 带代理启动指定路径的应用
   const launchPath = async (path: string) => {
     if (launching || !path) return;
@@ -506,6 +518,14 @@ export default function ProxyTool() {
       </div>
 
       <div className="proxy-tool-body">
+        {leftover && (
+          <div className="proxy-leftover">
+            <span>⚠️ 检测到上次遗留的系统代理仍指向本机（可能导致无法上网）。</span>
+            <button className="btn btn-sm btn-primary" disabled={sysBusy} onClick={clearLeftover}>
+              {sysBusy ? "清除中…" : "立即清除"}
+            </button>
+          </div>
+        )}
         {proxy.role !== 0 ? (
           <div className="proxy-card proxy-status">
             <span className="proxy-badge on">
