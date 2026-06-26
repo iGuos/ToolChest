@@ -16,7 +16,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dist:ios": "APPLE_DEVELOPMENT_TEAM=J4JFUVCFB4 tauri ios build --export-method debugging",
-    "install:ios": "pnpm dist:ios && bash scripts/ios-install.sh"
+    "install:ios": "pnpm dist:ios && bash scripts/ios-install.sh",
+    "dist:android": "tauri android build --apk --debug",
+    "install:android": "pnpm dist:android && bash scripts/android-install.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

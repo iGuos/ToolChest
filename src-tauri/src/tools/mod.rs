@@ -1,4 +1,5 @@
 pub mod deepseek;
+pub mod envsetup;
 pub mod hosts;
 pub mod http;
 pub mod lan;

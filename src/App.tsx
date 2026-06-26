@@ -9,6 +9,7 @@ import LanShare from "./tools/LanShare";
 import LanIncomingModal from "./tools/LanIncomingModal";
 import DeepSeek from "./tools/DeepSeekTab";
 import ProxyTool from "./tools/ProxyTool";
+import EnvSetup from "./tools/EnvSetup";
 import { useLan } from "./tools/lanContext";
 import { useEscToClose, useDragReorder, IS_MOBILE } from "./hooks";
 import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
@@ -42,6 +43,7 @@ const TOOLS: ToolMeta[] = [
   { id: "todo", name: "待办事项", icon: "📋" },
   { id: "lan-share", name: "局域网互传", icon: "📡" },
   { id: "proxy", name: "请求代理", icon: "🔀" },
+  { id: "env-setup", name: "环境配置", icon: "🧰" },
   { id: "deepseek", name: "DeepSeek", icon: "🤖" },
 ];
 
@@ -144,6 +146,8 @@ function renderTool(
       return <DeepSeek />;
     case "proxy":
       return <ProxyTool />;
+    case "env-setup":
+      return <EnvSetup />;
     default:
       return null;
   }
