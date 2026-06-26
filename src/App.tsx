@@ -341,6 +341,37 @@ export default function App() {
     }
   };
 
+  // 问题排查：检测「崩溃后系统代理未还原」残留。null=未检测/未知，true=有残留，false=正常。
+  const [diagLeftover, setDiagLeftover] = useState<boolean | null>(null);
+  const [diagChecking, setDiagChecking] = useState(false);
+  const [diagFixing, setDiagFixing] = useState(false);
+  const runDiag = useCallback(async () => {
+    setDiagChecking(true);
+    try {
+      setDiagLeftover(await invoke<boolean>("lan_proxy_leftover"));
+    } catch {
+      setDiagLeftover(null);
+    } finally {
+      setDiagChecking(false);
+    }
+  }, []);
+  // 打开设置时自动检测一次
+  useEffect(() => {
+    if (settingsOpen) runDiag();
+  }, [settingsOpen, runDiag]);
+  // 仅在确有残留时可触发：还原系统代理（macOS 弹一次授权），再复检
+  const fixDiag = async () => {
+    setDiagFixing(true);
+    try {
+      await invoke("lan_set_system_proxy", { enable: false, socksPort: 53319, httpPort: 53320 });
+      setDiagLeftover(await invoke<boolean>("lan_proxy_leftover"));
+    } catch {
+      /* 用户取消授权等：保持原状态 */
+    } finally {
+      setDiagFixing(false);
+    }
+  };
+
   // 功能菜单卡片拖拽排序（整张卡片可拖，点勾选框不触发拖拽）。复用通用拖拽 hook。
   const toolDnd = useDragReorder({
     selector: "[data-tool-card-id]",
@@ -595,6 +626,7 @@ export default function App() {
               <h3>设置</h3>
               <button className="modal-close" onClick={() => setSettingsOpen(false)}>×</button>
             </div>
+            <div className="modal-scroll">
             <div className="settings-section">
               <div className="settings-section-title">功能菜单</div>
               <div className="dim" style={{ fontSize: 12, marginBottom: 8 }}>
@@ -683,6 +715,37 @@ export default function App() {
                   ))}
                 </div>
               </div>
+            </div>
+            <div className="settings-section">
+              <div className="settings-section-title">问题排查</div>
+              <div className="settings-field">
+                <div className="settings-field-label">
+                  <span>系统代理残留检测</span>
+                  <span className="settings-field-hint">
+                    {diagChecking
+                      ? "检测中…"
+                      : diagLeftover === true
+                      ? "⚠️ 检测到崩溃遗留的系统代理（仍指向本机，会导致无法上网）"
+                      : diagLeftover === false
+                      ? "✓ 未发现残留，配置正常"
+                      : "未检测"}
+                  </span>
+                </div>
+                <div className="theme-options">
+                  <button className="theme-opt" onClick={runDiag} disabled={diagChecking || diagFixing}>
+                    {diagChecking ? "检测中…" : "重新检测"}
+                  </button>
+                  <button
+                    className="theme-opt"
+                    onClick={fixDiag}
+                    disabled={diagLeftover !== true || diagFixing}
+                    title={diagLeftover === true ? "还原系统代理（macOS 会弹一次授权）" : "未检测到问题，无需修复"}
+                  >
+                    {diagFixing ? "修复中…" : "立即修复"}
+                  </button>
+                </div>
+              </div>
+            </div>
             </div>
             <div className="modal-actions">
               <button className="btn btn-ghost settings-reset" onClick={resetSettings}>
