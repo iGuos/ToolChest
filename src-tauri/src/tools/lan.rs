@@ -435,10 +435,21 @@ struct LanConfig {
     shares: Option<Vec<ShareCfg>>,
 }
 
+/// 由启动时(setup)用 Tauri 的 app_data_dir 注入的可写配置目录。
+/// 移动端(iOS/Android)沙盒只有 app 专属目录可写——必须靠它,否则证书写不进去 →
+/// 每次启动重新生成指纹 → 被当成新设备。桌面端也用它,统一且正确。
+static CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn init_config_dir(dir: PathBuf) {
+    let _ = CONFIG_DIR.set(dir);
+}
+
 fn config_path() -> Option<PathBuf> {
-    // 跨平台配置位置：macOS/iOS 用 Application Support，Windows 用 %APPDATA%，其余用 ~/.config。
-    // iOS 沙盒只有 Library/、Documents/、tmp/ 可写；写到容器根的 ~/.config 会失败，
-    // 导致证书每次启动都重新生成 → 设备指纹变化 → 每次重启都被当成新设备。故 iOS 也走 Library。
+    // 优先用启动时注入的 app_data_dir（各平台都正确、可写）
+    if let Some(dir) = CONFIG_DIR.get() {
+        return Some(dir.join("lan.json"));
+    }
+    // 回退（setup 未注入时）：按平台默认。
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let home = std::env::var("HOME").ok()?;
@@ -4206,7 +4217,7 @@ pub async fn lan_set_system_proxy(enable: bool, socks_port: u16, http_port: u16)
 }
 
 #[cfg(target_os = "macos")]
-fn apply_system_proxy(enable: bool, port: u16, _http_port: u16) -> Result<(), String> {
+fn apply_system_proxy(enable: bool, port: u16, http_port: u16) -> Result<(), String> {
     // 取所有网络服务（跳过首行说明 + 带 * 的已禁用项）
     let out = std::process::Command::new("networksetup")
         .arg("-listallnetworkservices")
@@ -4226,10 +4237,17 @@ fn apply_system_proxy(enable: bool, port: u16, _http_port: u16) -> Result<(), St
     for s in &services {
         let q = format!("'{}'", s.replace('\'', "'\\''")); // 单引号 shell 转义
         if enable {
+            // SOCKS 指向本地 SOCKS5；HTTP/HTTPS 指向本地 HTTP 代理——覆盖只认 web 代理的 App
             script += &format!("networksetup -setsocksfirewallproxy {q} 127.0.0.1 {port}\n");
             script += &format!("networksetup -setsocksfirewallproxystate {q} on\n");
+            script += &format!("networksetup -setwebproxy {q} 127.0.0.1 {http_port}\n");
+            script += &format!("networksetup -setwebproxystate {q} on\n");
+            script += &format!("networksetup -setsecurewebproxy {q} 127.0.0.1 {http_port}\n");
+            script += &format!("networksetup -setsecurewebproxystate {q} on\n");
         } else {
             script += &format!("networksetup -setsocksfirewallproxystate {q} off\n");
+            script += &format!("networksetup -setwebproxystate {q} off\n");
+            script += &format!("networksetup -setsecurewebproxystate {q} off\n");
         }
     }
     let path = std::env::temp_dir().join(format!("baibao_sysproxy_{}.sh", rand_hex(6)));

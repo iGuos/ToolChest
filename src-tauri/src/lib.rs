@@ -65,6 +65,42 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// 桌面系统托盘：左键恢复窗口，右键菜单显示/退出。
+#[cfg(desktop)]
+fn setup_desktop_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::{
+        menu::{Menu, MenuItem},
+        tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    };
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出百宝箱", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut tb = TrayIconBuilder::new()
+        .tooltip("百宝箱")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tb = tb.icon(icon);
+    }
+    tb.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[allow(unused_mut)]
@@ -136,52 +172,28 @@ pub fn run() {
             tools::lan::lan_send_files,
             set_close_to_tray,
             app_info,
-        ]);
+        ])
+        // 统一启动初始化（所有平台）：注入可写配置目录 + 桌面托盘。
+        .setup(|app| {
+            use tauri::Manager;
+            if let Ok(dir) = app.path().app_data_dir() {
+                tools::lan::init_config_dir(dir);
+            }
+            #[cfg(desktop)]
+            setup_desktop_tray(app)?;
+            Ok(())
+        });
 
-    // 桌面专属：开机自启 + 系统托盘 + 「关到托盘」。iOS/Android 无这些概念，跳过。
+    // 桌面专属：开机自启 + 「关到托盘」。iOS/Android 无这些概念，跳过。
     #[cfg(desktop)]
     {
-        use tauri::{
-            menu::{Menu, MenuItem},
-            tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-            Manager, WindowEvent,
-        };
+        use tauri::{Manager, WindowEvent};
         builder = builder
             // 开机自启动：macOS 用 LaunchAgent，Windows 用注册表，跨平台统一 API
             .plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
                 None,
             ))
-            .setup(|app| {
-                // 系统托盘：左键点图标恢复窗口；右键菜单可显示/退出
-                let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-                let quit = MenuItem::with_id(app, "quit", "退出百宝箱", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&show, &quit])?;
-                let mut tb = TrayIconBuilder::new()
-                    .tooltip("百宝箱")
-                    .menu(&menu)
-                    .show_menu_on_left_click(false)
-                    .on_menu_event(|app, event| match event.id.as_ref() {
-                        "show" => show_main(app),
-                        "quit" => app.exit(0),
-                        _ => {}
-                    })
-                    .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            show_main(tray.app_handle());
-                        }
-                    });
-                if let Some(icon) = app.default_window_icon().cloned() {
-                    tb = tb.icon(icon);
-                }
-                tb.build(app)?;
-                Ok(())
-            })
             .on_window_event(|window, event| {
                 // 主窗口点关闭：按设置决定「关到托盘（隐藏）」还是「直接退出」
                 if let WindowEvent::CloseRequested { api, .. } = event {

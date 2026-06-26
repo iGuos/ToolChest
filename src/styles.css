@@ -3756,3 +3756,15 @@ html { -webkit-text-size-adjust: 100%; }
 .env-log.ok { color: var(--ok, #2ea043); }
 .env-note { font-size: 12px; line-height: 1.7; }
 .env-note code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* 移动端：body 下的浮层（任务面板/吐司，经 portal 渲染）避让底部 2-Tab 导航 */
+html[data-mobile="1"] .lan-task-stack {
+  bottom: calc(74px + env(safe-area-inset-bottom)) !important;
+  right: 12px !important;
+}
+html[data-mobile="1"] .lan-toast {
+  bottom: calc(74px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 92vw;
+}

@@ -35,9 +35,61 @@ fn item(
     }
 }
 
+/// GUI（Finder/Dock）启动的 App 继承的 PATH 极简，常找不到 rustup/brew/pod/adb。
+/// 这里把常见安装目录补进 PATH，保证检测与安装命令能定位到这些工具。
+#[cfg(not(windows))]
+fn augmented_path() -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(format!("{home}/.cargo/bin")); // rustup / cargo
+        dirs.push(format!("{home}/Library/Android/sdk/platform-tools")); // adb
+        dirs.push(format!("{home}/.gem/bin")); // cocoapods(gem 安装时)
+    }
+    for k in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(v) = std::env::var(k) {
+            dirs.push(format!("{v}/platform-tools"));
+        }
+    }
+    dirs.extend(
+        [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    if let Ok(p) = std::env::var("PATH") {
+        dirs.push(p);
+    }
+    dirs.join(":")
+}
+
+#[cfg(windows)]
+fn augmented_path() -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        dirs.push(format!("{up}\\.cargo\\bin"));
+    }
+    for k in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(v) = std::env::var(k) {
+            dirs.push(format!("{v}\\platform-tools"));
+        }
+    }
+    if let Ok(p) = std::env::var("PATH") {
+        dirs.push(p);
+    }
+    dirs.join(";")
+}
+
 /// 跑一个命令并取首个非空输出行；命令不存在返回 None。
 fn probe(bin: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(bin).args(args).output().ok()?;
+    let out = Command::new(bin).env("PATH", augmented_path()).args(args).output().ok()?;
     let so = String::from_utf8_lossy(&out.stdout);
     let se = String::from_utf8_lossy(&out.stderr);
     let line = so
@@ -52,6 +104,7 @@ fn probe(bin: &str, args: &[&str]) -> Option<String> {
 
 fn rustup_targets() -> String {
     Command::new("rustup")
+        .env("PATH", augmented_path())
         .args(["target", "list", "--installed"])
         .output()
         .ok()
@@ -228,6 +281,7 @@ pub async fn env_fix(key: String) -> Result<String, String> {
     };
     tauri::async_runtime::spawn_blocking(move || {
         let out = Command::new(argv[0])
+            .env("PATH", augmented_path())
             .args(&argv[1..])
             .output()
             .map_err(|e| format!("执行失败（命令不存在？）：{e}"))?;

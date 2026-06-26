@@ -215,11 +215,15 @@ function MobileSettings() {
 function MobileApp() {
   const { totalUnread } = useLan();
   const [tab, setTab] = useState<string>("lan-share");
-  // 移动端固定深色背景（与桌面默认一致）
+  // 移动端固定深色背景（与桌面默认一致）+ 标记 data-mobile（供 body 下的浮层避让底部导航）
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.theme = "dark";
+    root.dataset.mobile = "1";
     root.style.background = "#1e1e1e";
+    return () => {
+      delete root.dataset.mobile;
+    };
   }, []);
   return (
     <div className="mobile-app">
