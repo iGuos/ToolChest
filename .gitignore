@@ -3,4 +3,18 @@ dist
 .DS_Store
 .idea
 src-tauri/target
-src-tauri/gen
+# 移动端工程纳入版本管理（含 main.mm 后台保活 / Info.plist 竖屏+后台 / project.yml 定制），
+# 仅忽略构建产物。gen/apple 自带 .gitignore 已排除 build/Externals/xcuserdata。
+src-tauri/gen/apple/Pods
+src-tauri/gen/android/.gradle
+src-tauri/gen/android/.tauri
+src-tauri/gen/android/build
+src-tauri/gen/android/app/build
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/.idea
+# 构建每次重新生成的(由 project.yml/tauri.conf 派生)——不提交,避免污染 diff：
+src-tauri/gen/schemas
+src-tauri/gen/apple/baibao.xcodeproj
+src-tauri/gen/apple/baibao_iOS/Info.plist
+src-tauri/gen/android/gen
+src-tauri/gen/android/app/src/main/jniLibs

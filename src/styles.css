@@ -3768,3 +3768,15 @@ html[data-mobile="1"] .lan-toast {
   transform: translateX(-50%);
   max-width: 92vw;
 }
+
+/* 设备码核对状态 */
+.dev-trust-ok { color: var(--ok, #2ea043); font-weight: 600; }
+.dev-trust-no { color: var(--warn, #e0883a); }
+.lan-trust-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--ok, #2ea043);
+  border: 1px solid var(--ok, #2ea043);
+}

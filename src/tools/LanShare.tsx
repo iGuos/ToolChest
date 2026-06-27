@@ -250,7 +250,7 @@ export default function LanShare() {
     me, peers, items, unread, selected, error, serviceError, startService, refreshMe,
     setSelected, setError, refreshPeers, sendMessage, resendMessage, recallMessage, deleteItem, sendFiles,
     cancelTransfer, cancelSend, requestConfirm, addPeerByIp, setAlias, setCompat, setInvisible, pickDir,
-    setRemark, clearChat, togglePin, reorderPins,
+    setRemark, clearChat, togglePin, reorderPins, toggleTrusted,
     uploadTasks, cancelUpload, resumeUpload, dismissUpload,
     recvTasks, rejectReceive,
   } = useLan();
@@ -1077,6 +1077,9 @@ export default function LanShare() {
                 </button>
                 {selectedPeer.pinned && <span className="lan-peer-pin" title="已置顶">📌</span>}
                 <b>{selectedPeer.remark || selectedPeer.alias}</b>
+                {selectedPeer.trusted && (
+                  <span className="lan-trust-badge" title="设备码已核对，可信">✓ 已核对</span>
+                )}
                 <span className="dim">{selectedPeer.remark ? selectedPeer.alias : selectedPeer.ip}</span>
               </div>
 
@@ -1363,13 +1366,25 @@ export default function LanShare() {
                       <span className="dim">设备码</span>
                       <code className="device-code">{deviceCode(infoView)}</code>
                     </div>
+                    <div className="dev-info-row">
+                      <span className="dim">核对状态</span>
+                      <span className={p?.trusted ? "dev-trust-ok" : "dev-trust-no"}>
+                        {p?.trusted ? "✓ 已核对(可信)" : "未核对"}
+                      </span>
+                    </div>
                   </div>
                   <div className="dim" style={{ fontSize: 12, marginTop: 12, lineHeight: 1.6 }}>
-                    设备码由对方证书派生、无法伪造。和对方核对「设备码」一致，即为同一台真设备，可识破“同名冒充”。
-                    本机设备码见「设置 → 基本」。
+                    设备码由对方证书派生、无法伪造。和对方当面/电话核对「设备码」一致后,点下方「标记为已核对」,
+                    即可识破“同名冒充”并堵住首次连接被中间人调包的风险。本机设备码见「设置 → 基本」。
                   </div>
                   <div className="modal-actions">
                     <button className="btn btn-ghost" onClick={() => copyMsg(infoView)}>复制完整指纹</button>
+                    <button
+                      className={`btn ${p?.trusted ? "btn-ghost" : "btn-primary"}`}
+                      onClick={() => toggleTrusted(infoView)}
+                    >
+                      {p?.trusted ? "取消核对" : "标记为已核对"}
+                    </button>
                     <button className="btn btn-primary" onClick={() => setInfoView(null)}>关闭</button>
                   </div>
                 </div>

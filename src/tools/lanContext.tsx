@@ -38,6 +38,7 @@ export interface Peer {
   online?: boolean; // 合并历史已知设备后：当前是否在线（用于展示离线设备的历史记录）
   remark?: string; // 备注名（仅 UI 派生，按 fingerprint 单独持久化）
   pinned?: boolean; // 是否置顶（仅 UI 派生）
+  trusted?: boolean; // 设备码已人工核对（仅 UI 派生，持久化）；防同名冒充 / TOFU 中间人
   shares?: number; // 对方对外共享的目录数量（>0 显示「共享」标签）
 }
 export interface FileMeta {
@@ -154,6 +155,7 @@ interface LanCtxValue {
   clearChat: (fp: string) => void; // 清空与某设备的全部聊天/传输记录
   togglePin: (fp: string) => void; // 置顶/取消置顶
   reorderPins: (fromFp: string, toFp: string) => void; // 拖拽调整置顶设备顺序
+  toggleTrusted: (fp: string) => void; // 标记/取消「设备码已核对」
   setAlias: (alias: string) => Promise<void>;
   setCompat: (enabled: boolean) => Promise<void>;
   setInvisible: (enabled: boolean) => Promise<void>;
@@ -178,6 +180,7 @@ const LS_ITEMS = "baibao.lan.items.v1";
 const LS_PEERS = "baibao.lan.knownpeers.v1";
 const LS_REMARKS = "baibao.lan.remarks.v1"; // fingerprint -> 备注名
 const LS_PINS = "baibao.lan.pins.v1"; // 置顶设备的有序 fingerprint 列表
+const LS_TRUSTED = "baibao.lan.trusted.v1"; // 已人工核对过设备码的 fingerprint 列表（关闭 TOFU 缺口）
 const HISTORY_CAP = 3000; // 最多保留多少条记录，避免无限增长
 
 function loadRemarks(): Record<string, string> {
@@ -191,6 +194,14 @@ function loadRemarks(): Record<string, string> {
 function loadPins(): string[] {
   try {
     const raw = localStorage.getItem(LS_PINS);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+function loadTrusted(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_TRUSTED);
     return raw ? (JSON.parse(raw) as string[]) : [];
   } catch {
     return [];
@@ -233,6 +244,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ChatItem[]>(loadItems);
   const [remarks, setRemarks] = useState<Record<string, string>>(loadRemarks); // 备注（持久化）
   const [pins, setPins] = useState<string[]>(loadPins); // 置顶设备有序列表（持久化）
+  const [trusted, setTrusted] = useState<string[]>(loadTrusted); // 已核对设备码的指纹（持久化）
   const [confirm, setConfirm] = useState<Incoming | null>(null);
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [selected, setSelectedRaw] = useState<string | null>(null);
@@ -255,11 +267,13 @@ export function LanProvider({ children }: { children: ReactNode }) {
     for (const fp of Object.keys(knownPeers)) map.set(fp, { ...knownPeers[fp], online: false });
     for (const p of livePeers) map.set(p.fingerprint, { ...p, online: true });
     const pinIndex = new Map(pins.map((fp, i) => [fp, i]));
+    const trustedSet = new Set(trusted);
     const arr = [...map.values()]
       .map((p) => ({
         ...p,
         remark: remarks[p.fingerprint] || undefined,
         pinned: pinIndex.has(p.fingerprint),
+        trusted: trustedSet.has(p.fingerprint),
       }))
       .filter(
         (p) => p.online !== false || p.pinned || historyFps.has(p.fingerprint)
@@ -277,7 +291,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
         a.fingerprint.localeCompare(b.fingerprint)
       );
     });
-  }, [livePeers, knownPeers, remarks, pins, historyFps]);
+  }, [livePeers, knownPeers, remarks, pins, trusted, historyFps]);
 
   // 维护历史已知表：在线设备刷新元数据；离线且「无聊天记录、未置顶」的设备删除，避免常驻堆积。
   // 在线集合与被删集合不相交（删的都不在 livePeers 里），不会产生「加了又删」的抖动。
@@ -326,6 +340,13 @@ export function LanProvider({ children }: { children: ReactNode }) {
       /* ignore */
     }
   }, [pins]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_TRUSTED, JSON.stringify(trusted));
+    } catch {
+      /* ignore */
+    }
+  }, [trusted]);
   useEffect(() => {
     const t = window.setTimeout(() => {
       try {
@@ -989,6 +1010,11 @@ export function LanProvider({ children }: { children: ReactNode }) {
     setPins((ps) => (ps.includes(fp) ? ps.filter((x) => x !== fp) : [...ps, fp]));
   }, []);
 
+  // 标记/取消「设备码已核对」：人工核对双方设备码一致后标记，关闭 TOFU 中间人窗口
+  const toggleTrusted = useCallback((fp: string) => {
+    setTrusted((ts) => (ts.includes(fp) ? ts.filter((x) => x !== fp) : [...ts, fp]));
+  }, []);
+
   // 拖拽调整置顶设备顺序：把 fromFp 移动到 toFp 所在位置
   const reorderPins = useCallback((fromFp: string, toFp: string) => {
     setPins((ps) => {
@@ -1054,7 +1080,7 @@ export function LanProvider({ children }: { children: ReactNode }) {
     setSelected, setError, refreshPeers, requestConfirm, dismissConfirm, respond,
     acceptPendingFiles, acceptAllPending, rejectAllPending,
     sendMessage, resendMessage, recallMessage, deleteItem, sendFiles, cancelTransfer, cancelSend,
-    setRemark, clearChat, togglePin, reorderPins,
+    setRemark, clearChat, togglePin, reorderPins, toggleTrusted,
     setAlias, setCompat, setInvisible, pickDir, addPeerByIp,
   };
 
