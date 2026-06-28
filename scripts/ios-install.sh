@@ -28,5 +28,9 @@ fi
 echo "📲 安装到设备 $DEVICE_ID …"
 xcrun devicectl device install app --device "$DEVICE_ID" "$IPA"
 echo "🚀 启动应用 …"
-xcrun devicectl device process launch --device "$DEVICE_ID" "$BUNDLE_ID"
-echo "✅ 已安装并启动"
+# 启动尽力而为：锁屏等原因导致启动失败时不算整体失败（安装已完成，手动点开即可）
+if xcrun devicectl device process launch --device "$DEVICE_ID" "$BUNDLE_ID" 2>/dev/null; then
+  echo "✅ 已安装并启动"
+else
+  echo "✅ 已安装（自动启动失败，多为手机锁屏；解锁后手动点开即可）"
+fi
