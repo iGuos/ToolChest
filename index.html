@@ -24,7 +24,9 @@
       } catch (e) {}
     </script>
   </head>
-  <body>
+  <!-- 关闭系统 WebView 的「首字母大写 / 自动更正(弹建议框) / 拼写检查」：
+       这些属性会被后代 input/textarea 继承，省去运行时逐个处理 -->
+  <body autocapitalize="off" autocorrect="off" spellcheck="false">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

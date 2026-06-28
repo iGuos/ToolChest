@@ -13,32 +13,6 @@ window.addEventListener("contextmenu", (e) => {
   if (!editable && !hasSelection) e.preventDefault();
 });
 
-// macOS / iOS 的系统 WebView 默认让输入框「首字母大写 + 自动更正(弹建议框) + 拼写检查」。
-// 这是系统文本输入行为，开发类输入(消息/IP/密码/端口/设备名/备注)都不需要——
-// 这里给所有 input/textarea 设标准属性把它们关掉(不引入任何东西，只是禁用大写/更正)。
-// 覆盖当前与后续动态渲染的所有 input/textarea。
-function tameInput(node: Element) {
-  if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
-    node.setAttribute("autocapitalize", "off");
-    node.setAttribute("autocorrect", "off");
-    node.setAttribute("spellcheck", "false");
-  }
-}
-function tameAll(root: ParentNode) {
-  root.querySelectorAll("input, textarea").forEach(tameInput);
-}
-tameAll(document);
-new MutationObserver((muts) => {
-  for (const m of muts) {
-    m.addedNodes.forEach((n) => {
-      if (n instanceof Element) {
-        tameInput(n);
-        tameAll(n);
-      }
-    });
-  }
-}).observe(document.documentElement, { childList: true, subtree: true });
-
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <LanProvider>
