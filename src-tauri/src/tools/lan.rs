@@ -3458,6 +3458,24 @@ pub async fn lan_pick_files(app: AppHandle) -> Result<Vec<String>, String> {
     .map_err(|e| format!("任务调度失败：{e}"))?
 }
 
+/// 把前端 `<input type="file">`（如 iOS 选相册照片）选出的文件字节落到临时文件，返回路径。
+/// 移动端 WebView 的文件选择器能访问相册,但拿到的是 Blob 而非路径;暂存为文件后即可复用
+/// 既有的「按路径发送」流程(lan_send_files)。
+#[tauri::command]
+pub async fn lan_stage_file(name: String, data: Vec<u8>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = std::env::temp_dir().join("baibao_send");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+        let safe = name.replace(['/', '\\'], "_");
+        let safe = if safe.trim().is_empty() { "file".to_string() } else { safe };
+        let path = dir.join(format!("{}_{}", rand_hex(6), safe));
+        std::fs::write(&path, &data).map_err(|e| format!("写入临时文件失败：{e}"))?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("任务调度失败：{e}"))?
+}
+
 #[tauri::command]
 pub async fn lan_pick_dir(app: AppHandle) -> Result<Option<String>, String> {
     // 原生目录选择器：选「接收文件的保存目录」。blocking_pick_folder 仅桌面有；

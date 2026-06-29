@@ -1,10 +1,10 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ChangeEvent as ReactChangeEvent } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLan, type Peer, type FileMsg, type ChatItem } from "./lanContext";
-import { useEscToClose, useDragReorder } from "../hooks";
+import { useEscToClose, useDragReorder, IS_MOBILE } from "../hooks";
 import ShareBrowser from "./ShareBrowser";
 
 interface NetIface {
@@ -521,6 +521,32 @@ export default function LanShare() {
       const wait = Math.max(0, 600 - (Date.now() - started));
       window.setTimeout(() => setRefreshing(false), wait);
     }
+  };
+
+  // 移动端发送文件：原生选择器(文档)选不到相册,改用 <input type=file>(iOS 会给「照片图库」)。
+  // 选到的是 Blob,先经 lan_stage_file 落成临时文件拿到路径,再复用按路径发送的流程。
+  const mobileFileRef = useRef<HTMLInputElement>(null);
+  const onMobilePickFiles = async (e: ReactChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ""; // 复位,便于再次选同一文件
+    const fp = selectedRef.current;
+    if (!files.length || !fp) return;
+    try {
+      const paths: string[] = [];
+      for (const f of files) {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        const p = await invoke<string>("lan_stage_file", { name: f.name, data: Array.from(buf) });
+        paths.push(p);
+      }
+      await sendFiles(fp, paths);
+    } catch (err) {
+      setError(`发送失败：${String(err)}`);
+    }
+  };
+  // 附件按钮:移动端走 <input type=file>(含相册),桌面走原生文件选择器
+  const onAttachClick = () => {
+    if (IS_MOBILE) mobileFileRef.current?.click();
+    else if (selectedPeer) sendFiles(selectedPeer.fingerprint);
   };
 
   // 组网/覆盖网地址不在本机网卡、走隧道路由，网段扫描与多播都覆盖不到，只能逐个直连探测。
@@ -1093,12 +1119,20 @@ export default function LanShare() {
 
               {/* 输入区：上方工具条 + 文本框 */}
               <div className="lan-composer">
+                {/* 移动端隐藏文件输入：iOS 点开有「照片图库 / 拍照 / 选取文件」 */}
+                <input
+                  ref={mobileFileRef}
+                  type="file"
+                  multiple
+                  style={{ display: "none" }}
+                  onChange={onMobilePickFiles}
+                />
                 <div className="lan-toolbar">
                   <button
                     className="lan-tool-btn"
                     title="发送文件"
                     aria-label="发送文件"
-                    onClick={() => sendFiles(selectedPeer.fingerprint)}
+                    onClick={onAttachClick}
                   >
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />

@@ -118,6 +118,8 @@ export default function TodoList() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
+  const [renamingId, setRenamingId] = useState<number | null>(null); // 正在重命名的分组
+  const [renameInput, setRenameInput] = useState("");
 
   const taskIdRef = useRef(boot.tasks.reduce((m, t) => Math.max(m, t.id), 0) + 1);
   const groupIdRef = useRef(boot.groups.reduce((m, g) => Math.max(m, g.id), 0) + 1);
@@ -213,6 +215,7 @@ export default function TodoList() {
     setActiveGroupId(id);
     setMenuOpen(false);
     setCreating(false);
+    setRenamingId(null);
     setEditingId(null);
     setPendingDelete(null);
   };
@@ -227,6 +230,21 @@ export default function TodoList() {
     setCreating(false);
     setMenuOpen(false);
     setEditingId(null);
+  };
+
+  // 重命名分组：点铅笔进入行内编辑，回车/✓ 保存
+  const startRename = (g: Group) => {
+    setRenamingId(g.id);
+    setRenameInput(g.name);
+    setCreating(false);
+  };
+  const commitRename = () => {
+    const name = renameInput.trim();
+    if (renamingId != null && name) {
+      setGroups((gs) => gs.map((x) => (x.id === renamingId ? { ...x, name } : x)));
+    }
+    setRenamingId(null);
+    setRenameInput("");
   };
 
   // 删除分组：需在弹框中输入分组名一致才放行；连同该组下全部任务一并删除。
@@ -286,6 +304,29 @@ export default function TodoList() {
               <div className="group-menu">
                 {groups.map((g) => {
                   const deletable = g.id !== DEFAULT_GROUP.id;
+                  if (renamingId === g.id) {
+                    // 行内重命名
+                    return (
+                      <div key={g.id} className="group-create" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          autoFocus
+                          value={renameInput}
+                          placeholder="分组名称"
+                          onChange={(e) => setRenameInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitRename();
+                            else if (e.key === "Escape") {
+                              setRenamingId(null);
+                              setRenameInput("");
+                            }
+                          }}
+                        />
+                        <button className="group-create-ok" onClick={commitRename} disabled={!renameInput.trim()}>
+                          ✓
+                        </button>
+                      </div>
+                    );
+                  }
                   return (
                     <div
                       key={g.id}
@@ -295,6 +336,30 @@ export default function TodoList() {
                       <span className="group-item-name">{g.name}</span>
                       <span className="group-item-right">
                         {g.id === activeGroupId && <span className="group-check">✓</span>}
+                        <button
+                          className="group-del"
+                          title="重命名分组"
+                          aria-label="重命名分组"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startRename(g);
+                          }}
+                        >
+                          <svg
+                            viewBox="0 0 24 24"
+                            width="13"
+                            height="13"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M12 20h9" />
+                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+                          </svg>
+                        </button>
                         {deletable && (
                           <button
                             className="group-del"

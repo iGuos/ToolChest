@@ -151,6 +151,7 @@ pub fn run() {
             tools::lan::lan_share_op,
             tools::lan::lan_respond,
             tools::lan::lan_pick_files,
+            tools::lan::lan_stage_file,
             tools::lan::lan_pick_dir,
             tools::lan::lan_reveal,
             tools::lan::lan_open_path,

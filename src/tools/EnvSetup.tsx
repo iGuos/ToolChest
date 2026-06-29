@@ -67,26 +67,33 @@ export default function EnvSetup() {
       <div className="tool-header">
         <div>
           <h2>环境配置</h2>
-          <p className="tool-subtitle">检测并一键准备 iOS / Android 的打包环境。</p>
+          <p className="tool-subtitle">
+            {IS_MAC ? "检测并一键准备 iOS / Android 的打包环境。" : "检测并一键准备 Android 的打包环境。"}
+          </p>
         </div>
       </div>
 
       <div className="env-body">
         <div className="env-tabs">
-          <button className={`env-tab${plat === "ios" ? " active" : ""}`} onClick={() => setPlat("ios")}>
-             iOS
-          </button>
-          <button className={`env-tab${plat === "android" ? " active" : ""}`} onClick={() => setPlat("android")}>
-            🤖 Android
-          </button>
+          {/* iOS 只能在 macOS 构建：非 mac 不展示 iOS Tab，直接只看 Android */}
+          {IS_MAC && (
+            <>
+              <button className={`env-tab${plat === "ios" ? " active" : ""}`} onClick={() => setPlat("ios")}>
+                 iOS
+              </button>
+              <button
+                className={`env-tab${plat === "android" ? " active" : ""}`}
+                onClick={() => setPlat("android")}
+              >
+                🤖 Android
+              </button>
+            </>
+          )}
+          {!IS_MAC && <span className="env-tab active" style={{ cursor: "default" }}>🤖 Android</span>}
           <button className="btn btn-ghost btn-sm env-recheck" onClick={() => check(plat)} disabled={loading}>
             {loading ? "检测中…" : "重新检测"}
           </button>
         </div>
-
-        {plat === "ios" && !IS_MAC && (
-          <div className="env-warn">⚠️ iOS 打包只能在 macOS 上进行;当前系统无法构建 iOS。</div>
-        )}
 
         {!loading && (
           <div className="env-summary dim">
